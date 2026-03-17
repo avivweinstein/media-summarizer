@@ -1,0 +1,38 @@
+# Logging configuration — parsed by tomllib and passed to logging.config.dictConfig()
+# All output goes to stdout so systemd journald captures it on bear.
+#
+# Each log line includes: job_id, url (truncated), source, and the event message.
+# Format: LEVEL     logger_name     job_id=... url=... source=... event=...
+
+version = 1
+disable_existing_loggers = false
+
+[formatters.default]
+format = "%(asctime)s %(levelname)-8s %(name)-30s %(message)s"
+datefmt = "%Y-%m-%dT%H:%M:%SZ"
+
+[handlers.stdout]
+class = "logging.StreamHandler"
+stream = "ext://sys.stdout"
+formatter = "default"
+level = "DEBUG"
+
+[loggers.""]
+handlers = ["stdout"]
+level = "INFO"
+propagate = false
+
+[loggers.uvicorn]
+handlers = ["stdout"]
+level = "WARNING"
+propagate = false
+
+[loggers.uvicorn.error]
+handlers = ["stdout"]
+level = "ERROR"
+propagate = false
+
+[loggers."media_summarizer"]
+handlers = ["stdout"]
+level = "INFO"
+propagate = false
