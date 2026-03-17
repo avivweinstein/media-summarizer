@@ -5,10 +5,9 @@ Failed jobs are retried up to MAX_RETRIES times with exponential backoff.
 Jobs survive server restarts because they're persisted in SQLite.
 """
 
-import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -22,7 +21,7 @@ MAX_RETRIES = 3
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _serialize_job(job: Job) -> dict[str, Any]:

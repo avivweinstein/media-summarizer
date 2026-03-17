@@ -5,7 +5,7 @@ No transcript → NoTranscriptError. No audio fallback, ever.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
@@ -72,9 +72,9 @@ def _fetch_transcript_sync(video_id: str) -> str:
     return " ".join(snippet.text for snippet in fetched)
 
 
-def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict:  # type: ignore[type-arg]
+def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, object]:
     """Fetch video metadata via yt-dlp without downloading any media."""
-    opts: dict = {  # type: ignore[type-arg]
+    opts: dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -84,13 +84,13 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict:  # type: 
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:
-            info = ydl.extract_info(url, download=False)
+            info: dict[str, object] | None = ydl.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as e:
             raise MetadataError(f"Failed to fetch YouTube metadata: {e}") from e
 
     if info is None:
         raise MetadataError("yt-dlp returned no metadata for this URL.")
-    return info  # type: ignore[return-value]
+    return info
 
 
 def _parse_upload_date(raw: str | None) -> datetime | None:
@@ -98,7 +98,7 @@ def _parse_upload_date(raw: str | None) -> datetime | None:
     if not raw or len(raw) != 8:
         return None
     try:
-        return datetime(int(raw[:4]), int(raw[4:6]), int(raw[6:]), tzinfo=timezone.utc)
+        return datetime(int(raw[:4]), int(raw[4:6]), int(raw[6:]), tzinfo=UTC)
     except ValueError:
         return None
 
@@ -123,13 +123,18 @@ class YouTubeSource(BaseSource):
         )
         logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
 
+        raw_thumb = meta.get("thumbnail")
+        thumbnail_url = str(raw_thumb) if raw_thumb else None
+        raw_date = meta.get("upload_date")
+        upload_date = str(raw_date) if raw_date else None
+
         return TranscriptResult(
-            title=meta.get("title") or "Unknown Title",
+            title=str(meta.get("title") or "Unknown Title"),
             source="youtube",
             url=url,
-            channel_or_show=meta.get("channel") or meta.get("uploader") or "",
-            duration_seconds=int(meta.get("duration") or 0),
-            thumbnail_url=meta.get("thumbnail"),
+            channel_or_show=str(meta.get("channel") or meta.get("uploader") or ""),
+            duration_seconds=int(str(meta.get("duration") or 0)),
+            thumbnail_url=thumbnail_url,
             transcript=transcript,
-            published_at=_parse_upload_date(meta.get("upload_date")),
+            published_at=_parse_upload_date(upload_date),
         )

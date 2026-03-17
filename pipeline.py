@@ -7,10 +7,10 @@ Each step is wired in progressively across phases.
 import logging
 from urllib.parse import urlparse
 
+import job_queue
 from config import settings
 from exceptions import UnsupportedURLError
-from models import Job, JobStatus, TranscriptResult
-import job_queue
+from models import JobStatus, TranscriptResult
 from sources.youtube import YouTubeSource
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ def detect_source(url: str) -> str:
             "Spotify is not currently supported. Try a YouTube URL or a direct podcast RSS/MP3 URL."
         )
 
-    if hostname == "podcasts.apple.com" or url.lower().endswith(".mp3"):
+    if hostname == "podcasts.apple.com" or parsed.path.lower().endswith(".mp3"):
         return "podcast"
 
     raise UnsupportedURLError(
