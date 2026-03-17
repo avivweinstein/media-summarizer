@@ -11,6 +11,7 @@ import job_queue
 from config import settings
 from exceptions import UnsupportedURLError
 from models import JobStatus, TranscriptResult
+from notion_writer import save_to_notion
 from sources.youtube import YouTubeSource
 from summarizer import summarize
 
@@ -83,7 +84,9 @@ async def run_job(job_id: str) -> None:
         summary = await summarize(result, job_id=job.job_id)
         job.summary = summary
 
-        # Phase 4: Notion (TBD)
+        # Phase 4: save to Notion
+        page_id = await save_to_notion(result, summary, job_id=job.job_id)
+        job.notion_page_id = page_id
 
         job.status = JobStatus.done
         logger.info("%s event=job_completed title=%r", log, result.title)
