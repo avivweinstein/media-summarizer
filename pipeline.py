@@ -12,6 +12,7 @@ from config import settings
 from exceptions import UnsupportedURLError
 from models import JobStatus, TranscriptResult
 from sources.youtube import YouTubeSource
+from summarizer import summarize
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +77,15 @@ async def run_job(job_id: str) -> None:
             # podcast — Phase 5
             raise UnsupportedURLError("Podcast support is not yet implemented.")
 
-        # Phase 2: store transcript result; summarization (Phase 3) and Notion (Phase 4) TBD
-        job.status = JobStatus.done
         job.result = result
+
+        # Phase 3: summarize with Claude
+        summary = await summarize(result, job_id=job.job_id)
+        job.summary = summary
+
+        # Phase 4: Notion (TBD)
+
+        job.status = JobStatus.done
         logger.info("%s event=job_completed title=%r", log, result.title)
 
     except Exception as e:
