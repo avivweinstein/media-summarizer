@@ -116,7 +116,7 @@ class TestTranscribeFileCleanup:
 
         assert not mp3.exists()
 
-    async def test_file_too_large_raises_before_api_call(
+    async def test_file_too_large_without_ffmpeg_raises_before_api_call(
         self, tmp_path: Path, mocker: MagicMock
     ) -> None:
         from transcriber import WHISPER_MAX_BYTES
@@ -126,14 +126,43 @@ class TestTranscribeFileCleanup:
 
         mock_client = AsyncMock()
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+        mocker.patch(
+            "transcriber._compress_for_whisper",
+            side_effect=TranscriptionError("ffmpeg not installed"),
+        )
 
-        with pytest.raises(TranscriptionError, match="25 MB"):
+        with pytest.raises(TranscriptionError, match="ffmpeg"):
             await transcribe(mp3)
 
         # API should never have been called
         mock_client.audio.transcriptions.create.assert_not_called()
         # File still cleaned up
         assert not mp3.exists()
+
+    async def test_file_too_large_compresses_and_transcribes(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        from transcriber import WHISPER_MAX_BYTES
+
+        mp3 = tmp_path / "big.mp3"
+        mp3.write_bytes(b"x" * (WHISPER_MAX_BYTES + 1))
+
+        async def fake_compress(src: Path, dst: Path) -> None:
+            dst.write_bytes(b"x" * 100)  # "compressed" file well under 25 MB
+
+        mocker.patch("transcriber._compress_for_whisper", side_effect=fake_compress)
+
+        mock_client = AsyncMock()
+        mock_client.audio.transcriptions.create.return_value = "Compressed transcript."
+        mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+
+        result = await transcribe(mp3)
+
+        assert result == "Compressed transcript."
+        mock_client.audio.transcriptions.create.assert_called_once()
+        # Both original and compressed files cleaned up
+        assert not mp3.exists()
+        assert not (tmp_path / "big_compressed.mp3").exists()
 
     async def test_missing_file_raises_transcription_error(self, tmp_path: Path) -> None:
         missing = tmp_path / "does-not-exist.mp3"

@@ -102,5 +102,6 @@ async def health() -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
-    """Job dashboard — Phase 6."""
-    raise HTTPException(status_code=501, detail="Web UI coming in Phase 6.")
+    """Serve the job status dashboard."""
+    html = (Path(__file__).parent / "static" / "index.html").read_text()
+    return HTMLResponse(content=html)
