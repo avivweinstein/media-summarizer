@@ -12,6 +12,7 @@ from config import settings
 from exceptions import UnsupportedURLError
 from models import JobStatus, TranscriptResult
 from notion_writer import save_to_notion
+from sources.podcast import PodcastSource
 from sources.youtube import YouTubeSource
 from summarizer import summarize
 
@@ -75,8 +76,7 @@ async def run_job(job_id: str) -> None:
             source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
             result = await source.fetch(job.url, job_id=job.job_id)
         else:
-            # podcast — Phase 5
-            raise UnsupportedURLError("Podcast support is not yet implemented.")
+            result = await PodcastSource().fetch(job.url, job_id=job.job_id)
 
         job.result = result
 

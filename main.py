@@ -23,6 +23,7 @@ import job_queue
 from exceptions import UnsupportedURLError
 from models import JobResponse, SummarizeRequest, SummarizeResponse
 from pipeline import detect_source, run_job
+from transcriber import ensure_tmp_dir
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def _configure_logging() -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _configure_logging()
     await job_queue.init_db()
+    ensure_tmp_dir()
     logger.info("job_id=- url=- source=- event=server_started")
     yield
     logger.info("job_id=- url=- source=- event=server_stopped")
