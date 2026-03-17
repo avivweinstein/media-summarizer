@@ -9,6 +9,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ffmpeg
+        run: sudo apt-get install -y ffmpeg
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
@@ -26,6 +29,5 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_TEST_DATABASE_ID: ${{ secrets.NOTION_TEST_DATABASE_ID }}
-          PODCAST_INDEX_API_KEY: ${{ secrets.PODCAST_INDEX_API_KEY }}
-          PODCAST_INDEX_API_SECRET: ${{ secrets.PODCAST_INDEX_API_SECRET }}
-        run: uv run pytest -m "integration"
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: uv run pytest -m "integration" -v
