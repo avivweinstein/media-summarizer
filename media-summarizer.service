@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/aviv/Github/media-summarizer
-ExecStart=/home/aviv/Github/media-summarizer/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+ExecStart=/home/aviv/Github/media-summarizer/.venv/bin/uvicorn main:app --host 100.87.81.91 --port 8000
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
