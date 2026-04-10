@@ -1,5 +1,5 @@
 # Logging configuration — parsed by tomllib and passed to logging.config.dictConfig()
-# All output goes to stdout so systemd journald captures it on bear.
+# All output goes to stdout so systemd journald captures it.
 #
 # Each log line includes: job_id, url (truncated), source, and the event message.
 # Format: LEVEL     logger_name     job_id=... url=... source=... event=...

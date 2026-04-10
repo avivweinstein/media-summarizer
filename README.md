@@ -127,6 +127,7 @@ Running as a service means:
 2. **Optionally change the bind address.** The default is `127.0.0.1` (localhost only).
    To make it accessible from other devices on your network, change `--host 127.0.0.1`
    to `--host 0.0.0.0` or to a specific IP (e.g. a Tailscale IP for VPN-only access).
+   See [Accessing from other devices](#accessing-from-other-devices-tailscale) below.
 
 3. **Install and enable:**
 
@@ -168,6 +169,54 @@ git pull
 uv pip install -e .
 systemctl --user restart media-summarizer
 ```
+
+---
+
+## Accessing from other devices (Tailscale)
+
+By default the server binds to `127.0.0.1` and is only reachable from the machine it runs on. To access it from your phone, laptop, or other devices, the easiest approach is [Tailscale](https://tailscale.com/) — a zero-config mesh VPN.
+
+### Setup
+
+1. **Install Tailscale** on the server and on every device you want to access it from ([tailscale.com/download](https://tailscale.com/download)).
+
+2. **Find the server's Tailscale IP:**
+
+   ```bash
+   tailscale ip -4
+   # Example output: 100.64.1.42
+   ```
+
+3. **Update the service file** to bind to the Tailscale IP instead of localhost:
+
+   ```ini
+   ExecStart=%h/media-summarizer/.venv/bin/uvicorn main:app --host 100.64.1.42 --port 8000
+   ```
+
+   Then reload and restart:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user restart media-summarizer
+   ```
+
+4. **Access from any device on your Tailscale network:**
+
+   ```
+   http://<tailscale-hostname>:8000
+   ```
+
+   Tailscale assigns a stable hostname (e.g. `my-server`) and a stable IP (e.g. `100.64.1.42`) that won't change. Both work.
+
+### Why Tailscale?
+
+- Your server is only reachable from devices you've authorized — no port forwarding, no exposing to the public internet
+- The Tailscale IP is stable across reboots and reconnections
+- Works from anywhere (home, office, mobile data) as long as Tailscale is connected
+- Free for personal use (up to 100 devices)
+
+### Alternative: bind to all interfaces
+
+If you don't want Tailscale, you can bind to `0.0.0.0` to listen on all network interfaces. This makes the server reachable from any device on your local network, but also exposes it if your machine is on a public network. Make sure your firewall is configured appropriately.
 
 ---
 
@@ -284,6 +333,7 @@ Copy `.env.example` to `.env` and fill in:
 | `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
 | `PODCAST_INDEX_API_SECRET`  | No       | Podcast Index API secret                        | Same as above |
 | `PORT`                      | No       | Server port (default: 8000)                     | — |
+| `NOTION_TEST_DATABASE_ID`   | No       | Separate Notion DB for integration tests (keeps test pages out of your real DB) | Create a blank database |
 
 ---
 
