@@ -31,7 +31,7 @@ phone, and it gets submitted to media-summarizer automatically.
 **How to implement (Android/Pixel):**
 - Create a Tasker profile triggered by the share sheet (when URL matches
   youtube.com, podcasts.apple.com, or *.mp3).
-- POST to `http://bear:8000/summarize` with the shared URL.
+- POST to `http://YOUR_HOST:8000/summarize` with the shared URL.
 - Show a toast with the job_id.
 
 **How to implement (iOS):**
@@ -39,7 +39,7 @@ phone, and it gets submitted to media-summarizer automatically.
 - Use the "Get Contents of URL" action to POST to the API.
 - Show a notification with the result.
 
-**Prerequisites:** Phone must be on Tailscale to reach bear.
+**Prerequisites:** Phone must be on the same network as the server (e.g. via Tailscale or local LAN).
 
 ---
 

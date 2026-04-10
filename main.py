@@ -14,6 +14,7 @@ Routes:
 """
 
 import asyncio
+import json
 import logging
 import logging.config
 import tomllib
@@ -252,7 +253,6 @@ async def jobs_stream() -> EventSourceResponse:
             try:
                 jobs = await job_queue.list_jobs(limit=50)
                 responses = [_job_to_response(j) for j in jobs]
-                import json
                 snapshot = json.dumps(
                     [r.model_dump(mode="json") for r in responses],
                     default=str,

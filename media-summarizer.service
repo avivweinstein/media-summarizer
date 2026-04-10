@@ -1,3 +1,14 @@
+# Media Summarizer — systemd user service
+#
+# Installation:
+#   1. Edit the paths below to match your setup
+#   2. cp media-summarizer.service ~/.config/systemd/user/
+#   3. systemctl --user daemon-reload
+#   4. systemctl --user enable --now media-summarizer
+#   5. loginctl enable-linger $USER  # start on boot without login
+#
+# Logs: journalctl --user -u media-summarizer -f
+
 [Unit]
 Description=Media Summarizer — personal media intelligence pipeline
 After=network-online.target
@@ -5,14 +16,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/aviv/Github/media-summarizer
-ExecStart=/home/aviv/Github/media-summarizer/.venv/bin/uvicorn main:app --host 100.87.81.91 --port 8000
+# ── Edit these paths to match your installation ──
+WorkingDirectory=%h/media-summarizer
+ExecStart=%h/media-summarizer/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+EnvironmentFile=%h/media-summarizer/.env
+# ── End of user-editable paths ──
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=media-summarizer
-EnvironmentFile=/home/aviv/Github/media-summarizer/.env
 
 [Install]
 WantedBy=default.target

@@ -1,6 +1,6 @@
 # Media Summarizer
 
-A personal media intelligence pipeline. Send YouTube or podcast URLs via the web UI, HTTP API, or WhatsApp (through OpenClaw), and get structured AI summaries saved to Notion.
+A personal media intelligence pipeline. Send YouTube or podcast URLs via the web UI or HTTP API, and get structured AI summaries saved to Notion.
 
 ## Features
 
@@ -15,65 +15,158 @@ A personal media intelligence pipeline. Send YouTube or podcast URLs via the web
 
 ## Requirements
 
-- Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/) for dependency management
-- `ffmpeg` (for podcast audio compression and YouTube Whisper fallback)
+- **Python 3.11+**
+- **[`uv`](https://docs.astral.sh/uv/)** — Python package manager
+- **`ffmpeg`** — required for podcast audio compression and YouTube Whisper fallback
 
 ## Setup
 
-### 1. Install uv
+### 1. Install system dependencies
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu / Debian
+sudo apt install ffmpeg
+
+# Verify
+ffmpeg -version
+```
+
+### 2. Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 2. Clone and configure
+### 3. Clone and configure
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/avivweinstein/media-summarizer.git
 cd media-summarizer
 cp .env.example .env
-# Edit .env and fill in all API keys
 ```
 
-### 3. Create venv and install dependencies
+Edit `.env` and fill in your API keys (see [Environment Variables](#environment-variables) below for where to get each one).
+
+### 4. Create venv and install dependencies
 
 ```bash
 uv venv
 uv pip install -e ".[dev]"
 ```
 
-### 4. Start the server
+### 5. Set up Notion
+
+1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) and create a new **Internal Integration**.
+2. Copy the integration token into `NOTION_API_KEY` in your `.env`.
+3. Create a new Notion database with these properties:
+
+   | Property          | Type         |
+   |-------------------|--------------|
+   | Title             | Title        |
+   | URL               | URL          |
+   | Source            | Select       |
+   | Channel / Show    | Rich text    |
+   | Date Added        | Date         |
+   | Duration          | Number       |
+   | Tags              | Multi-select |
+   | Worth Rewatching  | Checkbox     |
+   | TL;DR             | Rich text    |
+   | Published         | Date         |
+   | Thumbnail         | URL          |
+
+4. Click **Share** on your database and invite your integration.
+5. Copy the database ID from the URL (`https://notion.so/yourworkspace/<DATABASE_ID>?v=...`) into `NOTION_DATABASE_ID`.
+
+### 6. Start the server
 
 ```bash
 uv run uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-The dashboard will be available at `http://localhost:8000`.
+Open `http://localhost:8000` in your browser. You should see the dashboard.
+
+### 7. Verify everything works
+
+```bash
+# Quick health check
+curl http://localhost:8000/health
+
+# Deep health check — verifies all API keys and DB connectivity
+curl "http://localhost:8000/health?deep=true"
+```
+
+A healthy response looks like:
+```json
+{"status": "ok", "db": "ok", "anthropic": "ok", "openai": "ok", "notion": "ok", "worker_queue_size": 0}
+```
 
 ---
 
-## Install as systemd user service (bear)
+## Running as a systemd service (Linux)
 
-The service file is configured as a **user-level** systemd service (no root needed):
+To run media-summarizer as a background service that starts on boot:
+
+### Why a systemd service?
+
+Running as a service means:
+- It starts automatically on boot (no need to SSH in and start it manually)
+- It restarts automatically if it crashes
+- Logs are captured by journald (viewable with `journalctl`)
+- It runs without an active terminal session
+
+### Setup
+
+1. **Edit the service file.** Open `media-summarizer.service` and update the paths.
+   The file uses `%h` which systemd expands to your home directory, so if your repo
+   is at `~/media-summarizer`, it works out of the box. If it's elsewhere, update the
+   `WorkingDirectory`, `ExecStart`, and `EnvironmentFile` lines.
+
+2. **Optionally change the bind address.** The default is `127.0.0.1` (localhost only).
+   To make it accessible from other devices on your network, change `--host 127.0.0.1`
+   to `--host 0.0.0.0` or to a specific IP (e.g. a Tailscale IP for VPN-only access).
+
+3. **Install and enable:**
 
 ```bash
+# Copy to systemd user directory
+mkdir -p ~/.config/systemd/user
 cp media-summarizer.service ~/.config/systemd/user/
+
+# Reload, enable (start on boot), and start now
 systemctl --user daemon-reload
-systemctl --user enable media-summarizer
-systemctl --user start media-summarizer
-```
+systemctl --user enable --now media-summarizer
 
-Ensure linger is enabled so the service starts on boot without an SSH session:
-
-```bash
+# Enable linger so the service runs even when you're not logged in
 loginctl enable-linger $USER
 ```
 
-View logs:
+4. **Verify it's running:**
 
 ```bash
+systemctl --user status media-summarizer
+curl http://localhost:8000/health
+```
+
+5. **View logs:**
+
+```bash
+# Follow logs in real-time
 journalctl --user -u media-summarizer -f
+
+# Last 50 lines
+journalctl --user -u media-summarizer -n 50
+```
+
+6. **Restart after pulling new code:**
+
+```bash
+cd ~/media-summarizer
+git pull
+uv pip install -e .
+systemctl --user restart media-summarizer
 ```
 
 ---
@@ -98,28 +191,28 @@ journalctl --user -u media-summarizer -f
 
 ```bash
 # Submit a single video
-curl -X POST http://bear:8000/summarize \
+curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 
-# Submit a playlist
-curl -X POST http://bear:8000/summarize \
+# Submit a playlist (auto-expands into individual jobs)
+curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.youtube.com/playlist?list=PLxxx"}'
 
 # Submit multiple URLs at once
-curl -X POST http://bear:8000/summarize/bulk \
+curl -X POST http://localhost:8000/summarize/bulk \
   -H "Content-Type: application/json" \
   -d '{"urls": ["https://youtu.be/abc", "https://youtu.be/def"]}'
 
-# Cancel a job
-curl -X POST http://bear:8000/job/{job_id}/cancel
+# Cancel a running job
+curl -X POST http://localhost:8000/job/{job_id}/cancel
 
-# Delete failed jobs
-curl -X DELETE http://bear:8000/jobs/failed
+# Delete all failed jobs
+curl -X DELETE http://localhost:8000/jobs/failed
 
-# Deep health check
-curl http://bear:8000/health?deep=true
+# Deep health check (verifies API keys)
+curl "http://localhost:8000/health?deep=true"
 ```
 
 ---
@@ -180,17 +273,39 @@ uv run pytest -m integration
 
 Copy `.env.example` to `.env` and fill in:
 
-| Variable                    | Description                                     |
-|-----------------------------|-------------------------------------------------|
-| `ANTHROPIC_API_KEY`         | Claude API key for summarization                |
-| `OPENAI_API_KEY`            | OpenAI key for Whisper transcription            |
-| `NOTION_API_KEY`            | Notion integration token                        |
-| `NOTION_DATABASE_ID`        | Target Notion database ID                       |
-| `PODCAST_INDEX_API_KEY`     | Podcast Index API key (reserved for future use) |
-| `PODCAST_INDEX_API_SECRET`  | Podcast Index API secret                        |
-| `YOUTUBE_API_KEY`           | YouTube Data API key (optional)                 |
-| `OPENCLAW_WEBHOOK_URL`      | Webhook URL for OpenClaw notifications          |
-| `PORT`                      | Server port (default: 8000)                     |
+| Variable                    | Required | Description                                     | Where to get it |
+|-----------------------------|----------|-------------------------------------------------|-----------------|
+| `ANTHROPIC_API_KEY`         | Yes      | Claude API key for summarization                | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| `OPENAI_API_KEY`            | Yes      | OpenAI key for Whisper transcription            | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `NOTION_API_KEY`            | Yes      | Notion integration token                        | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
+| `NOTION_DATABASE_ID`        | Yes      | Target Notion database ID                       | From your database URL |
+| `YOUTUBE_API_KEY`           | No       | YouTube Data API key (optional metadata optimization) | [Google Cloud Console](https://console.cloud.google.com) |
+| `OPENCLAW_WEBHOOK_URL`      | No       | Webhook URL for notifications                   | Your webhook endpoint |
+| `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
+| `PODCAST_INDEX_API_SECRET`  | No       | Podcast Index API secret                        | Same as above |
+| `PORT`                      | No       | Server port (default: 8000)                     | — |
+
+---
+
+## Troubleshooting
+
+**"No transcript available" for a YouTube video**
+The video may not have captions. Media Summarizer will automatically fall back to Whisper transcription (downloading the audio and transcribing it). If this also fails, ensure `ffmpeg` is installed.
+
+**Deep health check shows "not configured"**
+One or more API keys are missing from your `.env` file. Check the [Environment Variables](#environment-variables) table.
+
+**"ffmpeg not installed" error**
+Whisper fallback and podcast compression require ffmpeg. Install it with `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux).
+
+**Jobs stuck in "processing" after restart**
+Jobs that were mid-processing when the server stopped may remain in "processing" status. They will not auto-retry. You can delete them via the UI or API and resubmit.
+
+**Service won't start (systemd)**
+Check logs with `journalctl --user -u media-summarizer -n 50`. Common issues:
+- Wrong paths in the service file
+- `.env` file missing
+- Python venv not created (`uv venv && uv pip install -e .`)
 
 ---
 
@@ -201,3 +316,9 @@ See [ENHANCEMENTS.md](ENHANCEMENTS.md) for planned improvements including:
 - iOS/Android share sheet integration
 - Search/filter bar in the web UI
 - Additional source types (Spotify, Vimeo, Twitter Spaces)
+
+---
+
+## License
+
+[MIT](LICENSE)
