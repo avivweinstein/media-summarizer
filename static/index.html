@@ -335,19 +335,31 @@
   };
 
   // ---------------------------------------------------------------------------
-  // Copy TL;DR
+  // Copy TL;DR — uses Clipboard API with execCommand fallback for plain HTTP
   // ---------------------------------------------------------------------------
   function copyTldr(event, text) {
     event.stopPropagation();
-    navigator.clipboard.writeText(text).then(() => {
-      const btn = event.currentTarget;
+    const btn = event.currentTarget;
+    function onSuccess() {
       btn.classList.add('copied');
       btn.textContent = 'Copied!';
-      setTimeout(() => {
-        btn.classList.remove('copied');
-        btn.textContent = 'Copy TL;DR';
-      }, 1500);
-    });
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy TL;DR'; }, 1500);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(onSuccess).catch(() => fallbackCopy(text, onSuccess));
+    } else {
+      fallbackCopy(text, onSuccess);
+    }
+  }
+  function fallbackCopy(text, onSuccess) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); onSuccess(); } catch(e) {}
+    document.body.removeChild(ta);
   }
 
   // ---------------------------------------------------------------------------
@@ -434,7 +446,7 @@
       const points = (s.key_points || []).map(p => `<li>${esc(p)}</li>`).join('');
       const notionUrl = job.notion_page_id
         ? `https://www.notion.so/${job.notion_page_id.replace(/-/g,'')}` : null;
-      const worthBadge = s.worth_rewatching ? '<span class="worth-badge">\u2605 Worth rewatching</span>' : '';
+      const worthBadge = s.worth_rewatching ? '<span class="worth-badge" title="Dense with actionable insights, reference material, or expert-level depth that rewards re-watching">\u2605 Worth rewatching</span>' : '';
 
       detailHtml = `
         <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>

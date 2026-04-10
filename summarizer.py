@@ -45,7 +45,12 @@ SYSTEM_PROMPT = (
     "- tldr: 2-3 sentences capturing the core message\n"
     "- key_points: 5-8 bullet points, each a complete sentence\n"
     "- tags: pick from the canonical list below, or add new tags if content clearly warrants it\n"
-    "- worth_rewatching: true if content is dense with actionable insights or reference material\n\n"
+    "- worth_rewatching: true if the content meets ANY of these criteria:\n"
+    "    - Dense with specific, actionable advice you'd want to revisit\n"
+    "    - Contains reference material (frameworks, checklists, how-to steps) that's hard to memorize\n"
+    "    - Features expert-level depth that rewards repeated viewing\n"
+    "    - Has nuanced arguments that a summary alone doesn't fully capture\n"
+    "  Set false if the content is entertaining but shallow, news/current events, or fully captured by the summary.\n\n"
     "Canonical tags: " + ", ".join(CANONICAL_TAGS)
 )
 
