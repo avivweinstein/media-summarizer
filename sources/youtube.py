@@ -1,11 +1,13 @@
 """YouTube source — transcript via youtube-transcript-api, metadata via yt-dlp.
 
-No transcript → NoTranscriptError. No audio fallback, ever.
+If no native transcript is available, falls back to downloading audio via yt-dlp
+and transcribing with OpenAI Whisper.
 """
 
 import asyncio
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
@@ -19,6 +21,7 @@ from youtube_transcript_api._errors import (
 from exceptions import MetadataError, NoTranscriptError
 from models import TranscriptResult
 from sources.base import BaseSource
+from transcriber import tmp_path_for_job, transcribe
 
 logger = logging.getLogger(__name__)
 
@@ -38,21 +41,23 @@ def _extract_video_id(url: str) -> str:
     return ids[0]
 
 
-def _fetch_transcript_sync(video_id: str) -> str:
-    """Fetch transcript text. Tries English first, falls back to any available language."""
+def _fetch_transcript_sync(video_id: str) -> str | None:
+    """Fetch transcript text. Returns None if no transcript is available.
+
+    Tries native English transcript first, falls back to any language.
+    Returns None (instead of raising) so the caller can fall back to Whisper.
+    """
     api = YouTubeTranscriptApi()
     try:
         listing = api.list(video_id)
-    except TranscriptsDisabled:
-        raise NoTranscriptError("Transcripts are disabled for this video.")
-    except VideoUnavailable:
-        raise NoTranscriptError("Video is unavailable (private or deleted).")
-    except Exception as e:
-        raise NoTranscriptError(f"Could not list transcripts: {e}") from e
+    except (TranscriptsDisabled, VideoUnavailable):
+        return None
+    except Exception:
+        return None
 
     available = list(listing)
     if not available:
-        raise NoTranscriptError("No transcript available for this video. Skipping.")
+        return None
 
     # Prefer human-made English, then any English, then first available
     try:
@@ -66,8 +71,8 @@ def _fetch_transcript_sync(video_id: str) -> str:
 
     try:
         fetched = transcript_obj.fetch()
-    except Exception as e:
-        raise NoTranscriptError(f"Failed to fetch transcript content: {e}") from e
+    except Exception:
+        return None
 
     return " ".join(snippet.text for snippet in fetched)
 
@@ -103,6 +108,29 @@ def _parse_upload_date(raw: str | None) -> datetime | None:
         return None
 
 
+def _download_audio_sync(url: str, dest: Path) -> None:
+    """Download audio from a YouTube video via yt-dlp as MP3."""
+    opts: dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "outtmpl": str(dest.with_suffix(".%(ext)s")),
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",
+            }
+        ],
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    # yt-dlp may produce dest.mp3 — rename to the exact path we want
+    actual = dest.with_suffix(".mp3")
+    if actual.exists() and actual != dest:
+        actual.rename(dest)
+
+
 class YouTubeSource(BaseSource):
     def __init__(self, youtube_api_key: str = "") -> None:
         self.youtube_api_key = youtube_api_key
@@ -111,11 +139,26 @@ class YouTubeSource(BaseSource):
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
         loop = asyncio.get_event_loop()
 
+        # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
         transcript = await loop.run_in_executor(
             None, _fetch_transcript_sync, _extract_video_id(url)
         )
-        logger.info("%s event=transcript_fetch_done chars=%d", log, len(transcript))
+
+        if transcript:
+            logger.info("%s event=transcript_fetch_done chars=%d method=native", log, len(transcript))
+        else:
+            # Fall back to Whisper: download audio, transcribe
+            logger.info("%s event=transcript_native_unavailable fallback=whisper", log)
+            dest = tmp_path_for_job(job_id)
+            logger.info("%s event=audio_download_start", log)
+            await loop.run_in_executor(None, _download_audio_sync, url, dest)
+            logger.info(
+                "%s event=audio_download_done size_mb=%.1f",
+                log, dest.stat().st_size / 1e6 if dest.exists() else 0,
+            )
+            transcript = await transcribe(dest, job_id)
+            logger.info("%s event=transcript_fetch_done chars=%d method=whisper", log, len(transcript))
 
         logger.info("%s event=metadata_fetch_start", log)
         meta = await loop.run_in_executor(

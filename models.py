@@ -9,6 +9,18 @@ class JobStatus(StrEnum):
     processing = "processing"
     done = "done"
     failed = "failed"
+    cancelled = "cancelled"
+
+
+class JobStage(StrEnum):
+    """Fine-grained pipeline stage, shown in UI during processing."""
+    queued = "queued"
+    detecting = "detecting"
+    transcribing = "transcribing"
+    summarizing = "summarizing"
+    saving_notion = "saving_notion"
+    done = "done"
+    failed = "failed"
 
 
 class TranscriptResult(BaseModel):
@@ -33,6 +45,7 @@ class Job(BaseModel):
     job_id: str
     url: str
     status: JobStatus
+    stage: JobStage = JobStage.queued
     created_at: datetime
     updated_at: datetime
     retry_count: int = 0
@@ -41,6 +54,7 @@ class Job(BaseModel):
     notion_page_id: str | None = None
     error: str | None = None
     webhook_url: str | None = None
+    parent_job_id: str | None = None  # set when this job was spawned from a playlist/bulk
 
 
 class SummarizeRequest(BaseModel):
@@ -52,9 +66,20 @@ class SummarizeResponse(BaseModel):
     job_id: str
 
 
+class BulkSummarizeRequest(BaseModel):
+    """Submit multiple URLs or a playlist URL."""
+    urls: list[str]
+    webhook_url: str | None = None
+
+
+class BulkSummarizeResponse(BaseModel):
+    job_ids: list[str]
+
+
 class JobResponse(BaseModel):
     job_id: str
     status: JobStatus
+    stage: JobStage = JobStage.queued
     url: str
     created_at: datetime
     updated_at: datetime
@@ -63,3 +88,4 @@ class JobResponse(BaseModel):
     summary: Summary | None = None
     notion_page_id: str | None = None
     error: str | None = None
+    parent_job_id: str | None = None

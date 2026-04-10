@@ -32,19 +32,21 @@ class TestYouTubeURLs:
         assert detect_source("https://youtu.be/abc123?t=30") == "youtube"
 
     def test_youtube_channel_rejected(self) -> None:
-        with pytest.raises(UnsupportedURLError, match="video URLs"):
+        with pytest.raises(UnsupportedURLError, match="video URLs|playlist"):
             detect_source("https://www.youtube.com/channel/UCabc123")
 
     def test_youtube_user_rejected(self) -> None:
-        with pytest.raises(UnsupportedURLError, match="video URLs"):
+        with pytest.raises(UnsupportedURLError, match="video URLs|playlist"):
             detect_source("https://www.youtube.com/@SomeCreator")
 
-    def test_youtube_playlist_rejected(self) -> None:
-        with pytest.raises(UnsupportedURLError, match="video URLs"):
-            detect_source("https://www.youtube.com/playlist?list=PLabc")
+    def test_youtube_playlist_accepted(self) -> None:
+        assert detect_source("https://www.youtube.com/playlist?list=PLabc") == "youtube_playlist"
+
+    def test_youtube_playlist_with_list_param(self) -> None:
+        assert detect_source("https://www.youtube.com/playlist?list=PLxyz123") == "youtube_playlist"
 
     def test_youtube_homepage_rejected(self) -> None:
-        with pytest.raises(UnsupportedURLError, match="video URLs"):
+        with pytest.raises(UnsupportedURLError, match="video URLs|playlist"):
             detect_source("https://www.youtube.com/")
 
 

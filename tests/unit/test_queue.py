@@ -8,7 +8,7 @@ All tests use a fresh temporary SQLite file — no shared state between tests.
 from datetime import UTC
 
 import job_queue
-from models import JobStatus, TranscriptResult
+from models import JobStage, JobStatus, TranscriptResult
 
 
 async def test_create_job_has_correct_defaults(db_path: str) -> None:
@@ -154,3 +154,105 @@ async def test_notion_page_id_persists(db_path: str) -> None:
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.notion_page_id == "abc-123-notion-page"
+
+
+# ---------------------------------------------------------------------------
+# New feature tests: stage, cancellation, deletion, TTL, parent_job_id
+# ---------------------------------------------------------------------------
+
+
+async def test_create_job_has_queued_stage(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    assert job.stage == JobStage.queued
+
+
+async def test_stage_persists_through_update(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.stage = JobStage.transcribing
+    job.status = JobStatus.processing
+    await job_queue.update_job(job, db_path=db_path)
+
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.stage == JobStage.transcribing
+
+
+async def test_cancelled_status(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.cancelled
+    await job_queue.update_job(job, db_path=db_path)
+
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.status == JobStatus.cancelled
+
+
+async def test_parent_job_id_persists(db_path: str) -> None:
+    job = await job_queue.create_job(
+        "https://youtube.com/watch?v=abc", parent_job_id="parent-123", db_path=db_path
+    )
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.parent_job_id == "parent-123"
+
+
+async def test_delete_job(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    deleted = await job_queue.delete_job(job.job_id, db_path=db_path)
+    assert deleted is True
+    assert await job_queue.get_job(job.job_id, db_path=db_path) is None
+
+
+async def test_delete_job_returns_false_for_missing(db_path: str) -> None:
+    deleted = await job_queue.delete_job("nonexistent", db_path=db_path)
+    assert deleted is False
+
+
+async def test_delete_jobs_by_status(db_path: str) -> None:
+    j1 = await job_queue.create_job("https://youtube.com/watch?v=a", db_path=db_path)
+    j2 = await job_queue.create_job("https://youtube.com/watch?v=b", db_path=db_path)
+    j3 = await job_queue.create_job("https://youtube.com/watch?v=c", db_path=db_path)
+    j1.status = JobStatus.failed
+    j1.error = "err"
+    j2.status = JobStatus.failed
+    j2.error = "err"
+    j3.status = JobStatus.done
+    await job_queue.update_job(j1, db_path=db_path)
+    await job_queue.update_job(j2, db_path=db_path)
+    await job_queue.update_job(j3, db_path=db_path)
+
+    count = await job_queue.delete_jobs_by_status("failed", db_path=db_path)
+    assert count == 2
+    # done job should still exist
+    assert await job_queue.get_job(j3.job_id, db_path=db_path) is not None
+
+
+async def test_delete_old_jobs_respects_age(db_path: str) -> None:
+    from datetime import timedelta
+
+    # Create a job and manually backdate it
+    job = await job_queue.create_job("https://youtube.com/watch?v=old", db_path=db_path)
+    job.status = JobStatus.done
+    job.created_at = job.created_at - timedelta(days=100)
+    await job_queue.update_job(job, db_path=db_path)
+
+    # Manually update created_at in the DB (update_job doesn't touch created_at)
+    import aiosqlite
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE jobs SET created_at = ? WHERE job_id = ?",
+            (job.created_at.isoformat(), job.job_id),
+        )
+        await db.commit()
+
+    deleted = await job_queue.delete_old_jobs(max_age_days=90, db_path=db_path)
+    assert deleted == 1
+
+
+async def test_delete_old_jobs_keeps_recent(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=new", db_path=db_path)
+    job.status = JobStatus.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    deleted = await job_queue.delete_old_jobs(max_age_days=90, db_path=db_path)
+    assert deleted == 0

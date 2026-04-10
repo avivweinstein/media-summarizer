@@ -3,18 +3,20 @@
 Coordinates: detect source → source.fetch() → summarizer.summarize() → notion.save()
 Failed jobs are retried up to MAX_RETRIES times with exponential backoff.
 On completion (success or final failure), fires the per-job webhook if configured.
+Playlist/bulk URLs are expanded into individual jobs.
 """
 
 import asyncio
 import logging
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
+import yt_dlp
 
 import job_queue
 from config import settings
 from exceptions import UnsupportedURLError
-from models import Job, JobStatus, TranscriptResult
+from models import Job, JobStage, JobStatus, TranscriptResult
 from notion_writer import save_to_notion
 from sources.podcast import PodcastSource
 from sources.youtube import YouTubeSource
@@ -31,17 +33,22 @@ _BACKOFF_SECONDS = [5, 10, 20]  # sleep before attempt 2, 3, 4 (never used for a
 
 
 def detect_source(url: str) -> str:
-    """Return source type ('youtube' | 'podcast') or raise UnsupportedURLError."""
+    """Return source type ('youtube' | 'podcast' | 'youtube_playlist') or raise UnsupportedURLError."""
     parsed = urlparse(url.strip())
     hostname = (parsed.hostname or "").lower().lstrip("www.")
 
     if hostname in {"youtube.com", "youtu.be", "m.youtube.com"}:
-        # Must be a video URL, not a channel/playlist
+        qs = parse_qs(parsed.query or "")
+        # Playlist URL: has 'list' param but no 'v' param, or is /playlist path
+        is_playlist = "playlist" in parsed.path or ("list" in qs and "v" not in qs)
+        if is_playlist:
+            return "youtube_playlist"
+
         is_watch = "watch" in parsed.path or parsed.hostname == "youtu.be"
-        has_v = "v=" in (parsed.query or "")
+        has_v = "v" in qs
         if not (is_watch or has_v):
             raise UnsupportedURLError(
-                "Only YouTube video URLs are supported (youtube.com/watch?v=... or youtu.be/...)."
+                "Only YouTube video URLs or playlist URLs are supported."
             )
         return "youtube"
 
@@ -54,9 +61,38 @@ def detect_source(url: str) -> str:
         return "podcast"
 
     raise UnsupportedURLError(
-        "Unsupported source. Supported: YouTube (youtube.com/watch, youtu.be), "
+        "Unsupported source. Supported: YouTube (video or playlist), "
         "Apple Podcasts, direct RSS/MP3."
     )
+
+
+def _extract_playlist_videos_sync(url: str) -> list[str]:
+    """Extract individual video URLs from a YouTube playlist via yt-dlp."""
+    opts: dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if info is None:
+        return []
+
+    entries = info.get("entries") or []
+    urls: list[str] = []
+    for entry in entries:
+        vid = entry.get("id") or entry.get("url")
+        if vid:
+            urls.append(f"https://www.youtube.com/watch?v={vid}")
+    return urls
+
+
+async def expand_playlist(url: str) -> list[str]:
+    """Expand a playlist URL into individual video URLs. Runs yt-dlp in executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _extract_playlist_videos_sync, url)
 
 
 async def _notify_webhook(job: Job) -> None:
@@ -98,10 +134,23 @@ async def _notify_webhook(job: Job) -> None:
         logger.warning("job_id=%s event=webhook_failed error=%r", job.job_id, str(e))
 
 
+async def _check_cancelled(job: Job, db_path: str) -> bool:
+    """Re-read job from DB and return True if it's been cancelled."""
+    fresh = await job_queue.get_job(job.job_id, db_path=db_path)
+    return fresh is not None and fresh.status == JobStatus.cancelled
+
+
+async def _set_stage(job: Job, stage: JobStage, db_path: str) -> None:
+    """Update the job's stage and persist it."""
+    job.stage = stage
+    await job_queue.update_job(job, db_path=db_path)
+
+
 async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     """Execute the full pipeline for a job, with up to MAX_RETRIES attempts.
 
     Updates job state in DB throughout. Fires webhook on success or final failure.
+    Checks for cancellation between pipeline stages.
     """
     job = await job_queue.get_job(job_id, db_path=db_path)
     if job is None:
@@ -112,6 +161,10 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     last_error = ""
 
     for attempt in range(MAX_RETRIES):
+        if await _check_cancelled(job, db_path):
+            logger.info("job_id=%s event=job_cancelled", job.job_id)
+            return
+
         if attempt > 0:
             backoff = _BACKOFF_SECONDS[attempt - 1]
             logger.warning(
@@ -122,13 +175,18 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
         job.status = JobStatus.processing
         job.retry_count = attempt
-        await job_queue.update_job(job, db_path=db_path)
+        await _set_stage(job, JobStage.detecting, db_path)
 
         try:
             source_type = detect_source(job.url)
             log = f"job_id={job.job_id} url={job.url[:60]!r} source={source_type}"
             logger.info("%s event=job_started attempt=%d", log, attempt + 1)
 
+            if await _check_cancelled(job, db_path):
+                return
+
+            # --- Transcription stage ---
+            await _set_stage(job, JobStage.transcribing, db_path)
             result: TranscriptResult
             if source_type == "youtube":
                 source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
@@ -138,13 +196,24 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
             job.result = result
 
+            if await _check_cancelled(job, db_path):
+                return
+
+            # --- Summarization stage ---
+            await _set_stage(job, JobStage.summarizing, db_path)
             summary = await summarize(result, job_id=job.job_id)
             job.summary = summary
 
+            if await _check_cancelled(job, db_path):
+                return
+
+            # --- Save to Notion stage ---
+            await _set_stage(job, JobStage.saving_notion, db_path)
             page_id = await save_to_notion(result, summary, job_id=job.job_id)
             job.notion_page_id = page_id
 
             job.status = JobStatus.done
+            job.stage = JobStage.done
             logger.info("%s event=job_completed title=%r", log, result.title)
             await job_queue.update_job(job, db_path=db_path)
             await _notify_webhook(job)
@@ -158,6 +227,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             )
 
     job.status = JobStatus.failed
+    job.stage = JobStage.failed
     job.error = last_error
     logger.error("%s event=job_failed_final error=%r", log, last_error)
     await job_queue.update_job(job, db_path=db_path)

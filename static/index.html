@@ -5,100 +5,428 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Media Summarizer</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #222; }
+    :root {
+      --bg: #f0f2f5;
+      --card-bg: #fff;
+      --card-border: #e5e7eb;
+      --text: #222;
+      --text-secondary: #6b7280;
+      --text-muted: #9ca3af;
+      --header-bg: #111827;
+      --header-text: #fff;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #16a34a;
+      --error: #dc2626;
+      --error-bg: #fef2f2;
+      --error-border: #ef4444;
+      --tag-bg: #eff6ff;
+      --tag-text: #1d4ed8;
+      --badge-pending-bg: #fef9c3;
+      --badge-pending-text: #854d0e;
+      --badge-processing-bg: #dbeafe;
+      --badge-processing-text: #1e40af;
+      --badge-done-bg: #dcfce7;
+      --badge-done-text: #166534;
+      --badge-failed-bg: #fee2e2;
+      --badge-failed-text: #991b1b;
+      --badge-cancelled-bg: #f3f4f6;
+      --badge-cancelled-text: #6b7280;
+      --input-bg: #fff;
+      --input-border: #d1d5db;
+      --shadow: rgba(0,0,0,.08);
+      --shadow-hover: rgba(0,0,0,.12);
+      --divider: #f3f4f6;
+      --code-bg: #f3f4f6;
+    }
 
-    header { background: #111827; color: #fff; padding: 0.9rem 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+    [data-theme="dark"] {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --header-bg: #020617;
+      --header-text: #f1f5f9;
+      --accent: #60a5fa;
+      --accent-hover: #3b82f6;
+      --success: #4ade80;
+      --error: #f87171;
+      --error-bg: #1e1214;
+      --error-border: #7f1d1d;
+      --tag-bg: #1e293b;
+      --tag-text: #93c5fd;
+      --badge-pending-bg: #422006;
+      --badge-pending-text: #fde68a;
+      --badge-processing-bg: #1e3a5f;
+      --badge-processing-text: #93c5fd;
+      --badge-done-bg: #052e16;
+      --badge-done-text: #86efac;
+      --badge-failed-bg: #450a0a;
+      --badge-failed-text: #fca5a5;
+      --badge-cancelled-bg: #1e293b;
+      --badge-cancelled-text: #94a3b8;
+      --input-bg: #1e293b;
+      --input-border: #475569;
+      --shadow: rgba(0,0,0,.3);
+      --shadow-hover: rgba(0,0,0,.5);
+      --divider: #334155;
+      --code-bg: #334155;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+      transition: background .2s, color .2s;
+    }
+
+    /* Header */
+    header {
+      background: var(--header-bg); color: var(--header-text);
+      padding: 0.9rem 1.5rem;
+      display: flex; justify-content: space-between; align-items: center;
+    }
     header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; }
-    #refresh-status { font-size: 0.75rem; color: #9ca3af; }
+    .header-right { display: flex; align-items: center; gap: 1rem; }
+    #refresh-status { font-size: 0.75rem; color: var(--text-muted); }
+
+    /* Theme toggle */
+    .theme-toggle {
+      background: none; border: none; cursor: pointer;
+      font-size: 1.2rem; line-height: 1; padding: 4px;
+      color: var(--header-text); opacity: 0.7;
+    }
+    .theme-toggle:hover { opacity: 1; }
 
     main { max-width: 860px; margin: 1.5rem auto; padding: 0 1rem; }
 
-    .job { background: #fff; border-radius: 10px; margin-bottom: 0.9rem; padding: 1rem 1.2rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); cursor: pointer; transition: box-shadow .15s; border: 1px solid #e5e7eb; }
-    .job:hover { box-shadow: 0 3px 10px rgba(0,0,0,.12); }
+    /* Submit form */
+    .submit-form {
+      background: var(--card-bg); border-radius: 10px;
+      padding: 1rem 1.2rem; margin-bottom: 1.2rem;
+      box-shadow: 0 1px 3px var(--shadow);
+      border: 1px solid var(--card-border);
+    }
+    .submit-form form { display: flex; gap: 0.6rem; }
+    .submit-form input[type="text"] {
+      flex: 1; padding: 0.6rem 0.8rem; border-radius: 6px;
+      border: 1px solid var(--input-border);
+      background: var(--input-bg); color: var(--text);
+      font-size: 0.9rem; outline: none;
+      transition: border-color .15s;
+    }
+    .submit-form input[type="text"]:focus { border-color: var(--accent); }
+    .submit-form input[type="text"]::placeholder { color: var(--text-muted); }
+    .submit-btn {
+      padding: 0.6rem 1.2rem; border-radius: 6px; border: none;
+      background: var(--accent); color: #fff;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer;
+      white-space: nowrap; transition: background .15s;
+    }
+    .submit-btn:hover { background: var(--accent-hover); }
+    .submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .submit-error {
+      margin-top: 0.5rem; font-size: 0.8rem; color: var(--error);
+      display: none;
+    }
+
+    /* Job cards */
+    .job {
+      background: var(--card-bg); border-radius: 10px;
+      margin-bottom: 0.9rem; padding: 1rem 1.2rem;
+      box-shadow: 0 1px 3px var(--shadow); cursor: pointer;
+      transition: box-shadow .15s;
+      border: 1px solid var(--card-border);
+    }
+    .job:hover { box-shadow: 0 3px 10px var(--shadow-hover); }
+    .job.highlight { animation: highlight-fade 2s ease-out; }
+    @keyframes highlight-fade {
+      0% { box-shadow: 0 0 0 3px var(--accent); }
+      100% { box-shadow: 0 1px 3px var(--shadow); }
+    }
 
     .job-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
     .job-title { font-weight: 600; font-size: 0.95rem; line-height: 1.4; flex: 1; }
-    .job-meta { font-size: 0.78rem; color: #6b7280; margin-top: 0.25rem; }
+    .job-meta { font-size: 0.78rem; color: var(--text-secondary); margin-top: 0.25rem; }
 
-    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; flex-shrink: 0; }
-    .badge-pending    { background: #fef9c3; color: #854d0e; }
-    .badge-processing { background: #dbeafe; color: #1e40af; }
-    .badge-done       { background: #dcfce7; color: #166534; }
-    .badge-failed     { background: #fee2e2; color: #991b1b; }
-    .badge-processing::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3b82f6; animation: pulse 1.2s ease-in-out infinite; }
+    /* Stage indicator */
+    .job-stage {
+      font-size: 0.72rem; color: var(--accent); margin-top: 0.2rem;
+      font-weight: 500; text-transform: capitalize;
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 9px; border-radius: 20px;
+      font-size: 0.7rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .badge-pending    { background: var(--badge-pending-bg); color: var(--badge-pending-text); }
+    .badge-processing { background: var(--badge-processing-bg); color: var(--badge-processing-text); }
+    .badge-done       { background: var(--badge-done-bg); color: var(--badge-done-text); }
+    .badge-failed     { background: var(--badge-failed-bg); color: var(--badge-failed-text); }
+    .badge-cancelled  { background: var(--badge-cancelled-bg); color: var(--badge-cancelled-text); }
+    .badge-processing::before {
+      content: ''; display: inline-block; width: 7px; height: 7px;
+      border-radius: 50%; background: var(--accent);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
     @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
 
-    .detail { display: none; margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px solid #f3f4f6; }
+    /* Detail panel */
+    .detail { display: none; margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px solid var(--divider); }
     .detail.open { display: block; }
 
     .url-row { margin-bottom: 0.8rem; }
-    .url-link { font-size: 0.78rem; color: #6b7280; word-break: break-all; text-decoration: none; }
-    .url-link:hover { color: #3b82f6; text-decoration: underline; }
+    .url-link { font-size: 0.78rem; color: var(--text-secondary); word-break: break-all; text-decoration: none; }
+    .url-link:hover { color: var(--accent); text-decoration: underline; }
 
-    .tldr { font-size: 0.9rem; line-height: 1.6; color: #374151; margin-bottom: 0.8rem; }
+    .tldr { font-size: 0.9rem; line-height: 1.6; color: var(--text-secondary); margin-bottom: 0.8rem; }
 
-    .section-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #9ca3af; margin-bottom: 0.4rem; }
+    .section-label {
+      font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.4rem;
+    }
     .key-points { list-style: none; padding: 0; margin-bottom: 0.8rem; }
-    .key-points li { font-size: 0.86rem; line-height: 1.5; padding: 0.25rem 0 0.25rem 1rem; position: relative; color: #374151; }
-    .key-points li::before { content: '•'; position: absolute; left: 0; color: #9ca3af; }
+    .key-points li {
+      font-size: 0.86rem; line-height: 1.5;
+      padding: 0.25rem 0 0.25rem 1rem; position: relative; color: var(--text-secondary);
+    }
+    .key-points li::before { content: '\2022'; position: absolute; left: 0; color: var(--text-muted); }
 
     .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.8rem; }
-    .tag { background: #eff6ff; color: #1d4ed8; padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 500; }
+    .tag {
+      background: var(--tag-bg); color: var(--tag-text);
+      padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 500;
+    }
 
     .footer-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
-    .notion-btn { display: inline-flex; align-items: center; gap: 0.4rem; padding: 6px 14px; background: #111827; color: #fff; border-radius: 6px; text-decoration: none; font-size: 0.8rem; font-weight: 500; }
-    .notion-btn:hover { background: #374151; }
-    .worth-badge { font-size: 0.78rem; color: #16a34a; font-weight: 500; }
+    .notion-btn {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 6px 14px; background: var(--header-bg); color: var(--header-text);
+      border-radius: 6px; text-decoration: none; font-size: 0.8rem; font-weight: 500;
+    }
+    .notion-btn:hover { opacity: 0.85; }
+    .worth-badge { font-size: 0.78rem; color: var(--success); font-weight: 500; }
 
-    .error-text { font-size: 0.86rem; color: #dc2626; background: #fef2f2; padding: 0.6rem 0.8rem; border-radius: 6px; border-left: 3px solid #ef4444; }
-    .retry-note { font-size: 0.75rem; color: #6b7280; margin-top: 0.2rem; }
+    /* Copy button */
+    .copy-btn {
+      background: none; border: 1px solid var(--input-border);
+      border-radius: 6px; padding: 4px 10px; cursor: pointer;
+      font-size: 0.75rem; color: var(--text-secondary);
+      transition: border-color .15s, color .15s;
+    }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .copy-btn.copied { border-color: var(--success); color: var(--success); }
 
-    #empty { text-align: center; color: #9ca3af; padding: 4rem 2rem; font-size: 0.95rem; }
+    /* Action buttons (cancel, delete) */
+    .action-btn {
+      background: none; border: 1px solid var(--input-border);
+      border-radius: 6px; padding: 4px 10px; cursor: pointer;
+      font-size: 0.75rem; color: var(--text-secondary);
+      transition: all .15s;
+    }
+    .action-btn:hover { border-color: var(--error); color: var(--error); }
+    .action-btn.cancel-btn:hover { border-color: #f59e0b; color: #f59e0b; }
+
+    .error-text {
+      font-size: 0.86rem; color: var(--error);
+      background: var(--error-bg); padding: 0.6rem 0.8rem;
+      border-radius: 6px; border-left: 3px solid var(--error-border);
+    }
+    .retry-note { font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem; }
+
+    #empty { text-align: center; color: var(--text-muted); padding: 4rem 2rem; font-size: 0.95rem; }
     #empty p { margin-bottom: 0.4rem; }
-    #empty code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+    #empty code { background: var(--code-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+
+    /* Mobile responsive */
+    @media (max-width: 600px) {
+      header { padding: 0.7rem 1rem; }
+      header h1 { font-size: 1rem; }
+      main { padding: 0 0.5rem; margin: 0.8rem auto; }
+      .submit-form form { flex-direction: column; }
+      .submit-btn { width: 100%; padding: 0.75rem; }
+      .job { padding: 0.8rem; }
+      .job-header { gap: 0.5rem; }
+      .job-title { font-size: 0.88rem; }
+      .footer-row { gap: 0.5rem; }
+      .notion-btn { padding: 8px 16px; font-size: 0.85rem; }
+      .copy-btn, .action-btn { padding: 6px 12px; font-size: 0.8rem; }
+      /* Bigger touch targets */
+      .job { min-height: 54px; }
+    }
   </style>
 </head>
 <body>
 
 <header>
   <h1>Media Summarizer</h1>
-  <span id="refresh-status">Loading…</span>
+  <div class="header-right">
+    <span id="refresh-status">Connecting...</span>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">
+      <span id="theme-icon">&#9790;</span>
+    </button>
+  </div>
 </header>
 
 <main>
+  <div class="submit-form">
+    <form id="submit-form" onsubmit="submitUrl(event)">
+      <input type="text" id="url-input" placeholder="Paste a YouTube, podcast, or playlist URL..." autocomplete="off" />
+      <button type="submit" class="submit-btn" id="submit-btn">Summarize</button>
+    </form>
+    <div class="submit-error" id="submit-error"></div>
+  </div>
   <div id="jobs-container"></div>
   <div id="empty" style="display:none">
     <p>No jobs yet.</p>
-    <p>POST a URL to <code>/summarize</code> to get started.</p>
+    <p>Paste a URL above to get started.</p>
   </div>
 </main>
 
 <script>
   const openIds = new Set();
+  let lastSubmittedJobId = null;
 
+  // ---------------------------------------------------------------------------
+  // Theme
+  // ---------------------------------------------------------------------------
+  function getTheme() {
+    return localStorage.getItem('theme') || 'light';
+  }
+  function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    document.getElementById('theme-icon').innerHTML = theme === 'dark' ? '&#9788;' : '&#9790;';
+    localStorage.setItem('theme', theme);
+  }
+  function toggleTheme() {
+    applyTheme(getTheme() === 'dark' ? 'light' : 'dark');
+  }
+  applyTheme(getTheme());
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
   function fmt(iso) {
     return new Date(iso).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
   }
-
   function fmtDuration(secs) {
     if (!secs) return null;
     const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
-
   function esc(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
+  const STAGE_LABELS = {
+    queued: 'Queued',
+    detecting: 'Detecting source...',
+    transcribing: 'Transcribing...',
+    summarizing: 'Summarizing with Claude...',
+    saving_notion: 'Saving to Notion...',
+    done: 'Complete',
+    failed: 'Failed',
+  };
+
+  // ---------------------------------------------------------------------------
+  // Copy TL;DR
+  // ---------------------------------------------------------------------------
+  function copyTldr(event, text) {
+    event.stopPropagation();
+    navigator.clipboard.writeText(text).then(() => {
+      const btn = event.currentTarget;
+      btn.classList.add('copied');
+      btn.textContent = 'Copied!';
+      setTimeout(() => {
+        btn.classList.remove('copied');
+        btn.textContent = 'Copy TL;DR';
+      }, 1500);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cancel / Delete
+  // ---------------------------------------------------------------------------
+  async function cancelJob(event, jobId) {
+    event.stopPropagation();
+    if (!confirm('Cancel this job?')) return;
+    try {
+      await fetch(`/job/${jobId}/cancel`, { method: 'POST' });
+    } catch(e) {}
+  }
+
+  async function deleteJob(event, jobId) {
+    event.stopPropagation();
+    if (!confirm('Delete this job?')) return;
+    try {
+      await fetch(`/job/${jobId}`, { method: 'DELETE' });
+      openIds.delete(jobId);
+    } catch(e) {}
+  }
+
+  async function clearFailed() {
+    if (!confirm('Delete all failed jobs?')) return;
+    try { await fetch('/jobs/failed', { method: 'DELETE' }); } catch(e) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Submit URL
+  // ---------------------------------------------------------------------------
+  async function submitUrl(event) {
+    event.preventDefault();
+    const input = document.getElementById('url-input');
+    const btn = document.getElementById('submit-btn');
+    const errorEl = document.getElementById('submit-error');
+    const url = input.value.trim();
+    if (!url) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Submitting...';
+    errorEl.style.display = 'none';
+
+    try {
+      const resp = await fetch('/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json();
+        throw new Error(data.detail || 'Request failed');
+      }
+      const data = await resp.json();
+      lastSubmittedJobId = data.job_id;
+      input.value = '';
+    } catch (e) {
+      errorEl.textContent = e.message;
+      errorEl.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Summarize';
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
   function renderJob(job) {
     const r = job.result;
     const s = job.summary;
     const title = r?.title || job.url.slice(0, 70);
     const metaParts = [r?.source, r?.channel_or_show, fmtDuration(r?.duration_seconds)].filter(Boolean);
-    const meta = metaParts.join(' · ');
+    const meta = metaParts.join(' \u00b7 ');
     const retryNote = job.retry_count > 0
       ? `<div class="retry-note">Attempt ${job.retry_count + 1} of 3</div>` : '';
+
+    // Stage indicator for processing jobs
+    const stageLabel = (job.status === 'processing' || job.status === 'pending')
+      ? `<div class="job-stage">${STAGE_LABELS[job.stage] || job.stage}</div>` : '';
 
     let detailHtml = '';
     if (job.status === 'done' && s) {
@@ -106,7 +434,7 @@
       const points = (s.key_points || []).map(p => `<li>${esc(p)}</li>`).join('');
       const notionUrl = job.notion_page_id
         ? `https://www.notion.so/${job.notion_page_id.replace(/-/g,'')}` : null;
-      const worthBadge = s.worth_rewatching ? '<span class="worth-badge">★ Worth rewatching</span>' : '';
+      const worthBadge = s.worth_rewatching ? '<span class="worth-badge">\u2605 Worth rewatching</span>' : '';
 
       detailHtml = `
         <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
@@ -115,29 +443,47 @@
         ${tags ? `<div class="tags">${tags}</div>` : ''}
         <div class="footer-row">
           ${notionUrl ? `<a class="notion-btn" href="${notionUrl}" target="_blank" rel="noopener">Open in Notion</a>` : ''}
+          <button class="copy-btn" onclick="copyTldr(event, ${JSON.stringify(s.tldr).replace(/"/g, '&quot;')})">Copy TL;DR</button>
           ${worthBadge}
+          <button class="action-btn" onclick="deleteJob(event, '${job.job_id}')">Delete</button>
         </div>
       `;
     } else if (job.status === 'failed') {
       detailHtml = `
         <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
         <div class="error-text">${esc(job.error || 'Unknown error')}</div>
+        <div class="footer-row" style="margin-top:0.6rem">
+          <button class="action-btn" onclick="deleteJob(event, '${job.job_id}')">Delete</button>
+        </div>
+      `;
+    } else if (job.status === 'cancelled') {
+      detailHtml = `
+        <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
+        <div class="retry-note">Cancelled by user</div>
+        <div class="footer-row" style="margin-top:0.6rem">
+          <button class="action-btn" onclick="deleteJob(event, '${job.job_id}')">Delete</button>
+        </div>
       `;
     } else {
       detailHtml = `
         <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
-        <div class="retry-note">Processing…</div>
+        <div class="retry-note">Processing\u2026</div>
+        <div class="footer-row" style="margin-top:0.6rem">
+          <button class="action-btn cancel-btn" onclick="cancelJob(event, '${job.job_id}')">Cancel</button>
+        </div>
       `;
     }
 
     const isOpen = openIds.has(job.job_id);
+    const isNew = job.job_id === lastSubmittedJobId;
     return `
-      <div class="job" onclick="toggle('${job.job_id}')">
+      <div class="job ${isNew ? 'highlight' : ''}" id="job-${job.job_id}" onclick="toggle('${job.job_id}')">
         <div class="job-header">
           <div style="flex:1;min-width:0">
             <div class="job-title">${esc(title)}</div>
             ${meta ? `<div class="job-meta">${esc(meta)}</div>` : ''}
             <div class="job-meta">${fmt(job.created_at)}</div>
+            ${stageLabel}
             ${retryNote}
           </div>
           <span class="badge badge-${job.status}">${job.status}</span>
@@ -163,21 +509,54 @@
       empty.style.display = 'none';
       container.innerHTML = jobs.map(renderJob).join('');
     }
-  }
 
-  async function poll() {
-    try {
-      const resp = await fetch('/jobs');
-      render(await resp.json());
-      document.getElementById('refresh-status').textContent =
-        'Updated ' + new Date().toLocaleTimeString(undefined, { timeStyle: 'short' });
-    } catch {
-      document.getElementById('refresh-status').textContent = 'Error — retrying…';
+    // Auto-scroll to newly submitted job
+    if (lastSubmittedJobId) {
+      const el = document.getElementById('job-' + lastSubmittedJobId);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        // Clear after first scroll so it doesn't keep scrolling
+        const found = jobs.find(j => j.job_id === lastSubmittedJobId);
+        if (found && (found.status === 'done' || found.status === 'failed' || found.status === 'cancelled')) {
+          lastSubmittedJobId = null;
+        }
+      }
     }
   }
 
-  poll();
-  setInterval(poll, 5000);
+  // ---------------------------------------------------------------------------
+  // SSE connection with polling fallback
+  // ---------------------------------------------------------------------------
+  let evtSource = null;
+
+  function connectSSE() {
+    evtSource = new EventSource('/jobs/stream');
+    evtSource.addEventListener('jobs', (event) => {
+      try {
+        const jobs = JSON.parse(event.data);
+        render(jobs);
+        document.getElementById('refresh-status').textContent =
+          'Live \u2022 ' + new Date().toLocaleTimeString(undefined, { timeStyle: 'short' });
+      } catch(e) {}
+    });
+    evtSource.onerror = () => {
+      document.getElementById('refresh-status').textContent = 'Reconnecting...';
+      evtSource.close();
+      // Reconnect after 3 seconds
+      setTimeout(connectSSE, 3000);
+    };
+  }
+
+  // Initial load via polling, then switch to SSE
+  async function initialLoad() {
+    try {
+      const resp = await fetch('/jobs');
+      render(await resp.json());
+    } catch(e) {}
+    connectSSE();
+  }
+
+  initialLoad();
 </script>
 
 </body>

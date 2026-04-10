@@ -7,12 +7,12 @@ Jobs survive server restarts because they're persisted in SQLite.
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
 
-from models import Job, JobStatus, Summary, TranscriptResult
+from models import Job, JobStage, JobStatus, Summary, TranscriptResult
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "job_id": job.job_id,
         "url": job.url,
         "status": job.status.value,
+        "stage": job.stage.value,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
         "retry_count": job.retry_count,
@@ -37,6 +38,7 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "notion_page_id": job.notion_page_id,
         "error": job.error,
         "webhook_url": job.webhook_url,
+        "parent_job_id": job.parent_job_id,
     }
 
 
@@ -48,10 +50,13 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
     summary = None
     if data["summary"]:
         summary = Summary.model_validate_json(data["summary"])
+    # Handle DB rows created before the stage/parent_job_id columns existed
+    raw_stage = data.get("stage") or "queued"
     return Job(
         job_id=data["job_id"],
         url=data["url"],
         status=JobStatus(data["status"]),
+        stage=JobStage(raw_stage),
         created_at=datetime.fromisoformat(data["created_at"]),
         updated_at=datetime.fromisoformat(data["updated_at"]),
         retry_count=data["retry_count"],
@@ -60,17 +65,19 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         notion_page_id=data["notion_page_id"],
         error=data["error"],
         webhook_url=data["webhook_url"],
+        parent_job_id=data.get("parent_job_id"),
     )
 
 
 async def init_db(db_path: str = DB_PATH) -> None:
-    """Create the jobs table if it doesn't exist."""
+    """Create the jobs table if it doesn't exist, and run schema migrations."""
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id      TEXT PRIMARY KEY,
                 url         TEXT NOT NULL,
                 status      TEXT NOT NULL DEFAULT 'pending',
+                stage       TEXT NOT NULL DEFAULT 'queued',
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
                 retry_count INTEGER NOT NULL DEFAULT 0,
@@ -78,33 +85,48 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 summary     TEXT,
                 notion_page_id TEXT,
                 error       TEXT,
-                webhook_url TEXT
+                webhook_url TEXT,
+                parent_job_id TEXT
             )
         """)
+        # Migrate: add columns if they don't exist (for existing DBs)
+        cursor = await db.execute("PRAGMA table_info(jobs)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "stage" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'")
+        if "parent_job_id" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT")
         await db.commit()
 
 
-async def create_job(url: str, webhook_url: str | None = None, db_path: str = DB_PATH) -> Job:
+async def create_job(
+    url: str,
+    webhook_url: str | None = None,
+    parent_job_id: str | None = None,
+    db_path: str = DB_PATH,
+) -> Job:
     """Insert a new pending job and return it."""
     now = _utcnow()
     job = Job(
         job_id=str(uuid.uuid4()),
         url=url,
         status=JobStatus.pending,
+        stage=JobStage.queued,
         created_at=now,
         updated_at=now,
         webhook_url=webhook_url,
+        parent_job_id=parent_job_id,
     )
     data = _serialize_job(job)
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
             INSERT INTO jobs
-                (job_id, url, status, created_at, updated_at, retry_count,
-                 result, summary, notion_page_id, error, webhook_url)
+                (job_id, url, status, stage, created_at, updated_at, retry_count,
+                 result, summary, notion_page_id, error, webhook_url, parent_job_id)
             VALUES
-                (:job_id, :url, :status, :created_at, :updated_at, :retry_count,
-                 :result, :summary, :notion_page_id, :error, :webhook_url)
+                (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
+                 :result, :summary, :notion_page_id, :error, :webhook_url, :parent_job_id)
             """,
             data,
         )
@@ -144,6 +166,7 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
             """
             UPDATE jobs SET
                 status        = :status,
+                stage         = :stage,
                 updated_at    = :updated_at,
                 retry_count   = :retry_count,
                 result        = :result,
@@ -155,6 +178,34 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
             data,
         )
         await db.commit()
+
+
+async def delete_job(job_id: str, db_path: str = DB_PATH) -> bool:
+    """Delete a single job by ID. Returns True if a row was deleted."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_jobs_by_status(status: str, db_path: str = DB_PATH) -> int:
+    """Delete all jobs with the given status. Returns count of deleted rows."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("DELETE FROM jobs WHERE status = ?", (status,))
+        await db.commit()
+        return cursor.rowcount
+
+
+async def delete_old_jobs(max_age_days: int = 90, db_path: str = DB_PATH) -> int:
+    """Delete jobs older than max_age_days. Returns count of deleted rows."""
+    cutoff = (_utcnow() - timedelta(days=max_age_days)).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "DELETE FROM jobs WHERE created_at < ? AND status IN ('done', 'failed', 'cancelled')",
+            (cutoff,),
+        )
+        await db.commit()
+        return cursor.rowcount
 
 
 async def claim_next_pending_job(db_path: str = DB_PATH) -> Job | None:

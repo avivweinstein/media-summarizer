@@ -17,6 +17,7 @@ dependencies = [
     "openai>=1.30.0",
     "notion-client>=2.2.1",
     "feedparser>=6.0.11",
+    "sse-starlette>=2.0.0",
 ]
 
 [project.optional-dependencies]
