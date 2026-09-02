@@ -83,7 +83,9 @@ notes are never replaced.
 For local processing, set `PROCESSING_MODE=local`, run Ollama on a loopback
 address, and configure a local whisper.cpp executable/model. In local mode the
 pipeline does not call Anthropic or OpenAI, and Notion/webhooks are disabled.
-Deep health verifies the local providers. Spotify links remain unsupported
+The source website is still contacted to fetch public metadata or media; the
+transcript and summary stay on the Mac. Deep health verifies the local providers.
+Spotify links remain unsupported
 because Spotify does not provide a reliable canonical RSS mapping; submit the
 show RSS or another exact episode URL instead.
 
@@ -165,6 +167,12 @@ launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
 
+When an Obsidian vault is supplied, the installer also creates a daily launchd
+backup job. It keeps 14 verified snapshots of the vault and SQLite state under
+`~/Library/Application Support/media-summarizer/backups`. This protects against
+accidental edits and database corruption, but it is on the same Mac and is not a
+substitute for Time Machine or another encrypted off-device backup.
+
 The process pauses with the Mac and resumes after wake. Pending and interrupted
 jobs are recovered from SQLite at the last durable transcript/summary checkpoint;
 retry counts and provider-usage reservations also survive a crash. A process lock
@@ -172,6 +180,29 @@ prevents two local instances from replaying the same queue. Equivalent active
 submissions are deduplicated; completed static media such as a YouTube video is
 reused, while RSS/show URLs can be refreshed for newer episodes. RSS responses and
 audio downloads are streamed with time and size bounds.
+
+Operational state lives at
+`~/Library/Application Support/media-summarizer/jobs.db`; an existing repository
+`jobs.db` is copied there on first start and left untouched. Completed archive
+identity is retained independently from 90-day job history, preventing later
+resubmissions from duplicating Obsidian or Notion output. Full transcripts are
+removed from SQLite after completion or final failure by default, and job-list/SSE
+responses never include transcript text.
+
+Create or verify a snapshot manually with:
+
+```bash
+uv run python -m scripts.backup_media_library create
+uv run python -m scripts.backup_media_library verify /path/to/snapshot
+```
+
+Restore always writes to new paths, never over the live vault or database:
+
+```bash
+uv run python -m scripts.backup_media_library restore /path/to/snapshot \
+  --database-destination /path/to/restored/jobs.db \
+  --vault-destination /path/to/restored/Media-Library
+```
 
 ### Search and ask the local library
 
@@ -417,6 +448,9 @@ Copy `.env.example` to `.env` and fill in:
 | `UPLOAD_DIR`                | No       | Private crash-recovery storage for pending uploads | — |
 | `OBSIDIAN_VAULT_PATH`       | No       | Local canonical archive; must contain `.obsidian` | Your vault folder |
 | `OBSIDIAN_RETAIN_TRANSCRIPT` | No      | Save full transcripts to Obsidian (default: true) | — |
+| `DB_RETAIN_TRANSCRIPT`      | No       | Retain full transcripts in SQLite after terminal jobs (default: false) | — |
+| `JOB_DB_PATH`               | No       | Operational SQLite path under Application Support | — |
+| `BACKUP_DIR`                | No       | Destination for verified local snapshots | — |
 | `NOTION_ENABLED`            | No       | Enable optional Notion publishing (default: false) | — |
 | `NOTION_API_KEY`            | If enabled | Notion integration token                      | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
 | `NOTION_DATABASE_ID`        | If enabled | Target Notion database ID                     | From your database URL |
@@ -474,10 +508,10 @@ Check logs with `journalctl --user -u media-summarizer -n 50`. Common issues:
 ## Future Enhancements
 
 See [ENHANCEMENTS.md](ENHANCEMENTS.md) for planned improvements including:
-- Full-text search across summaries
+- Ranked FTS5/BM25 retrieval and stronger citation validation
 - iOS/Android share sheet integration
 - Search/filter bar in the web UI
-- Additional source types (Spotify, Vimeo, Twitter Spaces)
+- PDF ingestion
 
 ---
 
