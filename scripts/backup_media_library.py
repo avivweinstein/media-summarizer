@@ -14,6 +14,9 @@ from config import settings
 from job_queue import DB_PATH
 
 SNAPSHOT_PREFIX = "media-library-"
+BACKUP_FORMAT = "media-summarizer-backup-v1"
+RESTORE_MARKER_FORMAT = "media-summarizer-restore-v1"
+QUARANTINE_RETAIN = 2
 
 
 def _sha256(path: Path) -> str:
@@ -28,7 +31,9 @@ def _file_hashes(root: Path) -> dict[str, str]:
     return {
         path.relative_to(root).as_posix(): _sha256(path)
         for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink() and path.name != "manifest.json"
+        if path.is_file()
+        and not path.is_symlink()
+        and path.relative_to(root) != Path("manifest.json")
     }
 
 
@@ -44,7 +49,7 @@ def verify_backup(snapshot: Path) -> None:
     if not manifest_path.is_file():
         raise ValueError(f"Backup manifest is missing: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != "media-summarizer-backup-v1":
+    if manifest.get("format") != BACKUP_FORMAT:
         raise ValueError(f"Unsupported backup format: {snapshot}")
     expected = manifest.get("sha256")
     if not isinstance(expected, dict) or expected != _file_hashes(snapshot):
@@ -89,7 +94,7 @@ def create_backup(
         backup_db.chmod(0o600)
         shutil.copytree(vault, temporary / "vault")
         manifest = {
-            "format": "media-summarizer-backup-v1",
+            "format": BACKUP_FORMAT,
             "created_at": datetime.now(UTC).isoformat(),
             "database_source": str(database),
             "vault_source": str(vault),
@@ -107,21 +112,90 @@ def create_backup(
         if temporary.exists():
             shutil.rmtree(temporary)
 
-    snapshots = sorted(
-        (
-            path
-            for path in destination.glob(f"{SNAPSHOT_PREFIX}*")
-            if path.is_dir() and (path / "manifest.json").is_file()
-        ),
-        reverse=True,
-    )
-    for expired in snapshots[retain:]:
-        try:
-            verify_backup(expired)
-        except ValueError:
+    valid_snapshots: list[Path] = []
+    corrupt_snapshots: list[Path] = []
+    for path in destination.glob(f"{SNAPSHOT_PREFIX}*"):
+        if not path.is_dir():
             continue
+        try:
+            verify_backup(path)
+        except ValueError:
+            corrupt_snapshots.append(path)
+        else:
+            valid_snapshots.append(path)
+    for expired in sorted(valid_snapshots, reverse=True)[retain:]:
         shutil.rmtree(expired)
+    if corrupt_snapshots:
+        quarantine = destination / "quarantine"
+        quarantine.mkdir(mode=0o700, exist_ok=True)
+        quarantine.chmod(0o700)
+        for corrupt in corrupt_snapshots:
+            os.replace(corrupt, quarantine / corrupt.name)
+        quarantined = sorted(
+            (
+                path
+                for path in quarantine.iterdir()
+                if path.is_dir() and path.name.startswith(SNAPSHOT_PREFIX)
+            ),
+            reverse=True,
+        )
+        for expired in quarantined[QUARANTINE_RETAIN:]:
+            shutil.rmtree(expired)
     return snapshot
+
+
+def _restore_marker_path(database_destination: Path) -> Path:
+    return database_destination.parent / f".{database_destination.name}.restore.json"
+
+
+def _write_restore_marker(marker: Path, payload: dict[str, str]) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=marker.parent, delete=False
+    ) as temporary:
+        json.dump(payload, temporary, sort_keys=True)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    try:
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, marker)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _restored_content_matches(snapshot: Path, database: Path, vault: Path) -> bool:
+    if not database.is_file() or not vault.is_dir():
+        return False
+    return _sha256(database) == _sha256(snapshot / "jobs.db") and _file_hashes(
+        vault
+    ) == _file_hashes(snapshot / "vault")
+
+
+def _recover_interrupted_restore(
+    marker: Path,
+    snapshot: Path,
+    database_destination: Path,
+    vault_destination: Path,
+) -> bool:
+    if not marker.is_file():
+        return False
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    expected = {
+        "format": RESTORE_MARKER_FORMAT,
+        "snapshot": str(snapshot),
+        "database_destination": str(database_destination),
+        "vault_destination": str(vault_destination),
+    }
+    if payload != expected:
+        raise ValueError(f"Restore marker does not match this restore: {marker}")
+    if _restored_content_matches(snapshot, database_destination, vault_destination):
+        marker.unlink()
+        return True
+    database_destination.unlink(missing_ok=True)
+    if vault_destination.exists():
+        shutil.rmtree(vault_destination)
+    marker.unlink()
+    return False
 
 
 def restore_backup(snapshot: Path, database_destination: Path, vault_destination: Path) -> None:
@@ -129,10 +203,15 @@ def restore_backup(snapshot: Path, database_destination: Path, vault_destination
     database_destination = database_destination.expanduser().resolve()
     vault_destination = vault_destination.expanduser().resolve()
     verify_backup(snapshot)
-    if database_destination.exists() or vault_destination.exists():
-        raise ValueError("Restore destinations must not already exist.")
     database_destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     vault_destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker = _restore_marker_path(database_destination)
+    if _recover_interrupted_restore(
+        marker, snapshot, database_destination, vault_destination
+    ):
+        return
+    if database_destination.exists() or vault_destination.exists():
+        raise ValueError("Restore destinations must not already exist.")
     database_fd, database_stage_name = tempfile.mkstemp(
         prefix=".media-library-restore-",
         dir=database_destination.parent,
@@ -152,12 +231,23 @@ def restore_backup(snapshot: Path, database_destination: Path, vault_destination
             integrity = db.execute("PRAGMA integrity_check").fetchone()
         if integrity != ("ok",) or not (vault_stage / ".obsidian").is_dir():
             raise ValueError("Staged backup restore failed validation.")
+        _write_restore_marker(
+            marker,
+            {
+                "format": RESTORE_MARKER_FORMAT,
+                "snapshot": str(snapshot),
+                "database_destination": str(database_destination),
+                "vault_destination": str(vault_destination),
+            },
+        )
         os.replace(database_stage, database_destination)
         os.replace(vault_stage, vault_destination)
+        marker.unlink()
     except Exception:
         database_destination.unlink(missing_ok=True)
         if vault_destination.exists():
             shutil.rmtree(vault_destination)
+        marker.unlink(missing_ok=True)
         raise
     finally:
         database_stage.unlink(missing_ok=True)

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import requests  # type: ignore[import-untyped]
+import requests
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -31,10 +31,12 @@ from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 logger = logging.getLogger(__name__)
 
 
-class _TimeoutSession(requests.Session):  # type: ignore[misc]
-    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+class _TimeoutSession(requests.Session):
+    def request(
+        self, method: str | bytes, url: str | bytes, *args: Any, **kwargs: Any
+    ) -> requests.Response:
         kwargs.setdefault("timeout", settings.source_fetch_timeout_seconds)
-        return super().request(method, url, **kwargs)
+        return super().request(method, url, *args, **kwargs)
 
 
 def _extract_video_id(url: str) -> str:

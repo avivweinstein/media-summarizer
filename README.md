@@ -180,6 +180,9 @@ prevents two local instances from replaying the same queue. Equivalent active
 submissions are deduplicated; completed static media such as a YouTube video is
 reused, while RSS/show URLs can be refreshed for newer episodes. RSS responses and
 audio downloads are streamed with time and size bounds.
+Cancelling a job releases its worker slot promptly; cooperative downloads stop
+immediately, while an in-flight metadata request may finish in the executor within
+its configured socket timeout.
 
 Operational state lives at
 `~/Library/Application Support/media-summarizer/jobs.db`; an existing repository

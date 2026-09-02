@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call
 from scripts.install_macos_service import (
     BACKUP_LABEL,
     LABEL,
+    _wait_until_healthy,
     _wait_until_unloaded,
     build_backup_plist,
     build_plist,
@@ -77,6 +78,20 @@ def test_wait_until_unloaded_retries_until_launchd_forgets_service(mocker: Magic
     _wait_until_unloaded()
 
     assert run.call_count == 2
+
+
+def test_wait_until_healthy_retries_until_service_is_ready(mocker: MagicMock) -> None:
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    request = mocker.patch(
+        "scripts.install_macos_service.urlopen",
+        side_effect=[OSError("not ready"), response],
+    )
+    mocker.patch("scripts.install_macos_service.time.sleep")
+
+    _wait_until_healthy("127.0.0.1", 8000)
+
+    assert request.call_count == 2
 
 
 def test_uninstall_waits_for_service_before_removing_plist(

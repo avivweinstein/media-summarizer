@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 LABEL = "com.avivw.media-summarizer"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -77,6 +78,8 @@ def build_backup_plist(project_dir: Path, obsidian_vault_path: Path) -> dict[str
         "StandardErrorPath": str(LOG_DIR / "backup-error.log"),
         "Umask": 0o077,
     }
+
+
 def _target(label: str = LABEL) -> str:
     return f"gui/{os.getuid()}/{label}"
 
@@ -94,6 +97,20 @@ def _wait_until_unloaded(timeout_seconds: float = 5.0, *, label: str = LABEL) ->
             return
         time.sleep(0.1)
     raise SystemExit(f"Timed out waiting for {_target(label)} to unload.")
+
+
+def _wait_until_healthy(host: str, port: int, timeout_seconds: float = 20.0) -> None:
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(f"http://{probe_host}:{port}/health", timeout=1) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        time.sleep(0.1)
+    raise SystemExit("Timed out waiting for the media summarizer to initialize.")
 
 
 def _write_plist(path: Path, payload: dict[str, Any]) -> None:
@@ -149,6 +166,7 @@ def install(
     subprocess.run(["launchctl", "enable", _target()], check=True)
     subprocess.run(["launchctl", "kickstart", "-k", _target()], check=True)
     if obsidian_vault_path is not None:
+        _wait_until_healthy(host, port)
         backup_payload = build_backup_plist(project_dir, obsidian_vault_path)
         _write_plist(BACKUP_PLIST_PATH, backup_payload)
         subprocess.run(
