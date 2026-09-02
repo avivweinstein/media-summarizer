@@ -8,6 +8,7 @@ Covers:
 """
 
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -91,7 +92,7 @@ class TestTranscribeFileCleanup:
         mock_client = AsyncMock()
         mock_resp = httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com"))
         mock_client.audio.transcriptions.create.side_effect = RateLimitError(
-            message="rate limited", response=mock_resp, body=None
+            message="rate limited", response=cast(Any, mock_resp), body=None
         )
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
