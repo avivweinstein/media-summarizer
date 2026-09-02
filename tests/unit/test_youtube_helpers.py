@@ -10,14 +10,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from config import settings
-from exceptions import UsageLimitError
+from exceptions import MetadataError, UsageLimitError
 from models import TranscriptionOutput, TranscriptSegment
 from sources.youtube import (
     YouTubeSource,
     _download_audio_sync,
     _extract_video_id,
+    _HostRestrictedYoutubeDL,
     _parse_upload_date,
 )
+
+
+def test_host_restricted_extractor_blocks_request_before_network(mocker: MagicMock) -> None:
+    network = mocker.patch("sources.youtube.yt_dlp.YoutubeDL.urlopen", return_value="ok")
+    downloader = _HostRestrictedYoutubeDL({}, frozenset({"x.com"}))
+
+    with pytest.raises(MetadataError, match="untrusted host"):
+        downloader.urlopen("https://internal.example/private")
+    assert downloader.urlopen("https://x.com/example/status/1") == "ok"
+
+    network.assert_called_once()
 
 
 async def test_native_transcript_preserves_segments(mocker: MagicMock) -> None:
