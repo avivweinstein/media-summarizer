@@ -190,13 +190,39 @@ class TestSummarize:
         client.post.return_value = response
         client_factory = mocker.patch("summarizer.httpx.AsyncClient", return_value=client)
         anthropic = mocker.patch("summarizer.AsyncAnthropic")
-        mocker.patch.object(settings, "processing_mode", "local")
-
-        summary = await summarize(make_result())
+        summary = await summarize(make_result(), processing_mode="local")
 
         assert summary.tldr
         anthropic.assert_not_called()
         assert client_factory.call_args.kwargs["trust_env"] is False
+
+    async def test_local_request_is_reserved_before_call(self, mocker: MagicMock) -> None:
+        events: list[tuple[str, int]] = []
+        response = MagicMock()
+        response.json.return_value = {"message": {"content": VALID_JSON}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        async def api_call(*_args: object, **_kwargs: object) -> object:
+            events.append(("api", usage.local_summary_requests))
+            return response
+
+        async def persist(current: UsageStats) -> None:
+            events.append(("persist", current.local_summary_requests))
+
+        client.post.side_effect = api_call
+        mocker.patch("summarizer.httpx.AsyncClient", return_value=client)
+        usage = UsageStats()
+
+        await summarize(
+            make_result(),
+            usage=usage,
+            persist_usage=persist,
+            processing_mode="local",
+        )
+
+        assert events == [("persist", 1), ("api", 1)]
 
     async def test_successful_call_returns_summary(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()
@@ -381,9 +407,7 @@ class TestSummarize:
         response_json = json.dumps(
             {
                 **json.loads(VALID_JSON),
-                "key_moments": [
-                    {"timestamp_seconds": 66, "point": "Not an actual segment start."}
-                ],
+                "key_moments": [{"timestamp_seconds": 66, "point": "Not an actual segment start."}],
             }
         )
         mock_client = AsyncMock()
@@ -391,9 +415,7 @@ class TestSummarize:
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
         source = make_result(
             duration_seconds=0,
-            segments=[
-                TranscriptSegment(start_seconds=65, end_seconds=70, text="Actual segment.")
-            ],
+            segments=[TranscriptSegment(start_seconds=65, end_seconds=70, text="Actual segment.")],
         )
 
         summary = await summarize(source)

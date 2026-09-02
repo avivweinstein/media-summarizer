@@ -4,7 +4,6 @@ Covers job creation, retrieval, state transitions, and retry counter.
 All tests use a fresh temporary SQLite file — no shared state between tests.
 """
 
-
 import asyncio
 import sqlite3
 from datetime import UTC, datetime
@@ -239,9 +238,7 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
 
 async def test_create_or_get_job_deduplicates_concurrent_static_urls(db_path: str) -> None:
     results = await asyncio.gather(
-        job_queue.create_or_get_job(
-            "https://youtube.com/watch?v=abc&t=30", db_path=db_path
-        ),
+        job_queue.create_or_get_job("https://youtube.com/watch?v=abc&t=30", db_path=db_path),
         job_queue.create_or_get_job("https://youtu.be/abc?si=share", db_path=db_path),
     )
 
@@ -263,6 +260,30 @@ async def test_create_or_get_job_reuses_completed_static_media(db_path: str) -> 
 
     assert not duplicate_created
     assert duplicate.job_id == job.job_id
+
+
+async def test_processing_boundary_persists_and_separates_deduplication(
+    db_path: str,
+) -> None:
+    local, _ = await job_queue.create_or_get_job(
+        "https://youtube.com/watch?v=abc",
+        processing_mode="local",
+        external_processing_approved=False,
+        db_path=db_path,
+    )
+    cloud, cloud_created = await job_queue.create_or_get_job(
+        "https://youtube.com/watch?v=abc",
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
+    fetched = await job_queue.get_job(local.job_id, db_path=db_path)
+
+    assert fetched is not None
+    assert fetched.processing_mode == "local"
+    assert not fetched.external_processing_approved
+    assert cloud_created
+    assert cloud.job_id != local.job_id
 
 
 async def test_create_or_get_job_refreshes_completed_feed(db_path: str) -> None:
@@ -417,6 +438,7 @@ async def test_delete_old_jobs_respects_age(db_path: str) -> None:
 
     # Manually update created_at in the DB (update_job doesn't touch created_at)
     import aiosqlite
+
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "UPDATE jobs SET created_at = ? WHERE job_id = ?",

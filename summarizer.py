@@ -31,10 +31,11 @@ MAX_OUTPUT_TOKENS = 1024
 _API_BACKOFF_SECONDS = (1, 2)
 
 
-def summary_model_name() -> str:
-    if settings.processing_mode == "local":
+def summary_model_name(processing_mode: str) -> str:
+    if processing_mode == "local":
         return f"ollama/{settings.ollama_model}"
     return f"anthropic/{MODEL}"
+
 
 CANONICAL_TAGS = [
     "fitness",
@@ -149,7 +150,17 @@ def _local_ollama_url() -> str:
     return f"{settings.ollama_base_url.rstrip('/')}/api/chat"
 
 
-async def _call_local_ollama(system: str, prompt: str) -> Summary:
+async def _call_local_ollama(
+    system: str,
+    prompt: str,
+    usage: UsageStats,
+    persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+) -> Summary:
+    if usage.local_summary_requests >= settings.max_local_summary_requests_per_job:
+        raise UsageLimitError("Configured local summary request limit reached.")
+    usage.local_summary_requests += 1
+    if persist_usage is not None:
+        await persist_usage(usage)
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
         response = await client.post(
             _local_ollama_url(),
@@ -347,6 +358,7 @@ async def summarize(
     cost_budget_usd: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+    processing_mode: str = "cloud_public",
 ) -> Summary:
     """Call Claude to summarize a transcript. Returns a validated Summary.
 
@@ -365,9 +377,12 @@ async def summarize(
     chunks = _chunk_text(prompt_transcript, settings.summary_chunk_chars)
     request_count = 1 if len(chunks) == 1 else len(chunks) + 1
     usage_tracker = usage or UsageStats()
-    local_mode = settings.processing_mode == "local"
+    local_mode = processing_mode == "local"
     if local_mode:
-        if request_count > settings.max_local_summary_requests_per_job:
+        if (
+            usage_tracker.local_summary_requests + request_count
+            > settings.max_local_summary_requests_per_job
+        ):
             raise UsageLimitError(
                 f"Transcript requires {request_count} local summary requests, exceeding the "
                 "configured per-job request allowance."
@@ -387,7 +402,12 @@ async def summarize(
 
     async def call_summary(prompt: str) -> Summary:
         if local_mode:
-            return await _call_local_ollama(SYSTEM_PROMPT, prompt)
+            return await _call_local_ollama(
+                SYSTEM_PROMPT,
+                prompt,
+                usage_tracker,
+                persist_usage,
+            )
         assert client is not None
         return await _call_claude(
             client,
@@ -421,9 +441,7 @@ async def summarize(
 
     valid_timestamps = {round(segment.start_seconds) for segment in result.segments}
     summary.key_moments = [
-        moment
-        for moment in summary.key_moments
-        if moment.timestamp_seconds in valid_timestamps
+        moment for moment in summary.key_moments if moment.timestamp_seconds in valid_timestamps
     ]
 
     logger.info(

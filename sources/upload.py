@@ -1,5 +1,6 @@
 """Crash-safe local upload ingestion."""
 
+import logging
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable
@@ -14,6 +15,7 @@ from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 TEXT_EXTENSIONS = {".md", ".txt"}
 MEDIA_EXTENSIONS = {".m4a", ".mp3", ".mp4", ".mov", ".wav", ".webm"}
 UPLOAD_EXTENSIONS = TEXT_EXTENSIONS | MEDIA_EXTENSIONS
+logger = logging.getLogger(__name__)
 
 
 def upload_path(url: str) -> Path:
@@ -42,6 +44,36 @@ def cleanup_upload(url: str) -> None:
             return
 
 
+def reconcile_uploads(active_urls: set[str]) -> int:
+    """Remove only valid upload artifacts that no active job owns."""
+    root = Path(settings.upload_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    active_paths: set[Path] = set()
+    for url in active_urls:
+        try:
+            active_paths.add(upload_path(url))
+        except UnsupportedURLError:
+            logger.warning("Ignoring invalid active upload reference during reconciliation")
+
+    removed = 0
+    for path in root.iterdir():
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.suffix.casefold() not in UPLOAD_EXTENSIONS
+        ):
+            continue
+        try:
+            uuid.UUID(path.stem)
+        except ValueError:
+            continue
+        if path.resolve() not in active_paths:
+            path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 class UploadSource:
     async def fetch(
         self,
@@ -50,6 +82,7 @@ class UploadSource:
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         path = upload_path(url)
         if not path.is_file():
@@ -80,6 +113,7 @@ class UploadSource:
             job_id,
             usage=usage,
             persist_usage=persist_usage,
+            processing_mode=processing_mode,
         )
         return TranscriptResult(
             title=original_name,
@@ -89,6 +123,6 @@ class UploadSource:
             duration_seconds=0,
             transcript=transcription.text,
             segments=transcription.segments,
-            transcription_model=transcription_model_name(),
+            transcription_model=transcription_model_name(processing_mode),
             source_item_id=urlparse(url).hostname,
         )

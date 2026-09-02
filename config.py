@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     upload_dir: str = "~/Library/Application Support/media-summarizer/uploads"
     local_whisper_executable: str = "whisper-cli"
     local_whisper_model: str = ""
+    local_ffmpeg_timeout_seconds: int = Field(default=600, gt=0)
+    local_whisper_timeout_seconds: int = Field(default=14_400, gt=0)
     port: int = 8000
     summary_chunk_chars: int = Field(default=60_000, gt=0)
     max_transcript_chars: int = Field(default=600_000, gt=0)

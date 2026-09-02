@@ -412,6 +412,8 @@ Copy `.env.example` to `.env` and fill in:
 | `OLLAMA_MODEL`              | Local mode | Installed Ollama model name                    | — |
 | `LOCAL_WHISPER_EXECUTABLE`  | Local audio/video | whisper.cpp executable (default: `whisper-cli`) | — |
 | `LOCAL_WHISPER_MODEL`       | Local audio/video | Absolute path to a local whisper.cpp model     | — |
+| `LOCAL_FFMPEG_TIMEOUT_SECONDS` | No | Maximum local media-conversion runtime (default: 600) | — |
+| `LOCAL_WHISPER_TIMEOUT_SECONDS` | No | Maximum local transcription runtime (default: 14400) | — |
 | `UPLOAD_DIR`                | No       | Private crash-recovery storage for pending uploads | — |
 | `OBSIDIAN_VAULT_PATH`       | No       | Local canonical archive; must contain `.obsidian` | Your vault folder |
 | `OBSIDIAN_RETAIN_TRANSCRIPT` | No      | Save full transcripts to Obsidian (default: true) | — |

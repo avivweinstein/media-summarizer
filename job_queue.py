@@ -47,6 +47,8 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "dedupe_key": job.dedupe_key,
         "usage": job.usage.model_dump_json(),
         "interrupted": int(job.interrupted),
+        "processing_mode": job.processing_mode,
+        "external_processing_approved": int(job.external_processing_approved),
     }
 
 
@@ -84,11 +86,11 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         parent_job_id=data.get("parent_job_id"),
         dedupe_key=data.get("dedupe_key"),
         usage=(
-            UsageStats.model_validate_json(data["usage"])
-            if data.get("usage")
-            else UsageStats()
+            UsageStats.model_validate_json(data["usage"]) if data.get("usage") else UsageStats()
         ),
         interrupted=bool(data.get("interrupted", 0)),
+        processing_mode=data.get("processing_mode") or "cloud_public",
+        external_processing_approved=bool(data.get("external_processing_approved", 0)),
     )
 
 
@@ -115,7 +117,9 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 parent_job_id TEXT,
                 dedupe_key TEXT,
                 usage TEXT,
-                interrupted INTEGER NOT NULL DEFAULT 0
+                interrupted INTEGER NOT NULL DEFAULT 0,
+                processing_mode TEXT NOT NULL DEFAULT 'cloud_public',
+                external_processing_approved INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Migrate: add columns if they don't exist (for existing DBs)
@@ -136,21 +140,24 @@ async def init_db(db_path: str = DB_PATH) -> None:
         if "usage" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN usage TEXT")
         if "interrupted" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0")
+        if "processing_mode" not in columns:
             await db.execute(
-                "ALTER TABLE jobs ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE jobs ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'cloud_public'"
             )
-        async with db.execute(
-            "SELECT job_id, url FROM jobs WHERE dedupe_key IS NULL"
-        ) as rows:
-            for job_id, url in await rows.fetchall():
-                dedupe_key, _ = submission_identity(str(url))
+        if "external_processing_approved" not in columns:
+            await db.execute(
+                "ALTER TABLE jobs ADD COLUMN external_processing_approved INTEGER NOT NULL DEFAULT 0"
+            )
+        async with db.execute("SELECT job_id, url, processing_mode FROM jobs") as rows:
+            for job_id, url, processing_mode in await rows.fetchall():
+                base_dedupe_key, _ = submission_identity(str(url))
+                dedupe_key = f"{base_dedupe_key}:{processing_mode or 'cloud_public'}"
                 await db.execute(
                     "UPDATE jobs SET dedupe_key = ? WHERE job_id = ?",
                     (dedupe_key, job_id),
                 )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, status)"
-        )
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, status)")
         await db.commit()
 
 
@@ -159,6 +166,8 @@ async def create_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     dedupe_key: str | None = None,
+    processing_mode: str = "cloud_public",
+    external_processing_approved: bool = True,
     db_path: str = DB_PATH,
 ) -> Job:
     """Insert a new pending job and return it."""
@@ -173,7 +182,9 @@ async def create_job(
         webhook_url=webhook_url,
         webhook_urls=[webhook_url] if webhook_url else [],
         parent_job_id=parent_job_id,
-        dedupe_key=dedupe_key or submission_identity(url)[0],
+        dedupe_key=f"{dedupe_key or submission_identity(url)[0]}:{processing_mode}",
+        processing_mode=processing_mode,
+        external_processing_approved=external_processing_approved,
     )
     data = _serialize_job(job)
     async with aiosqlite.connect(db_path) as db:
@@ -183,12 +194,12 @@ async def create_job(
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
                  error, webhook_url, webhook_urls, parent_job_id, dedupe_key, usage,
-                 interrupted)
+                 interrupted, processing_mode, external_processing_approved)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
                  :error, :webhook_url, :webhook_urls, :parent_job_id, :dedupe_key,
-                 :usage, :interrupted)
+                 :usage, :interrupted, :processing_mode, :external_processing_approved)
             """,
             data,
         )
@@ -202,13 +213,20 @@ async def create_or_get_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     *,
+    processing_mode: str = "cloud_public",
+    external_processing_approved: bool = False,
     db_path: str = DB_PATH,
 ) -> tuple[Job, bool]:
     """Atomically reuse an equivalent active/static-completed job or create one."""
-    dedupe_key, reuse_completed = submission_identity(url)
-    statuses = ("pending", "processing", "done") if reuse_completed else (
-        "pending",
-        "processing",
+    base_dedupe_key, reuse_completed = submission_identity(url)
+    dedupe_key = f"{base_dedupe_key}:{processing_mode}"
+    statuses = (
+        ("pending", "processing", "done")
+        if reuse_completed
+        else (
+            "pending",
+            "processing",
+        )
     )
     placeholders = ", ".join("?" for _ in statuses)
 
@@ -253,6 +271,8 @@ async def create_or_get_job(
             webhook_urls=[webhook_url] if webhook_url else [],
             parent_job_id=parent_job_id,
             dedupe_key=dedupe_key,
+            processing_mode=processing_mode,
+            external_processing_approved=external_processing_approved,
         )
         data = _serialize_job(job)
         await db.execute(
@@ -261,12 +281,12 @@ async def create_or_get_job(
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
                  error, webhook_url, webhook_urls, parent_job_id, dedupe_key, usage,
-                 interrupted)
+                 interrupted, processing_mode, external_processing_approved)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
                  :error, :webhook_url, :webhook_urls, :parent_job_id, :dedupe_key,
-                 :usage, :interrupted)
+                 :usage, :interrupted, :processing_mode, :external_processing_approved)
             """,
             data,
         )
@@ -295,6 +315,17 @@ async def list_jobs(limit: int = 50, db_path: str = DB_PATH) -> list[Job]:
         ) as cursor:
             rows = await cursor.fetchall()
     return [_deserialize_job(row) for row in rows]
+
+
+async def list_active_upload_urls(db_path: str = DB_PATH) -> set[str]:
+    """Return upload references still owned by pending or processing jobs."""
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """SELECT url FROM jobs
+               WHERE status IN ('pending', 'processing') AND url LIKE 'upload://%'"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return {str(row[0]) for row in rows}
 
 
 async def recover_incomplete_jobs(db_path: str = DB_PATH) -> list[str]:

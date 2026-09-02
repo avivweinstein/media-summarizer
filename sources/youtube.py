@@ -185,6 +185,7 @@ class YouTubeSource(BaseSource):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
         loop = asyncio.get_event_loop()
@@ -235,8 +236,9 @@ class YouTubeSource(BaseSource):
                 duration_seconds=duration_seconds,
                 usage=usage_tracker,
                 persist_usage=persist_usage,
+                processing_mode=processing_mode,
             )
-            transcription_model = transcription_model_name()
+            transcription_model = transcription_model_name(processing_mode)
             logger.info(
                 "%s event=transcript_fetch_done chars=%d method=whisper",
                 log,

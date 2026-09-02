@@ -78,10 +78,10 @@ class _ArticleParser(HTMLParser):
 
     def result(self) -> tuple[str, str, str, str]:
         title = self.title or " ".join(self._title_parts)
-        chosen = self._article_parts if len(" ".join(self._article_parts)) >= 200 else self._all_parts
-        text = "\n".join(
-            line.strip() for line in " ".join(chosen).split("\n") if line.strip()
+        chosen = (
+            self._article_parts if len(" ".join(self._article_parts)) >= 200 else self._all_parts
         )
+        text = "\n".join(line.strip() for line in " ".join(chosen).split("\n") if line.strip())
         return title.strip(), self.author.strip(), self.published.strip(), text
 
 
@@ -95,6 +95,16 @@ def _published_at(value: str) -> datetime | None:
             return parsedate_to_datetime(value)
         except (TypeError, ValueError):
             return None
+
+
+def _has_audio_enclosure(feed: feedparser.FeedParserDict) -> bool:
+    for entry in feed.entries:
+        for enclosure in entry.get("enclosures", []):
+            enclosure_type = str(enclosure.get("type") or "").casefold()
+            enclosure_url = str(enclosure.get("href") or enclosure.get("url") or "").casefold()
+            if enclosure_type.startswith("audio/") or enclosure_url.endswith(".mp3"):
+                return True
+    return False
 
 
 async def _fetch_page(url: str) -> tuple[str, str, bytes]:
@@ -131,6 +141,52 @@ async def _fetch_page(url: str) -> tuple[str, str, bytes]:
 
 
 class ArticleSource:
+    async def _from_feed_entry(
+        self,
+        feed: feedparser.FeedParserDict,
+        final_url: str,
+        job_id: str,
+        usage: UsageStats | None,
+        persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+        processing_mode: str,
+    ) -> TranscriptResult:
+        entry = feed.entries[0]
+        entry_url = str(entry.get("link") or final_url)
+        fragments = entry.get("content") or []
+        raw_html = " ".join(
+            str(fragment.get("value") or "") for fragment in fragments if isinstance(fragment, dict)
+        )
+        raw_html = raw_html or str(entry.get("summary") or "")
+        parser = _ArticleParser()
+        parser.feed(raw_html)
+        _, _, _, text = parser.result()
+        if len(text) < 100 and entry_url != final_url:
+            return await self.fetch(
+                entry_url,
+                job_id,
+                usage=usage,
+                persist_usage=persist_usage,
+                processing_mode=processing_mode,
+            )
+        if len(text) < 100:
+            raise UnsupportedURLError(
+                "The latest feed entry did not contain enough readable article text."
+            )
+        if len(text) > settings.max_transcript_chars:
+            raise UnsupportedURLError("Article exceeds the configured transcript-size limit.")
+        feed_title = str(feed.feed.get("title") or "")
+        return TranscriptResult(
+            title=str(entry.get("title") or "Untitled article"),
+            source="article",
+            url=entry_url,
+            channel_or_show=str(entry.get("author") or feed_title),
+            duration_seconds=0,
+            transcript=text,
+            published_at=_published_at(str(entry.get("published") or entry.get("updated") or "")),
+            transcription_model="local/feed-parser",
+            source_item_id=str(entry.get("id") or entry_url),
+        )
+
     async def fetch(
         self,
         url: str,
@@ -138,6 +194,7 @@ class ArticleSource:
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         final_url, content_type, body = await _fetch_page(url)
         if content_type.startswith(("audio/", "video/")):
@@ -146,14 +203,25 @@ class ArticleSource:
                 job_id,
                 usage=usage,
                 persist_usage=persist_usage,
+                processing_mode=processing_mode,
             )
         feed = feedparser.parse(body)
-        if feed.entries and any(entry.get("enclosures") for entry in feed.entries):
+        if feed.entries and _has_audio_enclosure(feed):
             return await PodcastSource().fetch(
                 final_url,
                 job_id,
                 usage=usage,
                 persist_usage=persist_usage,
+                processing_mode=processing_mode,
+            )
+        if feed.entries:
+            return await self._from_feed_entry(
+                feed,
+                final_url,
+                job_id,
+                usage,
+                persist_usage,
+                processing_mode,
             )
         if content_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
             raise UnsupportedURLError(

@@ -50,7 +50,7 @@ from models import (
     SummarizeResponse,
 )
 from pipeline import _notify_webhook, detect_source, expand_playlist
-from sources.upload import UPLOAD_EXTENSIONS, cleanup_upload, upload_path
+from sources.upload import UPLOAD_EXTENSIONS, cleanup_upload, reconcile_uploads, upload_path
 from transcriber import ensure_tmp_dir
 from worker import job_worker
 
@@ -118,6 +118,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await job_queue.init_db()
         ensure_tmp_dir()
         await _cleanup_old_jobs()
+        removed_uploads = reconcile_uploads(await job_queue.list_active_upload_urls())
+        if removed_uploads:
+            logger.warning(
+                "job_id=- url=- source=upload event=startup_cleanup removed_files=%d",
+                removed_uploads,
+            )
         recovered_job_ids = await job_queue.recover_incomplete_jobs()
         job_worker.start()
         for job_id in recovered_job_ids:
@@ -136,8 +142,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Media Summarizer", lifespan=lifespan)
 
 
-async def _create_and_enqueue(url: str, webhook_url: str | None) -> Job:
-    job, created = await job_queue.create_or_get_job(url, webhook_url)
+async def _create_and_enqueue(
+    url: str,
+    webhook_url: str | None,
+    *,
+    processing_mode: str | None = None,
+    external_processing_approved: bool = False,
+) -> Job:
+    mode = processing_mode or settings.processing_mode
+    job, created = await job_queue.create_or_get_job(
+        url,
+        webhook_url,
+        processing_mode=mode,
+        external_processing_approved=external_processing_approved,
+    )
     if created:
         await job_worker.enqueue(job.job_id)
     else:
@@ -206,6 +224,7 @@ def _job_to_response(job: Job) -> JobResponse:
         error=job.error,
         parent_job_id=job.parent_job_id,
         usage=job.usage,
+        processing_mode=job.processing_mode,
     )
 
 
@@ -251,12 +270,22 @@ async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
         # Create a job for each video
         first_job_id = ""
         for video_url in video_urls:
-            job = await _create_and_enqueue(video_url, request.webhook_url)
+            job = await _create_and_enqueue(
+                video_url,
+                request.webhook_url,
+                processing_mode=settings.processing_mode,
+                external_processing_approved=request.external_processing_approved,
+            )
             if not first_job_id:
                 first_job_id = job.job_id
         return SummarizeResponse(job_id=first_job_id)
 
-    job = await _create_and_enqueue(url, request.webhook_url)
+    job = await _create_and_enqueue(
+        url,
+        request.webhook_url,
+        processing_mode=settings.processing_mode,
+        external_processing_approved=request.external_processing_approved,
+    )
     return SummarizeResponse(job_id=job.job_id)
 
 
@@ -270,7 +299,12 @@ async def submit_upload(
     _require_processing_approval(external_processing_approved)
     url = await _persist_upload(file)
     try:
-        job = await _create_and_enqueue(url, webhook_url)
+        job = await _create_and_enqueue(
+            url,
+            webhook_url,
+            processing_mode=settings.processing_mode,
+            external_processing_approved=external_processing_approved,
+        )
     except Exception:
         cleanup_upload(url)
         raise
@@ -299,11 +333,21 @@ async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
                 errors.append(f"{url[:60]}: playlist expansion failed: {e}")
                 continue
             for video_url in video_urls:
-                job = await _create_and_enqueue(video_url, request.webhook_url)
+                job = await _create_and_enqueue(
+                    video_url,
+                    request.webhook_url,
+                    processing_mode=settings.processing_mode,
+                    external_processing_approved=request.external_processing_approved,
+                )
                 if job.job_id not in job_ids:
                     job_ids.append(job.job_id)
         else:
-            job = await _create_and_enqueue(url, request.webhook_url)
+            job = await _create_and_enqueue(
+                url,
+                request.webhook_url,
+                processing_mode=settings.processing_mode,
+                external_processing_approved=request.external_processing_approved,
+            )
             if job.job_id not in job_ids:
                 job_ids.append(job.job_id)
 

@@ -82,7 +82,7 @@ class TestPodcast:
         ],
     )
     def test_generic_rss_urls(self, url: str) -> None:
-        assert detect_source(url) == "podcast"
+        assert detect_source(url) == "article"
 
 
 class TestAdditionalSources:

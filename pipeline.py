@@ -61,9 +61,7 @@ def detect_source(url: str) -> str:
         is_watch = "watch" in parsed.path or parsed.hostname == "youtu.be"
         has_v = "v" in qs
         if not (is_watch or has_v):
-            raise UnsupportedURLError(
-                "Only YouTube video URLs or playlist URLs are supported."
-            )
+            raise UnsupportedURLError("Only YouTube video URLs or playlist URLs are supported.")
         return "youtube"
 
     if hostname == "open.spotify.com":
@@ -85,11 +83,6 @@ def detect_source(url: str) -> str:
                 "This media host is not currently supported. Try YouTube, Apple Podcasts, "
                 "a podcast RSS URL, or a direct MP3 URL."
             )
-        if (
-            hostname.startswith(("feed.", "feeds.", "rss."))
-            or any(marker in lower_path for marker in ("/feed", "podcast", ".rss", ".xml"))
-        ):
-            return "podcast"
         return "article"
 
     raise UnsupportedURLError(
@@ -138,7 +131,7 @@ async def _notify_webhook(
     settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
-    if settings.processing_mode == "local" or not settings.webhooks_enabled:
+    if job.processing_mode == "local" or not settings.webhooks_enabled:
         return
     if urls is None:
         fresh = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -201,7 +194,7 @@ async def _notify_webhook(
 async def _check_cancelled(job: Job, db_path: str) -> bool:
     """Re-read job from DB and return True if it's been cancelled."""
     fresh = await job_queue.get_job(job.job_id, db_path=db_path)
-    return fresh is not None and fresh.status == JobStatus.cancelled
+    return fresh is None or fresh.status == JobStatus.cancelled
 
 
 async def _set_stage(job: Job, stage: JobStage, db_path: str) -> None:
@@ -226,6 +219,19 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     interrupted_stage = job.stage if job.interrupted else None
     job.interrupted = False
 
+    if job.processing_mode not in {"cloud_public", "local"}:
+        job.status = JobStatus.failed
+        job.stage = JobStage.failed
+        job.error = "Job has an invalid persisted processing mode."
+        await job_queue.update_job(job, db_path=db_path)
+        return
+    if job.processing_mode == "cloud_public" and not job.external_processing_approved:
+        job.status = JobStatus.failed
+        job.stage = JobStage.failed
+        job.error = "External AI processing was not approved for this job."
+        await job_queue.update_job(job, db_path=db_path)
+        return
+
     async def persist_usage(_usage: UsageStats) -> None:
         await job_queue.update_usage(job.job_id, job.usage, db_path=db_path)
 
@@ -238,9 +244,15 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             backoff = _BACKOFF_SECONDS[attempt - 1]
             logger.warning(
                 "%s event=job_retry attempt=%d/%d backoff=%ds",
-                log, attempt + 1, MAX_RETRIES, backoff,
+                log,
+                attempt + 1,
+                MAX_RETRIES,
+                backoff,
             )
             await asyncio.sleep(backoff)
+            if await _check_cancelled(job, db_path):
+                logger.info("job_id=%s event=job_cancelled_during_backoff", job.job_id)
+                return
 
         job.status = JobStatus.processing
         job.retry_count = attempt
@@ -271,6 +283,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
                 elif source_type == "podcast":
                     result = await PodcastSource().fetch(
@@ -278,6 +291,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
                 elif source_type == "media":
                     result = await MediaSource().fetch(
@@ -285,6 +299,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
                 elif source_type == "article":
                     result = await ArticleSource().fetch(
@@ -292,6 +307,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
                 else:
                     result = await UploadSource().fetch(
@@ -299,6 +315,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
 
                 job.result = result
@@ -320,6 +337,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     job_id=job.job_id,
                     usage=job.usage,
                     persist_usage=persist_usage,
+                    processing_mode=job.processing_mode,
                 )
                 job.summary = summary
                 await job_queue.update_job(job, db_path=db_path)
@@ -337,14 +355,14 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     summary,
                     settings.obsidian_vault_path,
                     retain_transcript=settings.obsidian_retain_transcript,
-                    summary_model=summary_model_name(),
+                    summary_model=summary_model_name(job.processing_mode),
                     added_at=job.created_at,
                     usage=job.usage,
                 )
                 output_saved = True
 
             if (
-                settings.processing_mode != "local"
+                job.processing_mode != "local"
                 and settings.notion_enabled
                 and not job.notion_page_id
             ):
@@ -394,7 +412,10 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             last_error = str(e)
             logger.error(
                 "%s event=attempt_failed attempt=%d/%d error=%r",
-                log, attempt + 1, MAX_RETRIES, last_error,
+                log,
+                attempt + 1,
+                MAX_RETRIES,
+                last_error,
             )
 
     job.status = JobStatus.failed

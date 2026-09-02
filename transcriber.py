@@ -33,6 +33,40 @@ TMP_DIR = Path("/tmp/media-summarizer")
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+
+async def _communicate_with_timeout(
+    process: asyncio.subprocess.Process,
+    timeout_seconds: int,
+    label: str,
+) -> tuple[bytes, bytes]:
+    try:
+        return await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        await asyncio.shield(_stop_process(process))
+        raise
+    except TimeoutError as error:
+        await _stop_process(process)
+        raise TranscriptionError(
+            f"{label} exceeded its configured {timeout_seconds}-second timeout."
+        ) from error
+
+
 def ensure_tmp_dir() -> None:
     """Create the temp dir and delete any leftover MP3s from crashed jobs."""
     TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,9 +77,7 @@ def ensure_tmp_dir() -> None:
             file.unlink(missing_ok=True)
             removed += 1
     if removed:
-        logger.warning(
-            "job_id=- url=- source=- event=startup_cleanup removed_files=%d", removed
-        )
+        logger.warning("job_id=- url=- source=- event=startup_cleanup removed_files=%d", removed)
 
 
 def tmp_path_for_job(job_id: str) -> Path:
@@ -59,12 +91,18 @@ async def _compress_for_whisper(src: Path, dst: Path) -> None:
     Typical reduction: 128 kbps stereo → 32 kbps mono = ~8x smaller.
     """
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        "-ac", "1",        # mono
-        "-ab", "32k",      # 32 kbps — sufficient for speech
-        "-ar", "16000",    # 16 kHz sample rate
-        "-f", "mp3",
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-ac",
+        "1",  # mono
+        "-ab",
+        "32k",  # 32 kbps — sufficient for speech
+        "-ar",
+        "16000",  # 16 kHz sample rate
+        "-f",
+        "mp3",
         str(dst),
     ]
     try:
@@ -73,16 +111,21 @@ async def _compress_for_whisper(src: Path, dst: Path) -> None:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        _, stderr = await _communicate_with_timeout(
+            proc, settings.local_ffmpeg_timeout_seconds, "ffmpeg conversion"
+        )
         if proc.returncode != 0:
-            raise TranscriptionError(
-                f"ffmpeg compression failed: {stderr.decode()[:300]}"
-            )
+            raise TranscriptionError(f"ffmpeg compression failed: {stderr.decode()[:300]}")
     except FileNotFoundError:
         raise TranscriptionError(
             "Audio file exceeds Whisper's 25 MB limit and ffmpeg is not installed. "
             "Install ffmpeg (sudo apt install ffmpeg) or use a shorter episode."
         )
+
+
+async def convert_to_mp3(src: Path, dst: Path) -> None:
+    """Normalize supported audio or video input to speech-optimized MP3."""
+    await _compress_for_whisper(src, dst)
 
 
 async def _probe_audio_duration(path: Path) -> float:
@@ -100,7 +143,9 @@ async def _probe_audio_duration(path: Path) -> float:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await process.communicate()
+        stdout, _ = await _communicate_with_timeout(
+            process, min(settings.local_ffmpeg_timeout_seconds, 60), "ffprobe"
+        )
         if process.returncode == 0:
             return max(0.0, float(stdout.decode().strip()))
     except (FileNotFoundError, ValueError):
@@ -108,8 +153,8 @@ async def _probe_audio_duration(path: Path) -> float:
     return 0.0
 
 
-def transcription_model_name() -> str:
-    if settings.processing_mode == "local":
+def transcription_model_name(processing_mode: str) -> str:
+    if processing_mode == "local":
         return "local/whisper.cpp"
     return "openai/whisper-1"
 
@@ -138,7 +183,9 @@ async def _transcribe_local(path: Path, job_id: str) -> TranscriptionOutput:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, ffmpeg_error = await ffmpeg.communicate()
+        _, ffmpeg_error = await _communicate_with_timeout(
+            ffmpeg, settings.local_ffmpeg_timeout_seconds, "Local audio conversion"
+        )
         if ffmpeg.returncode != 0:
             raise TranscriptionError(
                 f"Local audio conversion failed: {ffmpeg_error.decode()[:300]}"
@@ -155,7 +202,9 @@ async def _transcribe_local(path: Path, job_id: str) -> TranscriptionOutput:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await process.communicate()
+        _, stderr = await _communicate_with_timeout(
+            process, settings.local_whisper_timeout_seconds, "Local Whisper"
+        )
         if process.returncode != 0 or not json_path.is_file():
             raise TranscriptionError(f"Local Whisper failed: {stderr.decode()[:300]}")
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -195,6 +244,7 @@ async def transcribe(
     duration_seconds: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+    processing_mode: str = "cloud_public",
 ) -> TranscriptionOutput:
     """Send an MP3 file to Whisper and return text with segment timestamps.
 
@@ -215,7 +265,9 @@ async def transcribe(
                 f"Audio download is {file_size / 1e6:.0f} MB, exceeding the configured "
                 f"{settings.max_audio_download_bytes / 1e6:.0f} MB per-job limit."
             )
-        logger.info("%s event=transcribe_start path=%s size_mb=%.1f", log, mp3_path.name, file_size / 1e6)
+        logger.info(
+            "%s event=transcribe_start path=%s size_mb=%.1f", log, mp3_path.name, file_size / 1e6
+        )
 
         audio_seconds = await _probe_audio_duration(mp3_path)
         if audio_seconds <= 0:
@@ -238,7 +290,7 @@ async def transcribe(
                 f"Audio duration is {audio_seconds / 3600:.1f} hours, exceeding the "
                 f"configured {settings.max_audio_duration_seconds / 3600:.1f}-hour limit."
             )
-        if settings.processing_mode == "local":
+        if processing_mode == "local":
             result = await _transcribe_local(mp3_path, job_id)
             logger.info("%s event=transcribe_done chars=%d provider=local", log, len(result.text))
             return result
@@ -254,7 +306,8 @@ async def transcribe(
         if file_size > WHISPER_MAX_BYTES:
             logger.info(
                 "%s event=compress_start size_mb=%.1f reason=exceeds_whisper_limit",
-                log, file_size / 1e6,
+                log,
+                file_size / 1e6,
             )
             compressed_path = mp3_path.parent / f"{mp3_path.stem}_compressed.mp3"
             await _compress_for_whisper(mp3_path, compressed_path)
@@ -293,12 +346,8 @@ async def transcribe(
         raw_segments = [] if isinstance(response, str) else getattr(response, "segments", [])
         segments = [
             TranscriptSegment(
-                start_seconds=float(
-                    item.get("start", 0) if isinstance(item, dict) else item.start
-                ),
-                end_seconds=float(
-                    item.get("end", 0) if isinstance(item, dict) else item.end
-                ),
+                start_seconds=float(item.get("start", 0) if isinstance(item, dict) else item.start),
+                end_seconds=float(item.get("end", 0) if isinstance(item, dict) else item.end),
                 text=str(item.get("text", "") if isinstance(item, dict) else item.text),
             )
             for item in (raw_segments or [])
@@ -318,7 +367,9 @@ async def transcribe(
             ) from e
         raise TranscriptionError("Whisper API rate limit reached. Please try again shortly.") from e
     except AuthenticationError as e:
-        raise TranscriptionError("Invalid OpenAI API key. Please check OPENAI_API_KEY in .env.") from e
+        raise TranscriptionError(
+            "Invalid OpenAI API key. Please check OPENAI_API_KEY in .env."
+        ) from e
     except BadRequestError as e:
         raise TranscriptionError(f"Whisper rejected the audio file: {e}") from e
     except APIConnectionError as e:

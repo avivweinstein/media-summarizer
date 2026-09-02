@@ -7,6 +7,7 @@ Covers:
   - transcribe() deletes the file even when transcription raises
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +17,32 @@ import pytest
 from config import settings
 from exceptions import TranscriptionError, UsageLimitError
 from models import TranscriptionOutput, UsageStats
-from transcriber import ensure_tmp_dir, transcribe
+from transcriber import _communicate_with_timeout, ensure_tmp_dir, transcribe
+
+
+class TestSubprocessCleanup:
+    async def test_timeout_terminates_process(self) -> None:
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=TimeoutError)
+        process.wait = AsyncMock(return_value=0)
+
+        with pytest.raises(TranscriptionError, match="configured 1-second timeout"):
+            await _communicate_with_timeout(process, 1, "Local Whisper")
+
+        process.terminate.assert_called_once()
+        process.wait.assert_awaited_once()
+
+    async def test_cancellation_terminates_process(self) -> None:
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+        process.wait = AsyncMock(return_value=0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _communicate_with_timeout(process, 1, "Local Whisper")
+
+        process.terminate.assert_called_once()
 
 
 class TestEnsureTmpDir:
@@ -92,9 +118,7 @@ class TestTranscribeFileCleanup:
         assert usage.openai_audio_seconds == 120
         assert usage.estimated_cost_usd == pytest.approx(0.012)
 
-    async def test_local_mode_never_calls_openai(
-        self, tmp_path: Path, mocker: MagicMock
-    ) -> None:
+    async def test_local_mode_never_calls_openai(self, tmp_path: Path, mocker: MagicMock) -> None:
         media = tmp_path / "local.mp3"
         media.write_bytes(b"audio")
         local = mocker.patch(
@@ -102,9 +126,7 @@ class TestTranscribeFileCleanup:
             new=AsyncMock(return_value=TranscriptionOutput(text="Local transcript.")),
         )
         openai = mocker.patch("transcriber.AsyncOpenAI")
-        mocker.patch.object(settings, "processing_mode", "local")
-
-        result = await transcribe(media, job_id="local-job")
+        result = await transcribe(media, job_id="local-job", processing_mode="local")
 
         assert result.text == "Local transcript."
         local.assert_awaited_once()
