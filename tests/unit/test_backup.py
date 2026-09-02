@@ -122,3 +122,26 @@ def test_restore_recovers_after_interruption_between_publishes(
 
     assert restored_db.exists()
     assert (restored_vault / "Generated" / "Summaries" / "item.md").is_file()
+
+
+def test_restore_fsyncs_each_publication_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, vault, destination = _fixture(tmp_path)
+    snapshot = create_backup(database, vault, destination)
+    restored_db = tmp_path / "restore" / "jobs.db"
+    restored_vault = tmp_path / "Restored-Library"
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "scripts.backup_media_library._fsync_directory",
+        lambda path: calls.append(path),
+    )
+
+    restore_backup(snapshot, restored_db, restored_vault)
+
+    assert calls == [
+        restored_db.parent,
+        restored_db.parent,
+        restored_vault.parent,
+        restored_db.parent,
+    ]

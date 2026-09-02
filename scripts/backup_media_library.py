@@ -148,6 +148,14 @@ def _restore_marker_path(database_destination: Path) -> Path:
     return database_destination.parent / f".{database_destination.name}.restore.json"
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_restore_marker(marker: Path, payload: dict[str, str]) -> None:
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=marker.parent, delete=False
@@ -159,6 +167,7 @@ def _write_restore_marker(marker: Path, payload: dict[str, str]) -> None:
     try:
         temporary_path.chmod(0o600)
         os.replace(temporary_path, marker)
+        _fsync_directory(marker.parent)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -190,11 +199,15 @@ def _recover_interrupted_restore(
         raise ValueError(f"Restore marker does not match this restore: {marker}")
     if _restored_content_matches(snapshot, database_destination, vault_destination):
         marker.unlink()
+        _fsync_directory(marker.parent)
         return True
     database_destination.unlink(missing_ok=True)
     if vault_destination.exists():
         shutil.rmtree(vault_destination)
     marker.unlink()
+    _fsync_directory(database_destination.parent)
+    if vault_destination.parent != database_destination.parent:
+        _fsync_directory(vault_destination.parent)
     return False
 
 
@@ -241,13 +254,19 @@ def restore_backup(snapshot: Path, database_destination: Path, vault_destination
             },
         )
         os.replace(database_stage, database_destination)
+        _fsync_directory(database_destination.parent)
         os.replace(vault_stage, vault_destination)
+        _fsync_directory(vault_destination.parent)
         marker.unlink()
+        _fsync_directory(marker.parent)
     except Exception:
         database_destination.unlink(missing_ok=True)
         if vault_destination.exists():
             shutil.rmtree(vault_destination)
         marker.unlink(missing_ok=True)
+        _fsync_directory(database_destination.parent)
+        if vault_destination.parent != database_destination.parent:
+            _fsync_directory(vault_destination.parent)
         raise
     finally:
         database_stage.unlink(missing_ok=True)
