@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import yt_dlp
 
@@ -14,11 +14,33 @@ from config import settings
 from exceptions import MetadataError, UnsupportedURLError, UsageLimitError
 from models import TranscriptResult, UsageStats
 from sources.podcast import _download_mp3, _validate_public_http_url
-from sources.youtube import _download_audio_sync, _fetch_metadata_sync
+from sources.youtube import (
+    _download_audio_sync,
+    _fetch_metadata_sync,
+    _HostRestrictedYoutubeDL,
+)
 from transcriber import convert_to_mp3, tmp_path_for_job, transcribe, transcription_model_name
 from url_identity import twitter_status_parts
 
 _TWITTER_MEDIA_HOST = "video.twimg.com"
+_TWITTER_REQUEST_HOSTS = frozenset(
+    {
+        "amp.twimg.com",
+        "api.twitter.com",
+        "api.x.com",
+        "cdn.syndication.twimg.com",
+        "m.twitter.com",
+        "m.x.com",
+        "mobile.twitter.com",
+        "mobile.x.com",
+        "pbs.twimg.com",
+        "twitter.com",
+        "video.twimg.com",
+        "www.twitter.com",
+        "www.x.com",
+        "x.com",
+    }
+)
 
 
 def _vimeo_player_url(url: str) -> str:
@@ -31,6 +53,20 @@ def _vimeo_player_url(url: str) -> str:
     return f"https://player.vimeo.com/video/{video_ids[-1]}"
 
 
+def _twitter_base_url(url: str) -> str:
+    status = twitter_status_parts(url)
+    if status is None:
+        raise MetadataError("Invalid X/Twitter post URL.")
+    status_id, _ = status
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    status_position = next(
+        index for index, part in enumerate(parts) if part in {"status", "statuses"}
+    )
+    path = "/" + "/".join([*parts[: status_position + 1], status_id])
+    return urlunparse(parsed._replace(path=path, query="", fragment=""))
+
+
 def _fetch_twitter_metadata_sync(url: str) -> dict[str, object]:
     """Extract only native X media without following link cards or external URLs."""
     options: dict[str, object] = {
@@ -41,9 +77,10 @@ def _fetch_twitter_metadata_sync(url: str) -> dict[str, object]:
         "format": "bestaudio/best",
         "socket_timeout": settings.source_fetch_timeout_seconds,
     }
+    base_url = _twitter_base_url(url)
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            raw = ydl.extract_info(url, download=False, process=False)
+        with _HostRestrictedYoutubeDL(options, _TWITTER_REQUEST_HOSTS) as ydl:
+            raw = ydl.extract_info(base_url, download=False, process=False)
     except yt_dlp.utils.DownloadError as error:
         raise MetadataError(
             "The X post has no downloadable video, is unavailable, or requires login."
@@ -51,18 +88,15 @@ def _fetch_twitter_metadata_sync(url: str) -> dict[str, object]:
     if not isinstance(raw, dict) or raw.get("_type") in {"url", "url_transparent"}:
         raise MetadataError("The X post does not contain native video.")
 
-    _, requested_index = twitter_status_parts(url) or ("", None)
     if raw.get("_type") == "playlist":
         entries = [entry for entry in raw.get("entries") or [] if isinstance(entry, dict)]
-        if requested_index is None and len(entries) > 1:
+        if len(entries) > 1:
             raise MetadataError(
-                "The X post contains multiple videos; submit a URL ending in /video/1, "
-                "/video/2, and so on."
+                "X posts containing multiple videos are not supported yet."
             )
-        selected_index = int(requested_index or "1") - 1
-        if selected_index < 0 or selected_index >= len(entries):
-            raise MetadataError("The requested X post video does not exist.")
-        raw = cast(dict[str, object], entries[selected_index])
+        if not entries:
+            raise MetadataError("The X post does not contain downloadable video.")
+        raw = cast(dict[str, object], entries[0])
 
     if raw.get("_type") not in {None, "video"}:
         raise MetadataError("The X post does not contain native video.")
@@ -78,7 +112,7 @@ def _fetch_twitter_metadata_sync(url: str) -> dict[str, object]:
             raise MetadataError("The X post delegated to an untrusted media host.")
     raw["extractor"] = "twitter"
     raw["extractor_key"] = "Twitter"
-    with yt_dlp.YoutubeDL(options) as ydl:
+    with _HostRestrictedYoutubeDL(options, _TWITTER_REQUEST_HOSTS) as ydl:
         processed = ydl.process_ie_result(dict(raw), download=False)
     if not isinstance(processed, dict):
         raise MetadataError("The X post returned invalid media metadata.")
@@ -147,6 +181,7 @@ class MediaSource:
                 cancel_event,
                 is_twitter,
                 metadata if is_twitter else None,
+                _TWITTER_REQUEST_HOSTS if is_twitter else None,
                 cancel=cancel_event.set,
             )
         transcription = await transcribe(

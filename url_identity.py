@@ -69,9 +69,8 @@ def submission_identity(url: str) -> tuple[str, bool]:
             return f"vimeo:{video_id}", True
 
     if twitter_parts := twitter_status_parts(url):
-        status_id, media_index = twitter_parts
-        suffix = f":media:{media_index}" if media_index not in {None, "1"} else ""
-        return f"twitter:{status_id}{suffix}", True
+        status_id, _ = twitter_parts
+        return f"twitter:{status_id}", True
 
     filtered_query = [
         (key, value)

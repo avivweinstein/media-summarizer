@@ -39,6 +39,23 @@ class _TimeoutSession(requests.Session):
         return super().request(method, url, *args, **kwargs)
 
 
+class _HostRestrictedYoutubeDL(yt_dlp.YoutubeDL):  # type: ignore[misc]
+    def __init__(self, options: dict[str, object], allowed_hosts: frozenset[str]) -> None:
+        self._allowed_hosts = allowed_hosts
+        super().__init__(options)
+
+    def urlopen(self, request: Any) -> Any:
+        raw_url = request if isinstance(request, str) else getattr(request, "url", None)
+        if not isinstance(raw_url, str):
+            raise MetadataError("Media extractor attempted an invalid network request.")
+        parsed = urlparse(raw_url)
+        if parsed.scheme != "https" or parsed.hostname not in self._allowed_hosts:
+            raise MetadataError(
+                f"Media extractor attempted to contact an untrusted host: {parsed.hostname or '-'}"
+            )
+        return super().urlopen(request)
+
+
 def _extract_video_id(url: str) -> str:
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -149,6 +166,7 @@ def _download_audio_sync(
     cancel_event: threading.Event | None = None,
     no_playlist: bool = False,
     media_info: dict[str, object] | None = None,
+    allowed_hosts: frozenset[str] | None = None,
 ) -> None:
     """Download audio from one hosted video via yt-dlp as MP3."""
 
@@ -179,7 +197,12 @@ def _download_audio_sync(
     if no_playlist:
         opts["noplaylist"] = True
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        downloader = (
+            _HostRestrictedYoutubeDL(opts, allowed_hosts)
+            if allowed_hosts is not None
+            else yt_dlp.YoutubeDL(opts)
+        )
+        with downloader as ydl:
             if media_info is not None:
                 ydl.process_info(dict(media_info))
                 result = 0

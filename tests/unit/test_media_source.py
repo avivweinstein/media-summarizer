@@ -4,12 +4,23 @@ import pytest
 
 from exceptions import MetadataError, UnsupportedURLError
 from models import TranscriptionOutput, TranscriptSegment
-from sources.media import MediaSource, _fetch_twitter_metadata_sync, _vimeo_player_url
+from sources.media import (
+    MediaSource,
+    _fetch_twitter_metadata_sync,
+    _twitter_base_url,
+    _vimeo_player_url,
+)
 
 
 def test_standard_vimeo_url_uses_embedded_player() -> None:
     assert _vimeo_player_url("https://vimeo.com/123") == "https://player.vimeo.com/video/123"
     assert _vimeo_player_url("https://www.vimeo.com/123") == "https://player.vimeo.com/video/123"
+
+
+def test_twitter_base_url_removes_media_selection_and_tracking() -> None:
+    assert _twitter_base_url(
+        "https://x.com/example/status/1234567890/video/2?s=20"
+    ) == "https://x.com/example/status/1234567890"
 
 
 async def test_generic_media_downloads_and_preserves_timestamps(mocker: MagicMock) -> None:
@@ -121,10 +132,37 @@ def test_twitter_metadata_rejects_bare_multi_video_post(mocker: MagicMock) -> No
     extractor.__enter__.return_value.process_ie_result.side_effect = (
         lambda info, download: info
     )
-    mocker.patch("sources.media.yt_dlp.YoutubeDL", return_value=extractor)
+    mocker.patch("sources.media._HostRestrictedYoutubeDL", return_value=extractor)
 
-    with pytest.raises(MetadataError, match="multiple videos"):
+    with pytest.raises(MetadataError, match="multiple videos.*not supported"):
         _fetch_twitter_metadata_sync("https://x.com/example/status/1234567890")
+
+
+def test_twitter_metadata_normalizes_mixed_media_selection(mocker: MagicMock) -> None:
+    media = {
+        "formats": [{"url": "https://video.twimg.com/video.m3u8"}],
+        "id": "video-id",
+    }
+    extractor = MagicMock()
+    extractor.__enter__.return_value.extract_info.return_value = {
+        "_type": "playlist",
+        "entries": [media],
+    }
+    extractor.__enter__.return_value.process_ie_result.side_effect = (
+        lambda info, download: info
+    )
+    mocker.patch("sources.media._HostRestrictedYoutubeDL", return_value=extractor)
+
+    result = _fetch_twitter_metadata_sync(
+        "https://x.com/example/status/1234567890/video/2"
+    )
+
+    extractor.__enter__.return_value.extract_info.assert_called_once_with(
+        "https://x.com/example/status/1234567890",
+        download=False,
+        process=False,
+    )
+    assert result["id"] == "video-id"
 
 
 @pytest.mark.parametrize(
@@ -142,7 +180,7 @@ def test_twitter_metadata_rejects_external_delegation(
     extractor.__enter__.return_value.process_ie_result.side_effect = (
         lambda info, download: info
     )
-    mocker.patch("sources.media.yt_dlp.YoutubeDL", return_value=extractor)
+    mocker.patch("sources.media._HostRestrictedYoutubeDL", return_value=extractor)
 
     with pytest.raises(MetadataError, match="native video|untrusted"):
         _fetch_twitter_metadata_sync("https://x.com/example/status/1234567890")
