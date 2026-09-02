@@ -63,9 +63,32 @@ def _moment_link(result: TranscriptResult, seconds: int) -> str | None:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def _atomic_write_once(path: Path, content: str) -> None:
+def _safe_output_directory(vault_path: Path, relative_path: Path) -> Path:
+    """Create a vault-contained directory without following symlink components."""
+    directory = vault_path
+    for part in relative_path.parts:
+        directory /= part
+        if directory.is_symlink():
+            raise ObsidianError(f"Obsidian output paths must not contain symlinks: {directory}")
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if not directory.is_dir() or not directory.resolve().is_relative_to(vault_path):
+            raise ObsidianError(f"Unsafe Obsidian output directory: {directory}")
+    return directory
+
+
+def _validate_note_target(vault_path: Path, path: Path) -> None:
+    if not path.parent.resolve().is_relative_to(vault_path) or path.is_symlink():
+        raise ObsidianError(f"Unsafe Obsidian note path: {path}")
+    if path.exists() and not path.is_file():
+        raise ObsidianError(f"Obsidian note path is not a regular file: {path}")
+
+
+def _atomic_write_once(vault_path: Path, path: Path, content: str) -> None:
     """Create a file atomically without replacing an existing note."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_note_target(vault_path, path)
     if path.exists():
         return
 
@@ -86,7 +109,7 @@ def _atomic_write_once(path: Path, content: str) -> None:
         try:
             os.link(temp_path, path)
         except FileExistsError:
-            pass
+            _validate_note_target(vault_path, path)
     except OSError as error:
         raise ObsidianError(f"Failed to write Obsidian note {path}: {error}") from error
     finally:
@@ -94,8 +117,10 @@ def _atomic_write_once(path: Path, content: str) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def _find_existing(directory: Path, media_id: str) -> Path | None:
+def _find_existing(vault_path: Path, directory: Path, media_id: str) -> Path | None:
     matches = sorted(directory.glob(f"*--{media_id}.md"))
+    for match in matches:
+        _validate_note_target(vault_path, match)
     return matches[0] if matches else None
 
 
@@ -229,14 +254,22 @@ def _save_sync(
     media_id = source_id(result)
     transcript_path: Path | None = None
     if retain_transcript:
-        transcript_dir = vault_path / TRANSCRIPT_DIR
-        transcript_path = _find_existing(transcript_dir, f"{media_id}-transcript")
+        transcript_dir = _safe_output_directory(vault_path, TRANSCRIPT_DIR)
+        transcript_path = _find_existing(
+            vault_path,
+            transcript_dir,
+            f"{media_id}-transcript",
+        )
         if transcript_path is None:
             transcript_path = transcript_dir / f"{media_id}-transcript.md"
-            _atomic_write_once(transcript_path, _render_transcript(result, media_id))
+            _atomic_write_once(
+                vault_path,
+                transcript_path,
+                _render_transcript(result, media_id),
+            )
 
-    summary_dir = vault_path / SUMMARY_DIR
-    summary_path = _find_existing(summary_dir, media_id)
+    summary_dir = _safe_output_directory(vault_path, SUMMARY_DIR)
+    summary_path = _find_existing(vault_path, summary_dir, media_id)
     if summary_path is None:
         summary_path = summary_dir / f"{media_id}.md"
         content = _render_summary(
@@ -248,7 +281,7 @@ def _save_sync(
             transcript_path,
             usage,
         )
-        _atomic_write_once(summary_path, content)
+        _atomic_write_once(vault_path, summary_path, content)
     return summary_path.relative_to(vault_path).as_posix()
 
 

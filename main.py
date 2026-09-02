@@ -83,11 +83,17 @@ def _single_instance_lock(path: Path = _INSTANCE_LOCK_PATH) -> Iterator[None]:
 
 
 def _obsidian_destinations_writable(vault_path: Path, retain_transcript: bool) -> bool:
+    vault_path = vault_path.resolve()
     destinations = [vault_path / "Generated" / "Summaries"]
     if retain_transcript:
         destinations.append(vault_path / "Generated" / "Transcripts")
 
     for destination in destinations:
+        current = vault_path
+        for part in destination.relative_to(vault_path).parts:
+            current /= part
+            if current.is_symlink() or (current.exists() and not current.is_dir()):
+                return False
         existing = destination
         while not existing.exists() and existing != vault_path:
             existing = existing.parent

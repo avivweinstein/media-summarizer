@@ -193,3 +193,24 @@ async def test_nvidia_readiness_fails_before_provider_without_obsidian(
     assert "OBSIDIAN_VAULT_PATH is required" in str(caught.value.detail)
     whisper.assert_not_called()
     verify.assert_not_awaited()
+
+
+async def test_nvidia_readiness_rejects_symlinked_output_directory(
+    tmp_path: Path,
+    mocker: MagicMock,
+) -> None:
+    vault = tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "Generated").symlink_to(outside, target_is_directory=True)
+    mocker.patch.object(settings, "processing_mode", "nvidia_internal")
+    mocker.patch.object(settings, "obsidian_vault_path", str(vault))
+    verify = mocker.patch("main.verify_nvidia_model_access", new=AsyncMock())
+
+    with pytest.raises(HTTPException) as caught:
+        await _require_processing_ready()
+
+    assert caught.value.status_code == 503
+    assert "not writable" in str(caught.value.detail)
+    verify.assert_not_awaited()
