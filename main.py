@@ -20,7 +20,6 @@ import logging.config
 import tomllib
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -33,6 +32,7 @@ from exceptions import UnsupportedURLError
 from models import (
     BulkSummarizeRequest,
     BulkSummarizeResponse,
+    Job,
     JobResponse,
     JobStage,
     JobStatus,
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Media Summarizer", lifespan=lifespan)
 
 
-def _job_to_response(job: job_queue.Job) -> JobResponse:
+def _job_to_response(job: Job) -> JobResponse:
     return JobResponse(
         job_id=job.job_id,
         url=job.url,
@@ -292,8 +292,8 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     if settings.anthropic_api_key:
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-            await client.messages.create(
+            anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+            await anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
@@ -310,8 +310,8 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     if settings.openai_api_key:
         try:
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.openai_api_key)
-            await client.models.list()
+            openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+            await openai_client.models.list()
             checks["openai"] = "ok"
         except Exception as e:
             checks["openai"] = f"error: {e}"
@@ -324,8 +324,8 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     if settings.notion_api_key:
         try:
             from notion_client import AsyncClient
-            client = AsyncClient(auth=settings.notion_api_key)
-            await client.databases.retrieve(database_id=settings.notion_database_id)
+            notion_client = AsyncClient(auth=settings.notion_api_key)
+            await notion_client.databases.retrieve(database_id=settings.notion_database_id)
             checks["notion"] = "ok"
         except Exception as e:
             checks["notion"] = f"error: {e}"

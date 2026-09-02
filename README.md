@@ -105,7 +105,28 @@ A healthy response looks like:
 
 ---
 
-## Running as a systemd service (Linux)
+## Running as a background service
+
+### macOS (launchd)
+
+The macOS service binds to `127.0.0.1` by default so the unauthenticated API is
+not exposed to the local network. It starts at login, restarts after failures,
+and writes logs under `~/Library/Logs/media-summarizer/`.
+
+```bash
+uv sync --extra dev
+uv run python scripts/install_macos_service.py install
+
+# Inspect or remove the service
+uv run python scripts/install_macos_service.py status
+uv run python scripts/install_macos_service.py uninstall
+```
+
+The installer requires `.env` and `.venv/bin/uvicorn` to exist. Its generated
+launchd configuration uses an owner-only umask so newly created runtime files
+are not readable by other local users.
+
+### Linux (systemd)
 
 To run media-summarizer as a background service that starts on boot:
 
