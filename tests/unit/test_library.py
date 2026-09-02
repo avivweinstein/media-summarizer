@@ -100,7 +100,7 @@ async def test_ollama_receives_only_retrieved_generated_excerpt(
     mock_client.__aenter__.return_value = mock_client
     mock_client.__aexit__.return_value = None
     mock_client.post.return_value = mock_response
-    mocker.patch("library.httpx.AsyncClient", return_value=mock_client)
+    client_factory = mocker.patch("library.httpx.AsyncClient", return_value=mock_client)
 
     answer = await ask_library(
         str(vault),
@@ -114,6 +114,56 @@ async def test_ollama_receives_only_retrieved_generated_excerpt(
     assert answer.answer == "A local answer [1]"
     payload = mock_client.post.call_args.kwargs["json"]
     assert "Only retrieved excerpts" in payload["messages"][0]["content"]
+    assert client_factory.call_args.kwargs["trust_env"] is False
+
+
+async def test_ollama_answer_with_invalid_citation_falls_back_to_extractive(
+    tmp_path: Path,
+    mocker: MagicMock,
+) -> None:
+    vault = _vault(tmp_path)
+    _write_note(
+        vault / "Generated" / "Summaries" / "youtube-test.md",
+        "Grounded Answers",
+        "Grounded answers must cite retrieved material.",
+    )
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"message": {"content": "Unsupported [99]"}}
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+    mock_client.post.return_value = mock_response
+    mocker.patch("library.httpx.AsyncClient", return_value=mock_client)
+
+    answer = await ask_library(
+        str(vault),
+        "How are answers grounded?",
+        limit=5,
+        provider="ollama",
+        ollama_model="local-model",
+        ollama_base_url="http://127.0.0.1:11434",
+    )
+
+    assert answer.provider == "extractive"
+    assert answer.answer.endswith("[1]")
+
+
+async def test_search_ignores_stopwords_and_substring_matches(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _write_note(
+        vault / "Generated" / "Summaries" / "noise.md",
+        "General Notes",
+        "What is the thing and how does it work? The category is broad.",
+    )
+    _write_note(
+        vault / "Generated" / "Summaries" / "relevant.md",
+        "Checkpoint Recovery",
+        "A checkpoint restores interrupted jobs after restart.",
+    )
+
+    hits = await search_library(str(vault), "How does checkpoint recovery work?", limit=1)
+
+    assert hits[0].note_path == "Generated/Summaries/relevant.md"
 
 
 async def test_ollama_rejects_nonlocal_endpoint(tmp_path: Path) -> None:

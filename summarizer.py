@@ -377,14 +377,12 @@ async def summarize(
             persist_usage=persist_usage,
         )
 
-    if not result.segments:
-        summary.key_moments = []
-    elif result.duration_seconds > 0:
-        summary.key_moments = [
-            moment
-            for moment in summary.key_moments
-            if moment.timestamp_seconds <= result.duration_seconds
-        ]
+    valid_timestamps = {round(segment.start_seconds) for segment in result.segments}
+    summary.key_moments = [
+        moment
+        for moment in summary.key_moments
+        if moment.timestamp_seconds in valid_timestamps
+    ]
 
     logger.info(
         "%s event=summarize_done tags=%r worth_rewatching=%s requests=%d "

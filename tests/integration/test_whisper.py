@@ -17,13 +17,14 @@ def setup_tmp_dir() -> None:
     ensure_tmp_dir()
 
 
-async def test_transcribe_returns_string() -> None:
+async def test_transcribe_returns_timestamped_output() -> None:
     dest = TMP_DIR / "integration-whisper-test.mp3"
     shutil.copy(_FIXTURE_MP3, dest)
 
     result = await transcribe(dest, job_id="integration-test")
 
-    assert isinstance(result, str)
+    assert result.text
+    assert result.segments
 
 
 async def test_transcribe_cleans_up_file() -> None:

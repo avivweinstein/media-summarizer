@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -13,6 +14,37 @@ from models import LibraryAnswer, LibraryCitation, LibrarySearchHit
 _GENERATED_DIRS = (Path("Generated/Summaries"), Path("Generated/Transcripts"))
 _MAX_NOTE_BYTES = 2 * 1024 * 1024
 _WORD_RE = re.compile(r"[\w'-]+", re.UNICODE)
+_CITATION_RE = re.compile(r"\[(\d+)\]")
+_STOP_WORDS = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "are",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "say",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "why",
+    "with",
+}
+
+
+def _tokens(text: str) -> list[str]:
+    return [token.casefold() for token in _WORD_RE.findall(text)]
 
 
 def _frontmatter_value(text: str, key: str) -> str:
@@ -27,14 +59,24 @@ def _frontmatter_value(text: str, key: str) -> str:
     return str(value) if value is not None else ""
 
 
+def _body_lines(text: str) -> tuple[list[str], int]:
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for index, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                return lines[index + 1 :], index + 1
+    return lines, 0
+
+
 def _search_sync(vault_path: str, query: str, limit: int) -> list[LibrarySearchHit]:
     vault = Path(vault_path).expanduser().resolve()
     if not vault.is_dir() or not (vault / ".obsidian").is_dir():
         raise ValueError("A valid Obsidian vault is required for library search.")
 
-    terms = list(dict.fromkeys(term.casefold() for term in _WORD_RE.findall(query)))
-    if not terms:
+    raw_terms = list(dict.fromkeys(_tokens(query)))
+    if not raw_terms:
         return []
+    terms = [term for term in raw_terms if term not in _STOP_WORDS] or raw_terms
 
     hits: list[LibrarySearchHit] = []
     for relative_dir in _GENERATED_DIRS:
@@ -48,26 +90,28 @@ def _search_sync(vault_path: str, query: str, limit: int) -> list[LibrarySearchH
             if path.stat().st_size > _MAX_NOTE_BYTES:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            folded = text.casefold()
             title = _frontmatter_value(text, "title") or path.stem
-            title_folded = title.casefold()
-            counts = [folded.count(term) for term in terms]
+            lines, line_offset = _body_lines(text)
+            token_counts = Counter(_tokens("\n".join(lines)))
+            title_counts = Counter(_tokens(title))
+            counts = [token_counts[term] for term in terms]
             if not any(counts):
                 continue
-            score = sum(counts) + 5 * sum(title_folded.count(term) for term in terms)
-            positions = [position for term in terms if (position := folded.find(term)) >= 0]
-            position = min(positions)
-            line_number = text.count("\n", 0, position) + 1
-            start = max(0, position - 120)
-            end = min(len(text), position + 280)
-            excerpt = " ".join(text[start:end].split())
+            score = sum(counts) + 5 * sum(title_counts[term] for term in terms)
+            line_scores = [sum(Counter(_tokens(line))[term] for term in terms) for line in lines]
+            if not lines:
+                continue
+            best_line = max(range(len(lines)), key=line_scores.__getitem__)
+            excerpt_start = max(0, best_line - 2)
+            excerpt_end = min(len(lines), best_line + 3)
+            excerpt = " ".join(" ".join(lines[excerpt_start:excerpt_end]).split())
             hits.append(
                 LibrarySearchHit(
                     note_path=resolved.relative_to(vault).as_posix(),
                     title=title,
                     source_url=_frontmatter_value(text, "source_url") or None,
                     media_id=_frontmatter_value(text, "media_id") or None,
-                    line_number=line_number,
+                    line_number=line_offset + best_line + 1,
                     excerpt=excerpt,
                     score=score,
                 )
@@ -120,7 +164,7 @@ async def _ask_ollama(
         "the bracketed source numbers. If the excerpts are insufficient, say so.\n\n"
         f"Question: {question}\n\nLibrary excerpts:\n{context}"
     )
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
         response = await client.post(
             f"{base_url.rstrip('/')}/api/chat",
             json={
@@ -158,6 +202,7 @@ async def ask_library(
             provider=provider,
         )
 
+    answer_provider = provider
     if provider == "ollama":
         answer = await _ask_ollama(
             question,
@@ -165,9 +210,16 @@ async def ask_library(
             ollama_model,
             ollama_base_url,
         )
+        referenced = {int(index) for index in _CITATION_RE.findall(answer)}
+        valid_indices = {citation.index for citation in citations}
+        if not referenced or not referenced.issubset(valid_indices):
+            answer = "\n".join(
+                f"{citation.excerpt} [{citation.index}]" for citation in citations
+            )
+            answer_provider = "extractive"
     elif provider == "extractive":
         answer = "\n".join(f"{citation.excerpt} [{citation.index}]" for citation in citations)
     else:
         raise ValueError("Library Q&A provider must be 'extractive' or 'ollama'.")
 
-    return LibraryAnswer(answer=answer, citations=citations, provider=provider)
+    return LibraryAnswer(answer=answer, citations=citations, provider=answer_provider)

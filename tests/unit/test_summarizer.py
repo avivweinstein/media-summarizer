@@ -360,6 +360,29 @@ class TestSummarize:
         assert "[00:01:05] Important detail." in prompt
         assert summary.key_moments[0].timestamp_seconds == 65
 
+    async def test_hallucinated_timestamp_is_removed(self, mocker: MagicMock) -> None:
+        response_json = json.dumps(
+            {
+                **json.loads(VALID_JSON),
+                "key_moments": [
+                    {"timestamp_seconds": 66, "point": "Not an actual segment start."}
+                ],
+            }
+        )
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = make_claude_response(response_json)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        source = make_result(
+            duration_seconds=0,
+            segments=[
+                TranscriptSegment(start_seconds=65, end_seconds=70, text="Actual segment.")
+            ],
+        )
+
+        summary = await summarize(source)
+
+        assert summary.key_moments == []
+
     async def test_rate_limit_error_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import RateLimitError
 
