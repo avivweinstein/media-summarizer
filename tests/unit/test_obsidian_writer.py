@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from exceptions import ObsidianError
-from models import Summary, TranscriptResult
+from models import Summary, TranscriptResult, UsageStats
 from obsidian_writer import save_to_obsidian, source_id
 
 
@@ -72,6 +72,12 @@ async def test_save_creates_summary_and_transcript_with_metadata(tmp_path: Path)
         retain_transcript=True,
         summary_model="anthropic/test-model",
         added_at=datetime(2026, 9, 2, tzinfo=UTC),
+        usage=UsageStats(
+            anthropic_requests=1,
+            anthropic_input_tokens=100,
+            anthropic_output_tokens=50,
+            estimated_cost_usd=0.00105,
+        ),
     )
 
     summary_path = vault / relative_path
@@ -90,6 +96,8 @@ async def test_save_creates_summary_and_transcript_with_metadata(tmp_path: Path)
     assert "key_points:\n  - \"First point.\"\n  - \"Second point.\"" in content
     assert "- First point." in content
     assert "worth_rewatching: true" in content
+    assert "anthropic_input_tokens: 100" in content
+    assert "estimated_cost_usd: 0.00105" in content
     assert "![[Generated/Transcripts/" in content
     assert "A complete transcript." in transcript_path.read_text()
     assert summary_path.stat().st_mode & 0o777 == 0o600

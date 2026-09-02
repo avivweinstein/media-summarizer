@@ -24,8 +24,9 @@ from urllib.parse import parse_qs, urlparse
 import feedparser
 import httpx
 
-from exceptions import TranscriptionError
-from models import TranscriptResult
+from config import settings
+from exceptions import TranscriptionError, UsageLimitError
+from models import TranscriptResult, UsageStats
 from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe
 
@@ -186,12 +187,32 @@ async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
     """Stream-download an MP3 file to disk."""
     log = f"job_id={job_id} url={url[:60]!r} source=podcast"
     logger.info("%s event=mp3_download_start", log)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
-                    f.write(chunk)
+    downloaded = 0
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT
+        ) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                raw_content_length = resp.headers.get("content-length", "")
+                content_length = (
+                    int(raw_content_length) if raw_content_length.isdigit() else 0
+                )
+                if content_length > settings.max_audio_download_bytes:
+                    raise UsageLimitError(
+                        "Podcast audio exceeds the configured download-size limit."
+                    )
+                with open(dest, "wb") as f:
+                    async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
+                        downloaded += len(chunk)
+                        if downloaded > settings.max_audio_download_bytes:
+                            raise UsageLimitError(
+                                "Podcast audio exceeds the configured download-size limit."
+                            )
+                        f.write(chunk)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     size_mb = dest.stat().st_size / 1e6
     logger.info("%s event=mp3_download_done size_mb=%.1f", log, size_mb)
 
@@ -203,35 +224,46 @@ async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
 class PodcastSource(BaseSource):
     """Resolves podcast URLs to MP3, transcribes via Whisper, returns TranscriptResult."""
 
-    async def fetch(self, url: str, job_id: str = "-") -> TranscriptResult:
+    async def fetch(
+        self,
+        url: str,
+        job_id: str = "-",
+        *,
+        usage: UsageStats | None = None,
+    ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
 
         try:
             if parsed.path.lower().endswith(".mp3"):
-                return await self._from_direct_mp3(url, job_id)
+                return await self._from_direct_mp3(url, job_id, usage)
 
             if hostname == "podcasts.apple.com":
-                return await self._from_apple_podcasts(url, job_id)
+                return await self._from_apple_podcasts(url, job_id, usage)
 
             # Assume it's an RSS feed URL
             logger.info("%s event=rss_fetch_start", log)
             feed = await _fetch_rss(url)
-            return await self._from_feed(feed, url, job_id, episode_id=None)
+            return await self._from_feed(feed, url, job_id, episode_id=None, usage=usage)
 
-        except TranscriptionError:
+        except (TranscriptionError, UsageLimitError):
             raise
         except Exception as e:
             raise TranscriptionError(
                 f"Couldn't process podcast URL: {e}"
             ) from e
 
-    async def _from_direct_mp3(self, url: str, job_id: str) -> TranscriptResult:
+    async def _from_direct_mp3(
+        self,
+        url: str,
+        job_id: str,
+        usage: UsageStats | None,
+    ) -> TranscriptResult:
         """Download a direct MP3 URL and transcribe it."""
         dest = tmp_path_for_job(job_id)
         await _download_mp3(url, dest, job_id)
-        transcript = await transcribe(dest, job_id)
+        transcript = await transcribe(dest, job_id, usage=usage)
 
         return TranscriptResult(
             title=Path(urlparse(url).path).stem or "Podcast Episode",
@@ -244,7 +276,12 @@ class PodcastSource(BaseSource):
             source_item_id=url,
         )
 
-    async def _from_apple_podcasts(self, url: str, job_id: str) -> TranscriptResult:
+    async def _from_apple_podcasts(
+        self,
+        url: str,
+        job_id: str,
+        usage: UsageStats | None,
+    ) -> TranscriptResult:
         """Resolve Apple Podcasts URL → iTunes → RSS → MP3 → transcribe."""
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         podcast_id, episode_id = _parse_apple_podcast_ids(url)
@@ -252,7 +289,13 @@ class PodcastSource(BaseSource):
         feed_url = await _itunes_feed_url(podcast_id)
         logger.info("%s event=itunes_lookup_done feed_url=%s", log, feed_url)
         feed = await _fetch_rss(feed_url)
-        return await self._from_feed(feed, url, job_id, episode_id=episode_id)
+        return await self._from_feed(
+            feed,
+            url,
+            job_id,
+            episode_id=episode_id,
+            usage=usage,
+        )
 
     async def _from_feed(
         self,
@@ -260,6 +303,7 @@ class PodcastSource(BaseSource):
         original_url: str,
         job_id: str,
         episode_id: str | None,
+        usage: UsageStats | None,
     ) -> TranscriptResult:
         """Pick the best episode from a parsed RSS feed, download and transcribe."""
         log = f"job_id={job_id} url={original_url[:60]!r} source=podcast"
@@ -277,7 +321,12 @@ class PodcastSource(BaseSource):
 
         dest = tmp_path_for_job(job_id)
         await _download_mp3(mp3_url, dest, job_id)
-        transcript = await transcribe(dest, job_id)
+        transcript = await transcribe(
+            dest,
+            job_id,
+            duration_seconds=duration_seconds,
+            usage=usage,
+        )
 
         return TranscriptResult(
             title=title,

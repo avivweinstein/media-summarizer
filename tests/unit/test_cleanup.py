@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from exceptions import TranscriptionError
+from config import settings
+from exceptions import TranscriptionError, UsageLimitError
+from models import UsageStats
 from transcriber import ensure_tmp_dir, transcribe
 
 
@@ -70,6 +72,50 @@ class TestEnsureTmpDir:
 
 
 class TestTranscribeFileCleanup:
+    async def test_tracks_request_duration_and_cost(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        mp3 = tmp_path / "usage.mp3"
+        mp3.write_bytes(b"x" * 100)
+        mock_client = AsyncMock()
+        mock_client.audio.transcriptions.create.return_value = "Transcript text."
+        mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+        usage = UsageStats()
+
+        await transcribe(mp3, duration_seconds=120, usage=usage)
+
+        assert usage.openai_requests == 1
+        assert usage.openai_audio_seconds == 120
+        assert usage.estimated_cost_usd == pytest.approx(0.012)
+
+    async def test_duration_limit_blocks_before_api_call(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        mp3 = tmp_path / "too-long.mp3"
+        mp3.write_bytes(b"x" * 100)
+        mock_client = AsyncMock()
+        mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+        mocker.patch.object(settings, "max_audio_duration_seconds", 60)
+
+        with pytest.raises(UsageLimitError, match="duration"):
+            await transcribe(mp3, duration_seconds=120)
+
+        mock_client.audio.transcriptions.create.assert_not_called()
+
+    async def test_existing_request_usage_counts_toward_limit(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        mp3 = tmp_path / "request-limit.mp3"
+        mp3.write_bytes(b"x" * 100)
+        mock_client = AsyncMock()
+        mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+        usage = UsageStats(openai_requests=settings.max_openai_requests_per_job)
+
+        with pytest.raises(UsageLimitError, match="request limit"):
+            await transcribe(mp3, duration_seconds=60, usage=usage)
+
+        mock_client.audio.transcriptions.create.assert_not_called()
+
     async def test_deletes_file_on_success(self, tmp_path: Path, mocker: MagicMock) -> None:
         mp3 = tmp_path / "test-job.mp3"
         mp3.write_bytes(b"x" * 100)

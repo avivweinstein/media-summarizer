@@ -19,7 +19,8 @@ from openai import (
 )
 
 from config import settings
-from exceptions import TranscriptionError
+from exceptions import TranscriptionError, UsageLimitError
+from models import UsageStats
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,36 @@ async def _compress_for_whisper(src: Path, dst: Path) -> None:
         )
 
 
-async def transcribe(mp3_path: Path, job_id: str = "-") -> str:
+async def _probe_audio_duration(path: Path) -> float:
+    """Return media duration from ffprobe, or zero when it cannot be determined."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode == 0:
+            return max(0.0, float(stdout.decode().strip()))
+    except (FileNotFoundError, ValueError):
+        pass
+    return 0.0
+
+
+async def transcribe(
+    mp3_path: Path,
+    job_id: str = "-",
+    *,
+    duration_seconds: float | None = None,
+    usage: UsageStats | None = None,
+) -> str:
     """Send an MP3 file to Whisper and return the transcript text.
 
     Always deletes the file on exit, regardless of success or failure.
@@ -87,13 +117,38 @@ async def transcribe(mp3_path: Path, job_id: str = "-") -> str:
     """
     log = f"job_id={job_id} url=- source=podcast"
     compressed_path: Path | None = None
+    usage_tracker = usage or UsageStats()
 
     try:
         if not mp3_path.exists():
             raise TranscriptionError(f"MP3 file not found: {mp3_path}")
 
         file_size = mp3_path.stat().st_size
+        if file_size > settings.max_audio_download_bytes:
+            raise UsageLimitError(
+                f"Audio download is {file_size / 1e6:.0f} MB, exceeding the configured "
+                f"{settings.max_audio_download_bytes / 1e6:.0f} MB per-job limit."
+            )
         logger.info("%s event=transcribe_start path=%s size_mb=%.1f", log, mp3_path.name, file_size / 1e6)
+
+        audio_seconds = (
+            duration_seconds
+            if duration_seconds is not None and duration_seconds > 0
+            else await _probe_audio_duration(mp3_path)
+        )
+        if audio_seconds > settings.max_audio_duration_seconds:
+            raise UsageLimitError(
+                f"Audio duration is {audio_seconds / 3600:.1f} hours, exceeding the "
+                f"configured {settings.max_audio_duration_seconds / 3600:.1f}-hour limit."
+            )
+        estimated_cost = audio_seconds / 60 * settings.whisper_cost_per_minute_usd
+        if usage_tracker.estimated_cost_usd + estimated_cost > settings.max_estimated_cost_usd:
+            raise UsageLimitError(
+                f"Estimated transcription cost ${estimated_cost:.2f} exceeds the "
+                f"configured ${settings.max_estimated_cost_usd:.2f} per-job limit."
+            )
+        if usage_tracker.openai_requests >= settings.max_openai_requests_per_job:
+            raise UsageLimitError("Configured OpenAI per-job request limit reached.")
 
         if file_size > WHISPER_MAX_BYTES:
             logger.info(
@@ -114,6 +169,13 @@ async def transcribe(mp3_path: Path, job_id: str = "-") -> str:
             upload_path = mp3_path
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+        usage_tracker.openai_requests += 1
+        usage_tracker.openai_audio_seconds += audio_seconds
+        usage_tracker.estimated_cost_usd = round(
+            usage_tracker.estimated_cost_usd + estimated_cost,
+            6,
+        )
 
         with open(upload_path, "rb") as f:
             response = await client.audio.transcriptions.create(

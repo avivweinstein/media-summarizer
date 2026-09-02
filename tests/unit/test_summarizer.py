@@ -13,9 +13,10 @@ import pytest
 from anthropic import APIStatusError
 from anthropic.types import TextBlock
 
-from exceptions import SummarizationError
-from models import Summary, TranscriptResult
-from summarizer import MODEL, _parse_response, summarize
+from config import settings
+from exceptions import SummarizationError, UsageLimitError
+from models import Summary, TranscriptResult, UsageStats
+from summarizer import MODEL, _chunk_text, _parse_response, summarize
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +50,8 @@ def make_claude_response(content: str) -> MagicMock:
     """
     response = MagicMock()
     response.content = [TextBlock(type="text", text=content)]
+    response.usage.input_tokens = 100
+    response.usage.output_tokens = 50
     return response
 
 
@@ -151,6 +154,14 @@ class TestParseResponse:
         assert s.key_points == []
 
 
+class TestChunkText:
+    def test_chunks_have_strict_size_limit_and_preserve_text(self) -> None:
+        chunks = _chunk_text("one two three four five", 8)
+
+        assert all(len(chunk) <= 8 for chunk in chunks)
+        assert " ".join(chunks) == "one two three four five"
+
+
 # ---------------------------------------------------------------------------
 # summarize() — mocked Anthropic client
 # ---------------------------------------------------------------------------
@@ -164,6 +175,80 @@ class TestSummarize:
         result = await summarize(make_result())
         assert result.tldr == "A great video about cycling training."
         mock_client.messages.create.assert_called_once()
+
+    async def test_tracks_tokens_requests_and_estimated_cost(
+        self, mocker: MagicMock
+    ) -> None:
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        usage = UsageStats()
+
+        await summarize(make_result(), usage=usage)
+
+        assert usage.anthropic_requests == 1
+        assert usage.anthropic_input_tokens == 100
+        assert usage.anthropic_output_tokens == 50
+        assert usage.estimated_cost_usd == pytest.approx(0.00105)
+
+    async def test_long_transcript_uses_chunk_summaries_and_synthesis(
+        self, mocker: MagicMock
+    ) -> None:
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch.object(settings, "summary_chunk_chars", 10)
+        mocker.patch.object(settings, "max_transcript_chars", 100)
+        mocker.patch.object(settings, "max_anthropic_requests_per_job", 10)
+        usage = UsageStats()
+
+        await summarize(make_result(transcript="x" * 25), usage=usage)
+
+        assert mock_client.messages.create.call_count == 4
+        assert usage.anthropic_requests == 4
+
+    async def test_transcript_limit_blocks_before_api_call(self, mocker: MagicMock) -> None:
+        mock_client = AsyncMock()
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch.object(settings, "max_transcript_chars", 10)
+
+        with pytest.raises(UsageLimitError, match="character per-job limit"):
+            await summarize(make_result(transcript="x" * 11))
+
+        mock_client.messages.create.assert_not_called()
+
+    async def test_request_limit_blocks_chunked_summary(self, mocker: MagicMock) -> None:
+        mock_client = AsyncMock()
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch.object(settings, "summary_chunk_chars", 10)
+        mocker.patch.object(settings, "max_transcript_chars", 100)
+        mocker.patch.object(settings, "max_anthropic_requests_per_job", 3)
+
+        with pytest.raises(UsageLimitError, match="request allowance"):
+            await summarize(make_result(transcript="x" * 25))
+
+        mock_client.messages.create.assert_not_called()
+
+    async def test_existing_request_usage_counts_toward_limit(
+        self, mocker: MagicMock
+    ) -> None:
+        mock_client = AsyncMock()
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        usage = UsageStats(anthropic_requests=settings.max_anthropic_requests_per_job)
+
+        with pytest.raises(UsageLimitError, match="request allowance"):
+            await summarize(make_result(), usage=usage)
+
+        mock_client.messages.create.assert_not_called()
+
+    async def test_cost_limit_blocks_before_api_call(self, mocker: MagicMock) -> None:
+        mock_client = AsyncMock()
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+
+        with pytest.raises(UsageLimitError, match="cost"):
+            await summarize(make_result(), cost_budget_usd=0.001)
+
+        mock_client.messages.create.assert_not_called()
 
     async def test_uses_correct_model(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()

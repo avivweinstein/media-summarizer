@@ -19,7 +19,7 @@ from youtube_transcript_api._errors import (
 )
 
 from exceptions import MetadataError
-from models import TranscriptResult
+from models import TranscriptResult, UsageStats
 from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe
 
@@ -135,10 +135,24 @@ class YouTubeSource(BaseSource):
     def __init__(self, youtube_api_key: str = "") -> None:
         self.youtube_api_key = youtube_api_key
 
-    async def fetch(self, url: str, job_id: str = "-") -> TranscriptResult:
+    async def fetch(
+        self,
+        url: str,
+        job_id: str = "-",
+        *,
+        usage: UsageStats | None = None,
+    ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
         loop = asyncio.get_event_loop()
         video_id = _extract_video_id(url)
+
+        logger.info("%s event=metadata_fetch_start", log)
+        meta = await loop.run_in_executor(
+            None, _fetch_metadata_sync, url, self.youtube_api_key
+        )
+        logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
+        duration_seconds = int(str(meta.get("duration") or 0))
+        usage_tracker = usage or UsageStats()
 
         # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
@@ -159,15 +173,14 @@ class YouTubeSource(BaseSource):
                 "%s event=audio_download_done size_mb=%.1f",
                 log, dest.stat().st_size / 1e6 if dest.exists() else 0,
             )
-            transcript = await transcribe(dest, job_id)
+            transcript = await transcribe(
+                dest,
+                job_id,
+                duration_seconds=duration_seconds,
+                usage=usage_tracker,
+            )
             transcription_model = "openai/whisper-1"
             logger.info("%s event=transcript_fetch_done chars=%d method=whisper", log, len(transcript))
-
-        logger.info("%s event=metadata_fetch_start", log)
-        meta = await loop.run_in_executor(
-            None, _fetch_metadata_sync, url, self.youtube_api_key
-        )
-        logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
 
         raw_thumb = meta.get("thumbnail")
         thumbnail_url = str(raw_thumb) if raw_thumb else None
@@ -179,7 +192,7 @@ class YouTubeSource(BaseSource):
             source="youtube",
             url=url,
             channel_or_show=str(meta.get("channel") or meta.get("uploader") or ""),
-            duration_seconds=int(str(meta.get("duration") or 0)),
+            duration_seconds=duration_seconds,
             thumbnail_url=thumbnail_url,
             transcript=transcript,
             published_at=_parse_upload_date(upload_date),

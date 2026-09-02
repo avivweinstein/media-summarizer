@@ -134,6 +134,7 @@ def _job_to_response(job: Job) -> JobResponse:
         obsidian_note_path=job.obsidian_note_path,
         error=job.error,
         parent_job_id=job.parent_job_id,
+        usage=job.usage,
     )
 
 

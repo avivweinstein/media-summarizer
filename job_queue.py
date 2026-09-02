@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-from models import Job, JobStage, JobStatus, Summary, TranscriptResult
+from models import Job, JobStage, JobStatus, Summary, TranscriptResult, UsageStats
 from url_identity import submission_identity
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "webhook_url": job.webhook_url,
         "parent_job_id": job.parent_job_id,
         "dedupe_key": job.dedupe_key,
+        "usage": job.usage.model_dump_json(),
     }
 
 
@@ -73,6 +74,11 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         webhook_url=data["webhook_url"],
         parent_job_id=data.get("parent_job_id"),
         dedupe_key=data.get("dedupe_key"),
+        usage=(
+            UsageStats.model_validate_json(data["usage"])
+            if data.get("usage")
+            else UsageStats()
+        ),
     )
 
 
@@ -96,7 +102,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 error       TEXT,
                 webhook_url TEXT,
                 parent_job_id TEXT,
-                dedupe_key TEXT
+                dedupe_key TEXT,
+                usage TEXT
             )
         """)
         # Migrate: add columns if they don't exist (for existing DBs)
@@ -112,6 +119,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
             await db.execute("ALTER TABLE jobs ADD COLUMN obsidian_note_path TEXT")
         if "dedupe_key" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN dedupe_key TEXT")
+        if "usage" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN usage TEXT")
         async with db.execute(
             "SELECT job_id, url FROM jobs WHERE dedupe_key IS NULL"
         ) as rows:
@@ -154,11 +163,11 @@ async def create_job(
             INSERT INTO jobs
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
-                 error, webhook_url, parent_job_id, dedupe_key)
+                 error, webhook_url, parent_job_id, dedupe_key, usage)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
-                 :error, :webhook_url, :parent_job_id, :dedupe_key)
+                 :error, :webhook_url, :parent_job_id, :dedupe_key, :usage)
             """,
             data,
         )
@@ -214,11 +223,11 @@ async def create_or_get_job(
             INSERT INTO jobs
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
-                 error, webhook_url, parent_job_id, dedupe_key)
+                 error, webhook_url, parent_job_id, dedupe_key, usage)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
-                 :error, :webhook_url, :parent_job_id, :dedupe_key)
+                 :error, :webhook_url, :parent_job_id, :dedupe_key, :usage)
             """,
             data,
         )
@@ -284,6 +293,7 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
                 notion_page_id = :notion_page_id,
                 notion_error   = :notion_error,
                 obsidian_note_path = :obsidian_note_path,
+                usage          = :usage,
                 error         = :error
             WHERE job_id = :job_id
             """,

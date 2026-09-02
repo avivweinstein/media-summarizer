@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import job_queue
-from models import JobStage, JobStatus, TranscriptResult
+from models import JobStage, JobStatus, TranscriptResult, UsageStats
 
 
 async def test_create_job_has_correct_defaults(db_path: str) -> None:
@@ -166,12 +166,20 @@ async def test_output_metadata_persists(db_path: str) -> None:
     job.status = JobStatus.done
     job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
     job.notion_error = "Notion unavailable"
+    job.usage = UsageStats(
+        anthropic_requests=2,
+        anthropic_input_tokens=1234,
+        estimated_cost_usd=0.05,
+    )
     await job_queue.update_job(job, db_path=db_path)
 
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.obsidian_note_path == "Generated/Summaries/youtube-abc.md"
     assert fetched.notion_error == "Notion unavailable"
+    assert fetched.usage.anthropic_requests == 2
+    assert fetched.usage.anthropic_input_tokens == 1234
+    assert fetched.usage.estimated_cost_usd == 0.05
 
 
 async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
@@ -208,6 +216,7 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
     assert migrated.notion_error is None
     assert migrated.obsidian_note_path is None
     assert migrated.dedupe_key is not None
+    assert migrated.usage == UsageStats()
 
 
 async def test_create_or_get_job_deduplicates_concurrent_static_urls(db_path: str) -> None:

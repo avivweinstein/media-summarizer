@@ -15,7 +15,7 @@ import yt_dlp
 
 import job_queue
 from config import settings
-from exceptions import UnsupportedURLError
+from exceptions import UnsupportedURLError, UsageLimitError
 from models import Job, JobStage, JobStatus, TranscriptResult
 from notion_writer import save_to_notion
 from obsidian_writer import save_to_obsidian
@@ -135,6 +135,7 @@ async def _notify_webhook(job: Job) -> None:
             "tldr": job.summary.tldr if job.summary else "",
             "notion_url": notion_url,
             "obsidian_note_path": job.obsidian_note_path,
+            "usage": job.usage.model_dump(),
         }
     else:
         payload = {
@@ -208,9 +209,17 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             result: TranscriptResult
             if source_type == "youtube":
                 source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
-                result = await source.fetch(job.url, job_id=job.job_id)
+                result = await source.fetch(
+                    job.url,
+                    job_id=job.job_id,
+                    usage=job.usage,
+                )
             else:
-                result = await PodcastSource().fetch(job.url, job_id=job.job_id)
+                result = await PodcastSource().fetch(
+                    job.url,
+                    job_id=job.job_id,
+                    usage=job.usage,
+                )
 
             job.result = result
 
@@ -219,7 +228,11 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
             # --- Summarization stage ---
             await _set_stage(job, JobStage.summarizing, db_path)
-            summary = await summarize(result, job_id=job.job_id)
+            summary = await summarize(
+                result,
+                job_id=job.job_id,
+                usage=job.usage,
+            )
             job.summary = summary
 
             if await _check_cancelled(job, db_path):
@@ -237,6 +250,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     retain_transcript=settings.obsidian_retain_transcript,
                     summary_model=SUMMARY_MODEL,
                     added_at=job.created_at,
+                    usage=job.usage,
                 )
                 output_saved = True
 
@@ -269,6 +283,10 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             await _notify_webhook(job)
             return
 
+        except (UnsupportedURLError, UsageLimitError) as e:
+            last_error = str(e)
+            logger.error("%s event=job_non_retryable error=%r", log, last_error)
+            break
         except Exception as e:
             last_error = str(e)
             logger.error(

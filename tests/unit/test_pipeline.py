@@ -1,5 +1,6 @@
 """Tests for pipeline retry logic and webhook notifications."""
 
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -7,7 +8,8 @@ import pytest
 
 import job_queue
 from config import settings
-from models import JobStatus, Summary, TranscriptResult
+from exceptions import UsageLimitError
+from models import JobStatus, Summary, TranscriptResult, UsageStats
 from pipeline import run_job
 
 
@@ -72,6 +74,29 @@ def _mock_webhook(mocker: MagicMock) -> AsyncMock:
 
 
 class TestRetryLogic:
+    async def test_usage_limit_failure_is_not_retried(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        _mock_happy_path(mocker)
+        summarize_mock = mocker.patch(
+            "pipeline.summarize",
+            side_effect=UsageLimitError("Configured limit reached"),
+        )
+        mocker.patch("pipeline._notify_webhook")
+        sleep_mock = mocker.patch("pipeline.asyncio.sleep")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.failed
+        assert result.retry_count == 0
+        summarize_mock.assert_awaited_once()
+        sleep_mock.assert_not_called()
+
     async def test_succeeds_on_first_attempt(
         self, db_path: str, mocker: MagicMock
     ) -> None:
@@ -180,6 +205,55 @@ class TestRetryLogic:
 
 
 class TestOutputRouting:
+    async def test_usage_is_accumulated_and_persisted(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mock_source = AsyncMock()
+
+        async def fetch_with_usage(*_args: object, **kwargs: object) -> TranscriptResult:
+            usage = cast(UsageStats, kwargs["usage"])
+            usage.openai_requests += 1
+            usage.openai_audio_seconds += 60
+            usage.estimated_cost_usd += 0.006
+            return _transcript()
+
+        async def summarize_with_usage(*_args: object, **kwargs: object) -> Summary:
+            usage = cast(UsageStats, kwargs["usage"])
+            usage.anthropic_requests += 1
+            usage.anthropic_input_tokens += 100
+            usage.estimated_cost_usd += 0.001
+            return _summary()
+
+        mock_source.fetch.side_effect = fetch_with_usage
+        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
+        mocker.patch("pipeline.summarize", side_effect=summarize_with_usage)
+        obsidian = mocker.patch(
+            "pipeline.save_to_obsidian",
+            return_value="Generated/Summaries/youtube-test.md",
+        )
+        mocker.patch("pipeline._notify_webhook")
+        mock_settings = mocker.patch("pipeline.settings")
+        mock_settings.youtube_api_key = ""
+        mock_settings.obsidian_vault_path = "/vault"
+        mock_settings.obsidian_retain_transcript = True
+        mock_settings.notion_enabled = False
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.usage.openai_requests == 1
+        assert result.usage.anthropic_requests == 1
+        assert result.usage.anthropic_input_tokens == 100
+        assert result.usage.estimated_cost_usd == pytest.approx(0.007)
+        assert obsidian.call_args.kwargs["usage"].estimated_cost_usd == pytest.approx(
+            0.007
+        )
+
     async def test_obsidian_can_be_the_only_output(
         self, db_path: str, mocker: MagicMock
     ) -> None:

@@ -1,18 +1,63 @@
 """Tests for pure-function helpers in sources/podcast.py."""
 
 import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from config import settings
+from exceptions import UsageLimitError
 from sources.podcast import (
     _best_mp3_entry,
+    _download_mp3,
     _episode_source_item_id,
     _parse_apple_podcast_ids,
     _parse_duration,
     _struct_to_datetime,
     _thumbnail_from_entry,
 )
+
+
+async def test_download_stops_and_cleans_up_at_size_limit(
+    tmp_path: Path, mocker: MagicMock
+) -> None:
+    class FakeResponse:
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self, _size: int) -> AsyncIterator[bytes]:
+            for chunk in (b"123", b"456"):
+                yield chunk
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    destination = tmp_path / "too-large.mp3"
+    mocker.patch("sources.podcast.httpx.AsyncClient", return_value=FakeClient())
+    mocker.patch.object(settings, "max_audio_download_bytes", 5)
+
+    with pytest.raises(UsageLimitError, match="download-size"):
+        await _download_mp3("https://example.com/audio.mp3", destination)
+
+    assert not destination.exists()
 
 
 def test_episode_source_item_id_prefers_guid() -> None:
