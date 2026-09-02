@@ -10,6 +10,7 @@ import pytest
 
 from config import settings
 from exceptions import UnsupportedURLError, UsageLimitError
+from models import TranscriptionOutput
 from sources.podcast import (
     PodcastSource,
     _best_mp3_entry,
@@ -40,7 +41,10 @@ async def test_apple_episode_uses_exact_itunes_track_lookup(
         },
     )
     download = mocker.patch("sources.podcast._download_mp3")
-    mocker.patch("sources.podcast.transcribe", return_value="Transcript")
+    mocker.patch(
+        "sources.podcast.transcribe",
+        return_value=TranscriptionOutput(text="Transcript"),
+    )
 
     result = await PodcastSource()._from_apple_podcasts(
         f"https://podcasts.apple.com/us/podcast/show/id123?i={episode_id}",
@@ -176,9 +180,7 @@ async def test_rss_redirect_to_private_address_is_rejected(
 def test_episode_source_item_id_prefers_guid() -> None:
     entry = {"id": "episode-guid"}
 
-    assert _episode_source_item_id(entry, "https://cdn.example.com/audio.mp3") == (
-        "episode-guid"
-    )
+    assert _episode_source_item_id(entry, "https://cdn.example.com/audio.mp3") == ("episode-guid")
 
 
 def test_episode_source_item_id_falls_back_to_enclosure() -> None:

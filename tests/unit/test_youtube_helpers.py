@@ -11,12 +11,38 @@ import pytest
 
 from config import settings
 from exceptions import UsageLimitError
+from models import TranscriptionOutput, TranscriptSegment
 from sources.youtube import (
     YouTubeSource,
     _download_audio_sync,
     _extract_video_id,
     _parse_upload_date,
 )
+
+
+async def test_native_transcript_preserves_segments(mocker: MagicMock) -> None:
+    mocker.patch(
+        "sources.youtube._fetch_metadata_sync",
+        return_value={"title": "Timestamped", "duration": 120},
+    )
+    mocker.patch(
+        "sources.youtube._fetch_transcript_sync",
+        return_value=TranscriptionOutput(
+            text="A useful detail.",
+            segments=[
+                TranscriptSegment(
+                    start_seconds=30,
+                    end_seconds=35,
+                    text="A useful detail.",
+                )
+            ],
+        ),
+    )
+
+    result = await YouTubeSource().fetch("https://youtube.com/watch?v=timestamped")
+
+    assert result.transcript == "A useful detail."
+    assert result.segments[0].start_seconds == 30
 
 
 async def test_duration_limit_blocks_before_youtube_download(

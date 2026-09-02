@@ -20,7 +20,7 @@ from anthropic.types import TextBlock
 
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
-from models import Summary, TranscriptResult, UsageStats
+from models import KeyMoment, Summary, TranscriptResult, UsageStats
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +29,21 @@ MAX_OUTPUT_TOKENS = 1024
 _API_BACKOFF_SECONDS = (1, 2)
 
 CANONICAL_TAGS = [
-    "fitness", "cycling", "running", "lifting", "nutrition", "health",
-    "finance", "investing", "tech", "ai", "productivity", "science",
-    "mindset", "smart-home", "career",
+    "fitness",
+    "cycling",
+    "running",
+    "lifting",
+    "nutrition",
+    "health",
+    "finance",
+    "investing",
+    "tech",
+    "ai",
+    "productivity",
+    "science",
+    "mindset",
+    "smart-home",
+    "career",
 ]
 
 SYSTEM_PROMPT = (
@@ -41,12 +53,15 @@ SYSTEM_PROMPT = (
     "{\n"
     '  "tldr": "2-3 sentence summary",\n'
     '  "key_points": ["...", "...", "..."],\n'
+    '  "key_moments": [{"timestamp_seconds": 123, "point": "..."}],\n'
     '  "tags": ["fitness", "finance"],\n'
     '  "worth_rewatching": true | false\n'
     "}\n\n"
     "Guidelines:\n"
     "- tldr: 2-3 sentences capturing the core message\n"
     "- key_points: 5-8 bullet points, each a complete sentence\n"
+    "- key_moments: 3-5 important moments using only timestamps present in the "
+    "transcript; use [] when timestamps are unavailable\n"
     "- tags: pick from the canonical list below, or add new tags if content clearly warrants it\n"
     "- worth_rewatching: true if the content meets ANY of these criteria:\n"
     "    - Dense with specific, actionable advice you'd want to revisit\n"
@@ -58,6 +73,22 @@ SYSTEM_PROMPT = (
 )
 
 
+def _format_timestamp(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _timestamped_transcript(result: TranscriptResult) -> str:
+    if not result.segments:
+        return result.transcript
+    return "\n".join(
+        f"[{_format_timestamp(segment.start_seconds)}] {segment.text.strip()}"
+        for segment in result.segments
+    )
+
+
 def _build_user_prompt(result: TranscriptResult, transcript: str | None = None) -> str:
     lines = [
         f"Title: {result.title}",
@@ -67,7 +98,11 @@ def _build_user_prompt(result: TranscriptResult, transcript: str | None = None) 
     ]
     if result.published_at:
         lines.append(f"Published: {result.published_at.strftime('%Y-%m-%d')}")
-    lines += ["", "Transcript:", result.transcript if transcript is None else transcript]
+    lines += [
+        "",
+        "Transcript:",
+        _timestamped_transcript(result) if transcript is None else transcript,
+    ]
     return "\n".join(lines)
 
 
@@ -154,9 +189,7 @@ async def _call_claude(
             if e.status_code >= 500 and api_attempt < len(_API_BACKOFF_SECONDS):
                 await asyncio.sleep(_API_BACKOFF_SECONDS[api_attempt])
                 continue
-            raise SummarizationError(
-                f"Claude API error (HTTP {e.status_code}): {e.message}"
-            ) from e
+            raise SummarizationError(f"Claude API error (HTTP {e.status_code}): {e.message}") from e
 
         first_block = message.content[0]
         if not isinstance(first_block, TextBlock):
@@ -229,6 +262,20 @@ def _parse_response(raw: str) -> Summary:
     else:
         tags = [str(t) for t in raw_tags]
 
+    raw_moments = data.get("key_moments", [])
+    key_moments: list[KeyMoment] = []
+    if isinstance(raw_moments, list):
+        for item in raw_moments:
+            if not isinstance(item, dict):
+                continue
+            timestamp = item.get("timestamp_seconds")
+            point = item.get("point")
+            if isinstance(timestamp, (int, float)) and timestamp >= 0 and isinstance(point, str):
+                if point.strip():
+                    key_moments.append(
+                        KeyMoment(timestamp_seconds=round(timestamp), point=point.strip())
+                    )
+
     raw_rewatch = data.get("worth_rewatching")
     if raw_rewatch is None:
         errors.append("'worth_rewatching' is required")
@@ -245,7 +292,13 @@ def _parse_response(raw: str) -> Summary:
             f"Claude response missing or invalid required fields: {'; '.join(errors)}"
         )
 
-    return Summary(tldr=tldr, key_points=key_points, tags=tags, worth_rewatching=worth_rewatching)
+    return Summary(
+        tldr=tldr,
+        key_points=key_points,
+        key_moments=key_moments,
+        tags=tags,
+        worth_rewatching=worth_rewatching,
+    )
 
 
 async def summarize(
@@ -269,13 +322,11 @@ async def summarize(
             f"{settings.max_transcript_chars:,}-character per-job limit."
         )
 
-    chunks = _chunk_text(result.transcript, settings.summary_chunk_chars)
+    prompt_transcript = _timestamped_transcript(result)
+    chunks = _chunk_text(prompt_transcript, settings.summary_chunk_chars)
     request_count = 1 if len(chunks) == 1 else len(chunks) + 1
     usage_tracker = usage or UsageStats()
-    if (
-        usage_tracker.anthropic_requests + request_count
-        > settings.max_anthropic_requests_per_job
-    ):
+    if usage_tracker.anthropic_requests + request_count > settings.max_anthropic_requests_per_job:
         raise UsageLimitError(
             f"Transcript requires {request_count} Anthropic requests, exceeding the "
             "remaining per-job request allowance."
@@ -288,7 +339,7 @@ async def summarize(
         summary = await _call_claude(
             client,
             system=SYSTEM_PROMPT,
-            prompt=_build_user_prompt(result),
+            prompt=_build_user_prompt(result, prompt_transcript),
             usage=usage_tracker,
             cost_budget_usd=budget,
             persist_usage=persist_usage,
@@ -325,6 +376,15 @@ async def summarize(
             cost_budget_usd=budget,
             persist_usage=persist_usage,
         )
+
+    if not result.segments:
+        summary.key_moments = []
+    elif result.duration_seconds > 0:
+        summary.key_moments = [
+            moment
+            for moment in summary.key_moments
+            if moment.timestamp_seconds <= result.duration_seconds
+        ]
 
     logger.info(
         "%s event=summarize_done tags=%r worth_rewatching=%s requests=%d "

@@ -15,19 +15,21 @@ from anthropic.types import TextBlock
 
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
-from models import Summary, TranscriptResult, UsageStats
+from models import Summary, TranscriptResult, TranscriptSegment, UsageStats
 from summarizer import MODEL, _chunk_text, _parse_response, summarize
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-VALID_JSON = json.dumps({
-    "tldr": "A great video about cycling training.",
-    "key_points": ["Point one.", "Point two.", "Point three."],
-    "tags": ["cycling", "fitness"],
-    "worth_rewatching": True,
-})
+VALID_JSON = json.dumps(
+    {
+        "tldr": "A great video about cycling training.",
+        "key_points": ["Point one.", "Point two.", "Point three."],
+        "tags": ["cycling", "fitness"],
+        "worth_rewatching": True,
+    }
+)
 
 
 def make_result(**kwargs: object) -> TranscriptResult:
@@ -67,6 +69,7 @@ def make_api_status_error(
 # ---------------------------------------------------------------------------
 # _parse_response — unit tests (no I/O)
 # ---------------------------------------------------------------------------
+
 
 class TestParseResponse:
     def test_valid_json_returns_summary(self) -> None:
@@ -153,6 +156,16 @@ class TestParseResponse:
         s = _parse_response(json.dumps(data))
         assert s.key_points == []
 
+    def test_valid_key_moments_are_parsed(self) -> None:
+        data = {
+            **json.loads(VALID_JSON),
+            "key_moments": [{"timestamp_seconds": 42, "point": "Core idea."}],
+        }
+
+        summary = _parse_response(json.dumps(data))
+
+        assert summary.key_moments[0].timestamp_seconds == 42
+
 
 class TestChunkText:
     def test_chunks_have_strict_size_limit_and_preserve_text(self) -> None:
@@ -166,6 +179,7 @@ class TestChunkText:
 # summarize() — mocked Anthropic client
 # ---------------------------------------------------------------------------
 
+
 class TestSummarize:
     async def test_successful_call_returns_summary(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()
@@ -176,9 +190,7 @@ class TestSummarize:
         assert result.tldr == "A great video about cycling training."
         mock_client.messages.create.assert_called_once()
 
-    async def test_tracks_tokens_requests_and_estimated_cost(
-        self, mocker: MagicMock
-    ) -> None:
+    async def test_tracks_tokens_requests_and_estimated_cost(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()
         mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
@@ -191,9 +203,7 @@ class TestSummarize:
         assert usage.anthropic_output_tokens == 50
         assert usage.estimated_cost_usd == pytest.approx(0.00105)
 
-    async def test_persists_reservation_before_anthropic_call(
-        self, mocker: MagicMock
-    ) -> None:
+    async def test_persists_reservation_before_anthropic_call(self, mocker: MagicMock) -> None:
         events: list[str] = []
         mock_client = AsyncMock()
 
@@ -211,9 +221,7 @@ class TestSummarize:
 
         assert events[0:2] == ["persist", "api"]
 
-    async def test_chunk_failure_retries_only_the_failed_call(
-        self, mocker: MagicMock
-    ) -> None:
+    async def test_chunk_failure_retries_only_the_failed_call(self, mocker: MagicMock) -> None:
         from anthropic import APIConnectionError
 
         connection_error = APIConnectionError(
@@ -286,9 +294,7 @@ class TestSummarize:
 
         mock_client.messages.create.assert_not_called()
 
-    async def test_existing_request_usage_counts_toward_limit(
-        self, mocker: MagicMock
-    ) -> None:
+    async def test_existing_request_usage_counts_toward_limit(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
         usage = UsageStats(anthropic_requests=settings.max_anthropic_requests_per_job)
@@ -328,8 +334,35 @@ class TestSummarize:
         user_message = call_kwargs["messages"][0]["content"]
         assert "My unique transcript content xyz" in user_message
 
+    async def test_timestamped_segments_are_included_in_prompt(self, mocker: MagicMock) -> None:
+        response_json = json.dumps(
+            {
+                **json.loads(VALID_JSON),
+                "key_moments": [{"timestamp_seconds": 65, "point": "Important detail."}],
+            }
+        )
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = make_claude_response(response_json)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        source = make_result(
+            segments=[
+                TranscriptSegment(
+                    start_seconds=65,
+                    end_seconds=70,
+                    text="Important detail.",
+                )
+            ]
+        )
+
+        summary = await summarize(source)
+
+        prompt = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+        assert "[00:01:05] Important detail." in prompt
+        assert summary.key_moments[0].timestamp_seconds == 65
+
     async def test_rate_limit_error_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import RateLimitError
+
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = make_api_status_error(
             RateLimitError, 429, "Too many requests"
@@ -341,6 +374,7 @@ class TestSummarize:
 
     async def test_credit_exhaustion_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import BadRequestError
+
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = make_api_status_error(
             BadRequestError, 400, "Your credit balance is too low to access the Anthropic API"
@@ -352,6 +386,7 @@ class TestSummarize:
 
     async def test_generic_bad_request_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import BadRequestError
+
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = make_api_status_error(
             BadRequestError, 400, "Invalid request"
@@ -363,6 +398,7 @@ class TestSummarize:
 
     async def test_connection_error_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import APIConnectionError
+
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = APIConnectionError(
             request=cast(Any, httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
@@ -374,6 +410,7 @@ class TestSummarize:
 
     async def test_server_error_raises_summarization_error(self, mocker: MagicMock) -> None:
         from anthropic import InternalServerError
+
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = make_api_status_error(
             InternalServerError, 500, "Internal server error"

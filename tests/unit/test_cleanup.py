@@ -128,9 +128,7 @@ class TestTranscribeFileCleanup:
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
-    async def test_unknown_duration_fails_closed(
-        self, tmp_path: Path, mocker: MagicMock
-    ) -> None:
+    async def test_unknown_duration_fails_closed(self, tmp_path: Path, mocker: MagicMock) -> None:
         mp3 = tmp_path / "unknown-duration.mp3"
         mp3.write_bytes(b"x" * 100)
         mocker.patch("transcriber._probe_audio_duration", return_value=0)
@@ -245,11 +243,33 @@ class TestTranscribeFileCleanup:
 
         result = await transcribe(mp3)
 
-        assert result == "Compressed transcript."
+        assert result.text == "Compressed transcript."
         mock_client.audio.transcriptions.create.assert_called_once()
         # Both original and compressed files cleaned up
         assert not mp3.exists()
         assert not (tmp_path / "big_compressed.mp3").exists()
+
+    async def test_preserves_whisper_segment_timestamps(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        mp3 = tmp_path / "timestamped.mp3"
+        mp3.write_bytes(b"x" * 100)
+        response = MagicMock()
+        response.text = "First thought. Second thought."
+        response.segments = [
+            {"start": 0.0, "end": 4.2, "text": "First thought."},
+            {"start": 4.2, "end": 8.0, "text": "Second thought."},
+        ]
+        mock_client = AsyncMock()
+        mock_client.audio.transcriptions.create.return_value = response
+        mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
+
+        result = await transcribe(mp3)
+
+        assert result.segments[1].start_seconds == 4.2
+        call = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert call["response_format"] == "verbose_json"
+        assert call["timestamp_granularities"] == ["segment"]
 
     async def test_missing_file_raises_transcription_error(self, tmp_path: Path) -> None:
         missing = tmp_path / "does-not-exist.mp3"
