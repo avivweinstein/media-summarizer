@@ -105,7 +105,9 @@ def _fetch_transcript_sync(video_id: str) -> TranscriptionOutput | None:
     )
 
 
-def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, object]:
+def _fetch_metadata_sync(
+    url: str, youtube_api_key: str = "", no_playlist: bool = False
+) -> dict[str, object]:
     """Fetch video metadata via yt-dlp without downloading any media."""
     opts: dict[str, object] = {
         "quiet": True,
@@ -116,6 +118,8 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
     }
     if youtube_api_key:
         opts["youtube_api_key"] = youtube_api_key
+    if no_playlist:
+        opts["noplaylist"] = True
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:
@@ -143,15 +147,16 @@ def _download_audio_sync(
     dest: Path,
     max_bytes: int,
     cancel_event: threading.Event | None = None,
+    no_playlist: bool = False,
 ) -> None:
-    """Download audio from a YouTube video via yt-dlp as MP3."""
+    """Download audio from one hosted video via yt-dlp as MP3."""
 
     def enforce_size(progress: dict[str, object]) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Media download cancelled.")
         downloaded = progress.get("downloaded_bytes", 0)
         if isinstance(downloaded, (int, float)) and downloaded > max_bytes:
-            raise UsageLimitError("YouTube audio exceeds the configured download-size limit.")
+            raise UsageLimitError("Media audio exceeds the configured download-size limit.")
 
     opts: dict[str, object] = {
         "quiet": True,
@@ -170,6 +175,8 @@ def _download_audio_sync(
             }
         ],
     }
+    if no_playlist:
+        opts["noplaylist"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.download([url])
@@ -188,7 +195,7 @@ def _download_audio_sync(
             partial.unlink(missing_ok=True)
         if "download-size limit" in str(error):
             raise UsageLimitError(
-                "YouTube audio exceeds the configured download-size limit."
+                "Media audio exceeds the configured download-size limit."
             ) from error
         raise
     except Exception:

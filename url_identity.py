@@ -4,6 +4,37 @@ import hashlib
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 _TRACKING_PARAMS = {"si"}
+_TWITTER_HOSTNAMES = {
+    "m.twitter.com",
+    "m.x.com",
+    "mobile.twitter.com",
+    "mobile.x.com",
+    "twitter.com",
+    "x.com",
+}
+
+
+def twitter_status_parts(url: str) -> tuple[str, str | None] | None:
+    """Return the post ID and optional selected media index for an X/Twitter URL."""
+    parsed = urlparse(url.strip())
+    hostname = (parsed.hostname or "").lower().removeprefix("www.")
+    if hostname not in _TWITTER_HOSTNAMES:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    try:
+        status_position = next(
+            index for index, part in enumerate(parts) if part in {"status", "statuses"}
+        )
+        status_id = parts[status_position + 1]
+    except (StopIteration, IndexError):
+        return None
+    if not status_id.isdigit():
+        return None
+    media_index = None
+    if len(parts) > status_position + 3 and parts[status_position + 2] in {"photo", "video"}:
+        candidate = parts[status_position + 3]
+        media_index = candidate if candidate.isdigit() else None
+    return status_id, media_index
 
 
 def submission_identity(url: str) -> tuple[str, bool]:
@@ -36,6 +67,11 @@ def submission_identity(url: str) -> tuple[str, bool]:
         )
         if video_id:
             return f"vimeo:{video_id}", True
+
+    if twitter_parts := twitter_status_parts(url):
+        status_id, media_index = twitter_parts
+        suffix = f":media:{media_index}" if media_index else ""
+        return f"twitter:{status_id}{suffix}", True
 
     filtered_query = [
         (key, value)

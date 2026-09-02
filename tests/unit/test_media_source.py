@@ -1,5 +1,8 @@
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from exceptions import MetadataError
 from models import TranscriptionOutput, TranscriptSegment
 from sources.media import MediaSource, _vimeo_player_url
 
@@ -53,3 +56,46 @@ async def test_direct_media_uses_pinned_streaming_download(mocker: MagicMock) ->
     convert.assert_awaited_once()
     assert transcribe.call_args.args[0].suffix == ".mp3"
     assert result.title == "talk.mp4"
+
+
+async def test_twitter_video_uses_single_item_hosted_media_path(mocker: MagicMock) -> None:
+    url = "https://x.com/example/status/1234567890/video/2"
+    validate = mocker.patch(
+        "sources.media._validate_public_http_url", new=AsyncMock(return_value="1.1.1.1")
+    )
+    metadata = mocker.patch(
+        "sources.media._fetch_metadata_sync",
+        return_value={
+            "id": "1234567890",
+            "title": "Example post",
+            "duration": 30,
+            "uploader": "Example User",
+        },
+    )
+    download = mocker.patch("sources.media._download_audio_sync")
+    mocker.patch(
+        "sources.media.transcribe",
+        new=AsyncMock(return_value=TranscriptionOutput(text="X video transcript.")),
+    )
+
+    result = await MediaSource().fetch(url, job_id="twitter-job")
+
+    validate.assert_awaited_once_with(url)
+    metadata.assert_called_once_with(url, "", True)
+    assert download.call_args.args[-1] is True
+    assert result.source == "twitter"
+    assert result.source_item_id == "1234567890"
+    assert result.channel_or_show == "Example User"
+
+
+async def test_twitter_video_reports_unavailable_or_gated_post(mocker: MagicMock) -> None:
+    mocker.patch(
+        "sources.media._validate_public_http_url", new=AsyncMock(return_value="1.1.1.1")
+    )
+    mocker.patch(
+        "sources.media._fetch_metadata_sync",
+        side_effect=MetadataError("extractor failed"),
+    )
+
+    with pytest.raises(MetadataError, match="requires login"):
+        await MediaSource().fetch("https://x.com/example/status/1234567890", job_id="job")
