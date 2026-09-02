@@ -49,3 +49,29 @@ async def test_cancel_stops_active_job_without_stopping_worker(mocker: MagicMock
     await worker.stop()
 
     assert completed == ["job-2"]
+
+
+async def test_cancel_acknowledgement_is_bounded_for_slow_blocking_work(
+    mocker: MagicMock,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run(_job_id: str) -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    mocker.patch("worker.run_job", side_effect=run)
+    worker = JobWorker(concurrency=1, cancel_wait_seconds=0.01)
+    worker.start()
+    await worker.enqueue("job-1")
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert await asyncio.wait_for(worker.cancel("job-1"), timeout=0.2)
+
+    release.set()
+    await asyncio.wait_for(worker._queue.join(), timeout=1)
+    await worker.stop()

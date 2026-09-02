@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -147,7 +148,7 @@ class TestRetryLogic:
         assert result.notion_error is not None
 
     async def test_dynamic_source_reuses_permanent_archive_after_job_deletion(
-        self, db_path: str, mocker: MagicMock
+        self, db_path: str, mocker: MagicMock, tmp_path: Path
     ) -> None:
         url = "https://feeds.example.com/show"
         transcript = TranscriptResult(
@@ -170,6 +171,12 @@ class TestRetryLogic:
         prior.result = transcript
         prior.summary = _summary()
         prior.obsidian_note_path = f"Generated/Summaries/{source_id(transcript)}.md"
+        vault = tmp_path / "Media-Library"
+        note = vault / prior.obsidian_note_path
+        (vault / ".obsidian").mkdir(parents=True)
+        note.parent.mkdir(parents=True)
+        note.write_text("# Episode\n")
+        mocker.patch.object(settings, "obsidian_vault_path", str(vault))
         await job_queue.update_job(prior, db_path=db_path)
         await job_queue.record_archive(prior, db_path=db_path)
         await job_queue.delete_job(prior.job_id, db_path=db_path)
@@ -188,7 +195,6 @@ class TestRetryLogic:
         summarize_mock = mocker.patch("pipeline.summarize")
         save = mocker.patch("pipeline.save_to_obsidian")
         mocker.patch("pipeline._notify_webhook")
-        mocker.patch.object(settings, "obsidian_vault_path", "/vault")
         mocker.patch.object(settings, "notion_enabled", False)
 
         await run_job(job.job_id, db_path=db_path)

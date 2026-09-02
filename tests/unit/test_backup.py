@@ -53,3 +53,32 @@ def test_backup_retention_removes_oldest_snapshot(tmp_path: Path) -> None:
 
     assert not first.exists()
     assert second.exists()
+
+
+def test_backup_rejects_vault_symlinks(tmp_path: Path) -> None:
+    database, vault, destination = _fixture(tmp_path)
+    external = tmp_path / "outside.md"
+    external.write_text("not part of the vault")
+    (vault / "linked.md").symlink_to(external)
+
+    with pytest.raises(ValueError, match="symlinks"):
+        create_backup(database, vault, destination)
+
+
+def test_failed_restore_leaves_no_partial_destinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, vault, destination = _fixture(tmp_path)
+    snapshot = create_backup(database, vault, destination)
+    restored_db = tmp_path / "restore" / "jobs.db"
+    restored_vault = tmp_path / "Restored-Library"
+
+    def fail_copytree(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr("scripts.backup_media_library.shutil.copytree", fail_copytree)
+    with pytest.raises(OSError, match="simulated"):
+        restore_backup(snapshot, restored_db, restored_vault)
+
+    assert not restored_db.exists()
+    assert not restored_vault.exists()

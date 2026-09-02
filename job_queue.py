@@ -110,6 +110,16 @@ def _archive_id(job: Job) -> str:
     return f"{job.processing_mode}:{output_id}"
 
 
+def _obsidian_artifact_exists(note_path: str | None) -> bool:
+    if note_path is None:
+        return True
+    if not settings.obsidian_vault_path:
+        return False
+    vault = Path(settings.obsidian_vault_path).expanduser().resolve()
+    candidate = (vault / note_path).resolve()
+    return candidate.is_relative_to(vault) and candidate.is_file()
+
+
 async def _upsert_archive_row(db: aiosqlite.Connection, job: Job) -> None:
     if (
         not job.dedupe_key
@@ -157,6 +167,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
     db_path = str(path)
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
+        if not settings.db_retain_transcript:
+            await db.execute("PRAGMA secure_delete = ON")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id      TEXT PRIMARY KEY,
@@ -249,6 +261,18 @@ async def init_db(db_path: str = DB_PATH) -> None:
         ) as completed_rows:
             for row in await completed_rows.fetchall():
                 await _upsert_archive_row(db, _deserialize_job(row))
+        if not settings.db_retain_transcript:
+            async with db.execute(
+                """SELECT job_id, result FROM jobs
+                   WHERE status IN ('done', 'failed', 'cancelled') AND result IS NOT NULL"""
+            ) as terminal_rows:
+                for job_id, raw_result in await terminal_rows.fetchall():
+                    result = TranscriptResult.model_validate_json(raw_result)
+                    if result.transcript or result.segments:
+                        await db.execute(
+                            "UPDATE jobs SET result = ? WHERE job_id = ?",
+                            (_without_transcript(result).model_dump_json(), job_id),
+                        )
         await db.commit()
     path.chmod(0o600)
 
@@ -336,22 +360,26 @@ async def create_or_get_job(
             existing = await cursor.fetchone()
         if existing is not None:
             existing_job = _deserialize_job(existing)
-            if webhook_url and webhook_url not in existing_job.webhook_urls:
-                existing_job.webhook_urls.append(webhook_url)
-                if existing_job.webhook_url is None:
-                    existing_job.webhook_url = webhook_url
-                await db.execute(
-                    """UPDATE jobs
-                       SET webhook_url = ?, webhook_urls = ?
-                       WHERE job_id = ?""",
-                    (
-                        existing_job.webhook_url,
-                        json.dumps(existing_job.webhook_urls),
-                        existing_job.job_id,
-                    ),
-                )
-            await db.commit()
-            return existing_job, False
+            artifact_exists = existing_job.status != JobStatus.done or _obsidian_artifact_exists(
+                existing_job.obsidian_note_path
+            )
+            if artifact_exists:
+                if webhook_url and webhook_url not in existing_job.webhook_urls:
+                    existing_job.webhook_urls.append(webhook_url)
+                    if existing_job.webhook_url is None:
+                        existing_job.webhook_url = webhook_url
+                    await db.execute(
+                        """UPDATE jobs
+                           SET webhook_url = ?, webhook_urls = ?
+                           WHERE job_id = ?""",
+                        (
+                            existing_job.webhook_url,
+                            json.dumps(existing_job.webhook_urls),
+                            existing_job.job_id,
+                        ),
+                    )
+                await db.commit()
+                return existing_job, False
 
         if reuse_completed:
             async with db.execute(
@@ -360,7 +388,9 @@ async def create_or_get_job(
                 (dedupe_key,),
             ) as cursor:
                 archived = await cursor.fetchone()
-            if archived is not None:
+            if archived is not None and _obsidian_artifact_exists(
+                archived["obsidian_note_path"]
+            ):
                 now = _utcnow()
                 job = Job(
                     job_id=str(uuid.uuid4()),
@@ -519,9 +549,10 @@ async def find_archived_output(
             row = await cursor.fetchone()
     if row is None:
         return None
+    note_path = row["obsidian_note_path"]
     return (
         Summary.model_validate_json(row["summary"]),
-        row["obsidian_note_path"],
+        note_path if _obsidian_artifact_exists(note_path) else None,
         row["notion_page_id"],
     )
 

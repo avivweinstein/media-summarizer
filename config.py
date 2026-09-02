@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     max_openai_requests_per_job: int = Field(default=3, gt=0)
     max_audio_duration_seconds: int = Field(default=14_400, gt=0)
     max_audio_download_bytes: int = Field(default=500_000_000, gt=0)
+    source_fetch_timeout_seconds: int = Field(default=120, gt=0)
     max_article_download_bytes: int = Field(default=5_000_000, gt=0)
     max_estimated_cost_usd: float = Field(default=2.0, gt=0)
     anthropic_input_cost_per_million_usd: float = Field(default=3.0, ge=0)

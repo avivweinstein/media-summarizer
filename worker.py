@@ -24,13 +24,19 @@ logger = logging.getLogger(__name__)
 
 # How many jobs can run in parallel
 DEFAULT_CONCURRENCY = 2
+DEFAULT_CANCEL_WAIT_SECONDS = 2.0
 
 
 class JobWorker:
     """Manages a pool of async workers that process jobs from a queue."""
 
-    def __init__(self, concurrency: int = DEFAULT_CONCURRENCY) -> None:
+    def __init__(
+        self,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        cancel_wait_seconds: float = DEFAULT_CANCEL_WAIT_SECONDS,
+    ) -> None:
         self.concurrency = concurrency
+        self.cancel_wait_seconds = cancel_wait_seconds
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._tasks: list[asyncio.Task[None]] = []
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
@@ -71,7 +77,16 @@ class JobWorker:
         if task is None:
             return False
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=self.cancel_wait_seconds)
+        except asyncio.CancelledError:
+            pass
+        except TimeoutError:
+            logger.warning(
+                "job_id=%s url=- source=- event=cancel_ack_timeout wait_seconds=%.1f",
+                job_id,
+                self.cancel_wait_seconds,
+            )
         return True
 
     @property

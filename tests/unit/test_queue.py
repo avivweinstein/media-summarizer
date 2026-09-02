@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import job_queue
+from config import settings
 from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
 
 
@@ -448,7 +449,15 @@ async def test_recovery_finalizes_checkpoint_even_after_interruption_budget(
     assert checkpoint.interruption_count == job_queue.MAX_INTERRUPTION_RECOVERIES
 
 
-async def test_archive_identity_survives_job_deletion(db_path: str) -> None:
+async def test_archive_identity_survives_job_deletion(
+    db_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "Media-Library"
+    note = vault / "Generated" / "Summaries" / "youtube-abc.md"
+    (vault / ".obsidian").mkdir(parents=True)
+    note.parent.mkdir(parents=True)
+    note.write_text("# Archived\n")
+    monkeypatch.setattr(settings, "obsidian_vault_path", str(vault))
     job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
     job.status = JobStatus.done
     job.stage = JobStage.done
@@ -483,6 +492,75 @@ async def test_archive_identity_survives_job_deletion(db_path: str) -> None:
     assert reused.notion_page_id == job.notion_page_id
     assert reused.result is not None
     assert reused.result.transcript == ""
+
+
+async def test_missing_archived_obsidian_note_is_requeued_for_repair(
+    db_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "Media-Library"
+    (vault / ".obsidian").mkdir(parents=True)
+    monkeypatch.setattr(settings, "obsidian_vault_path", str(vault))
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.done
+    job.stage = JobStage.done
+    job.result = TranscriptResult(
+        title="Archived",
+        source="youtube",
+        url=job.url,
+        channel_or_show="Channel",
+        duration_seconds=60,
+        transcript="temporary transcript",
+        source_item_id="abc",
+    )
+    job.summary = Summary(
+        tldr="Archived summary",
+        key_points=["Point"],
+        tags=["test"],
+        worth_rewatching=False,
+    )
+    job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
+    await job_queue.update_job(job, db_path=db_path)
+    await job_queue.record_archive(job, db_path=db_path)
+
+    repaired, created = await job_queue.create_or_get_job(
+        "https://youtu.be/abc", db_path=db_path
+    )
+    archived = await job_queue.find_archived_output(
+        job.obsidian_note_path,
+        processing_mode=job.processing_mode,
+        db_path=db_path,
+    )
+
+    assert created
+    assert repaired.status == JobStatus.pending
+    assert archived is not None
+    assert archived[0] == job.summary
+    assert archived[1] is None
+
+
+async def test_init_redacts_transcripts_from_existing_terminal_rows(
+    db_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=legacy", db_path=db_path)
+    job.status = JobStatus.failed
+    job.result = TranscriptResult(
+        title="Legacy",
+        source="youtube",
+        url=job.url,
+        channel_or_show="Channel",
+        duration_seconds=60,
+        transcript="legacy sensitive transcript",
+        source_item_id="legacy",
+    )
+    await job_queue.update_job(job, db_path=db_path)
+    monkeypatch.setattr(settings, "db_retain_transcript", False)
+
+    await job_queue.init_db(db_path=db_path)
+
+    redacted = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert redacted is not None and redacted.result is not None
+    assert redacted.result.transcript == ""
+    assert redacted.result.segments == []
 
 
 async def test_redact_job_transcript_preserves_metadata(db_path: str) -> None:

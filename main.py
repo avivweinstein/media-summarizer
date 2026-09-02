@@ -394,9 +394,9 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             status_code=409,
             detail=f"Job is already {status} and cannot be cancelled.",
         )
-    await job_worker.cancel(job_id)
     if not settings.db_retain_transcript:
         await job_queue.redact_job_transcript(job_id)
+    await job_worker.cancel(job_id)
     cleanup_upload(job.url)
     logger.info("job_id=%s url=%.60s source=- event=job_cancelled_by_user", job.job_id, job.url)
     return {"status": "cancelled"}

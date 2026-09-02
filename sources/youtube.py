@@ -9,8 +9,10 @@ import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import requests  # type: ignore[import-untyped]
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -27,6 +29,12 @@ from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 
 logger = logging.getLogger(__name__)
+
+
+class _TimeoutSession(requests.Session):  # type: ignore[misc]
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("timeout", settings.source_fetch_timeout_seconds)
+        return super().request(method, url, **kwargs)
 
 
 def _extract_video_id(url: str) -> str:
@@ -50,32 +58,35 @@ def _fetch_transcript_sync(video_id: str) -> TranscriptionOutput | None:
     Tries native English transcript first, falls back to any language.
     Returns None (instead of raising) so the caller can fall back to Whisper.
     """
-    api = YouTubeTranscriptApi()
-    try:
-        listing = api.list(video_id)
-    except (TranscriptsDisabled, VideoUnavailable):
-        return None
-    except Exception:
-        return None
+    with _TimeoutSession() as session:
+        api = YouTubeTranscriptApi(http_client=session)
+        try:
+            listing = api.list(video_id)
+        except (TranscriptsDisabled, VideoUnavailable):
+            return None
+        except Exception:
+            return None
 
-    available = list(listing)
-    if not available:
-        return None
+        available = list(listing)
+        if not available:
+            return None
 
-    # Prefer human-made English, then any English, then first available
-    try:
-        transcript_obj = listing.find_transcript(["en", "en-US", "en-GB", "en-CA", "en-AU"])
-    except NoTranscriptFound:
-        transcript_obj = available[0]
-        logger.warning(
-            "url=- source=youtube event=non_english_transcript lang=%s",
-            transcript_obj.language_code,
-        )
+        # Prefer human-made English, then any English, then first available
+        try:
+            transcript_obj = listing.find_transcript(
+                ["en", "en-US", "en-GB", "en-CA", "en-AU"]
+            )
+        except NoTranscriptFound:
+            transcript_obj = available[0]
+            logger.warning(
+                "url=- source=youtube event=non_english_transcript lang=%s",
+                transcript_obj.language_code,
+            )
 
-    try:
-        fetched = transcript_obj.fetch()
-    except Exception:
-        return None
+        try:
+            fetched = transcript_obj.fetch()
+        except Exception:
+            return None
 
     segments = [
         TranscriptSegment(
@@ -99,6 +110,7 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
         "no_warnings": True,
         "proxy": "",
         "skip_download": True,
+        "socket_timeout": settings.source_fetch_timeout_seconds,
     }
     if youtube_api_key:
         opts["youtube_api_key"] = youtube_api_key
@@ -147,6 +159,7 @@ def _download_audio_sync(
         "max_filesize": max_bytes,
         "outtmpl": str(dest.with_suffix(".%(ext)s")),
         "progress_hooks": [enforce_size],
+        "socket_timeout": settings.source_fetch_timeout_seconds,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

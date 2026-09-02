@@ -466,6 +466,7 @@ Copy `.env.example` to `.env` and fill in:
 | `MAX_OPENAI_REQUESTS_PER_JOB` | No     | OpenAI request cap including retries (default: 3) | — |
 | `MAX_AUDIO_DURATION_SECONDS` | No      | Audio duration cap (default: 14,400 / 4 hours)  | — |
 | `MAX_AUDIO_DOWNLOAD_BYTES`  | No       | Download-size cap (default: 500 MB)             | — |
+| `SOURCE_FETCH_TIMEOUT_SECONDS` | No    | Network timeout for video metadata and captions (default: 120) | — |
 | `MAX_ARTICLE_DOWNLOAD_BYTES` | No      | Article response-size cap (default: 5 MB)       | — |
 | `MAX_LOCAL_SUMMARY_REQUESTS_PER_JOB` | No | Local chunk/synthesis request cap (default: 12) | — |
 | `MAX_ESTIMATED_COST_USD`    | No       | Combined estimated API spend cap per job (default: $2) | — |
