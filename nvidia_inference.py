@@ -13,6 +13,26 @@ class NvidiaInferenceError(RuntimeError):
     """Safe, credential-free Inference Hub readiness error."""
 
 
+async def _strip_authorization_header(request: httpx.Request) -> None:
+    """Prevent Anthropic SDK bearer credentials from reaching Inference Hub."""
+    request.headers.pop("authorization", None)
+
+
+def nvidia_http_client(
+    *,
+    timeout: float,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """Build a proxy-free client that cannot forward public Anthropic bearer auth."""
+    return httpx.AsyncClient(
+        timeout=timeout,
+        trust_env=False,
+        follow_redirects=False,
+        event_hooks={"request": [_strip_authorization_header]},
+        transport=transport,
+    )
+
+
 def validated_nvidia_base_url() -> str:
     """Return the configured Inference Hub origin only when it is exact and safe."""
     value = settings.nvidia_inference_base_url.strip().rstrip("/")
@@ -48,7 +68,7 @@ def validate_nvidia_configuration() -> None:
 async def nvidia_model_catalog() -> set[str]:
     """Fetch the accessible Inference Hub model IDs without following redirects."""
     validate_nvidia_configuration()
-    async with httpx.AsyncClient(timeout=10, trust_env=False, follow_redirects=False) as client:
+    async with nvidia_http_client(timeout=10) as client:
         response = await client.get(
             f"{validated_nvidia_base_url()}/v1/models",
             headers={"x-api-key": settings.nvidia_inference_api_key},

@@ -8,7 +8,9 @@ Large files (>25 MB) are re-encoded to 32 kbps mono via ffmpeg before upload.
 import asyncio
 import json
 import logging
+import os
 import shutil
+import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -67,9 +69,30 @@ async def _communicate_with_timeout(
         ) from error
 
 
+def _ensure_private_tmp_dir() -> None:
+    """Create and validate an owner-only, non-symlink temporary directory."""
+    TMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(TMP_DIR, flags)
+    except OSError as error:
+        raise TranscriptionError(
+            "The media temporary path must be a private directory, not a symlink."
+        ) from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise TranscriptionError(
+                "The media temporary directory must be owned by the current user."
+            )
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 def ensure_tmp_dir() -> None:
-    """Create the temp dir and delete any leftover MP3s from crashed jobs."""
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    """Secure the temp dir and delete leftover media from crashed jobs."""
+    _ensure_private_tmp_dir()
     removed = 0
     temporary_suffixes = {".json", ".m4a", ".mov", ".mp3", ".mp4", ".wav", ".webm"}
     for file in TMP_DIR.iterdir():
@@ -81,7 +104,7 @@ def ensure_tmp_dir() -> None:
 
 
 def tmp_path_for_job(job_id: str) -> Path:
-    TMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_private_tmp_dir()
     return TMP_DIR / f"{job_id}.mp3"
 
 

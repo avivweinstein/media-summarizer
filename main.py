@@ -101,6 +101,16 @@ async def _require_processing_ready() -> None:
     if settings.processing_mode != "nvidia_internal":
         return
     try:
+        if not settings.obsidian_vault_path:
+            raise ValueError("OBSIDIAN_VAULT_PATH is required in NVIDIA internal mode.")
+        vault_path = Path(settings.obsidian_vault_path).expanduser()
+        if not vault_path.is_dir() or not (vault_path / ".obsidian").is_dir():
+            raise ValueError("OBSIDIAN_VAULT_PATH is not a valid Obsidian vault.")
+        if not _obsidian_destinations_writable(
+            vault_path,
+            settings.obsidian_retain_transcript,
+        ):
+            raise ValueError("The configured Obsidian vault is not writable.")
         local_whisper_configuration()
         await verify_nvidia_model_access()
     except (NvidiaInferenceError, TranscriptionError, ValueError) as error:

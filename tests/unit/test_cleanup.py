@@ -53,6 +53,7 @@ class TestEnsureTmpDir:
             path = tmp_path_for_job("job")
 
         assert target.is_dir()
+        assert target.stat().st_mode & 0o777 == 0o700
         assert path == target / "job.mp3"
 
     def test_creates_directory_if_missing(self, tmp_path: Path) -> None:
@@ -63,6 +64,26 @@ class TestEnsureTmpDir:
             ensure_tmp_dir()
 
         assert target.exists()
+        assert target.stat().st_mode & 0o777 == 0o700
+
+    def test_tightens_existing_directory_permissions(self, tmp_path: Path) -> None:
+        target = tmp_path / "media-summarizer"
+        target.mkdir(mode=0o755)
+
+        with patch("transcriber.TMP_DIR", target):
+            ensure_tmp_dir()
+
+        assert target.stat().st_mode & 0o777 == 0o700
+
+    def test_rejects_symlink_temp_directory(self, tmp_path: Path) -> None:
+        actual = tmp_path / "actual"
+        actual.mkdir()
+        target = tmp_path / "media-summarizer"
+        target.symlink_to(actual, target_is_directory=True)
+
+        with patch("transcriber.TMP_DIR", target):
+            with pytest.raises(TranscriptionError, match="not a symlink"):
+                ensure_tmp_dir()
 
     def test_idempotent_when_dir_already_exists(self, tmp_path: Path) -> None:
         target = tmp_path / "media-summarizer"

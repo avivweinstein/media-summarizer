@@ -7,6 +7,7 @@ from config import settings
 from nvidia_inference import (
     NVIDIA_INFERENCE_ORIGIN,
     NvidiaInferenceError,
+    nvidia_http_client,
     nvidia_model_catalog,
     validate_nvidia_configuration,
     validated_nvidia_base_url,
@@ -51,15 +52,60 @@ async def test_catalog_disables_proxy_and_redirects(mocker: MagicMock) -> None:
     client.__aenter__.return_value = client
     client.__aexit__.return_value = None
     client.get.return_value = response
-    factory = mocker.patch("nvidia_inference.httpx.AsyncClient", return_value=client)
+    factory = mocker.patch("nvidia_inference.nvidia_http_client", return_value=client)
 
     assert await nvidia_model_catalog() == {"internal-model"}
 
-    factory.assert_called_once_with(timeout=10, trust_env=False, follow_redirects=False)
+    factory.assert_called_once_with(timeout=10)
     client.get.assert_awaited_once_with(
         f"{NVIDIA_INFERENCE_ORIGIN}/v1/models",
         headers={"x-api-key": "secret-value"},
     )
+
+
+async def test_sdk_cannot_forward_anthropic_auth_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anthropic import AsyncAnthropic
+
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "public-secret-must-not-leave")
+    captured_headers: httpx.Headers | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_headers
+        captured_headers = request.headers
+        return httpx.Response(
+            200,
+            json={
+                "id": "message-id",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "{}"}],
+                "model": "internal-model",
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    async with nvidia_http_client(
+        timeout=10,
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        client = AsyncAnthropic(
+            api_key="nvidia-key",
+            base_url=NVIDIA_INFERENCE_ORIGIN,
+            http_client=http_client,
+        )
+        await client.messages.create(
+            model="internal-model",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+
+    assert captured_headers is not None
+    assert captured_headers.get("x-api-key") == "nvidia-key"
+    assert "authorization" not in captured_headers
 
 
 async def test_model_access_error_never_contains_key(mocker: MagicMock) -> None:

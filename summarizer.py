@@ -23,7 +23,11 @@ from anthropic.types import TextBlock
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
 from models import KeyMoment, Summary, TranscriptResult, UsageStats
-from nvidia_inference import validate_nvidia_configuration, validated_nvidia_base_url
+from nvidia_inference import (
+    nvidia_http_client,
+    validate_nvidia_configuration,
+    validated_nvidia_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -412,12 +416,10 @@ async def summarize(
                 validate_nvidia_configuration()
             except ValueError as error:
                 raise SummarizationError(str(error)) from error
-            internal_http_client = httpx.AsyncClient(
-                trust_env=False,
-                follow_redirects=False,
-            )
+            internal_http_client = nvidia_http_client(timeout=600)
             client = AsyncAnthropic(
                 api_key=settings.nvidia_inference_api_key,
+                auth_token="",
                 base_url=validated_nvidia_base_url(),
                 max_retries=0,
                 http_client=internal_http_client,

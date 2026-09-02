@@ -159,9 +159,12 @@ async def test_nvidia_health_checks_internal_model_and_local_whisper_only(
 
 
 async def test_nvidia_readiness_fails_closed_without_provider(
+    tmp_path: Path,
     mocker: MagicMock,
 ) -> None:
+    (tmp_path / ".obsidian").mkdir()
     mocker.patch.object(settings, "processing_mode", "nvidia_internal")
+    mocker.patch.object(settings, "obsidian_vault_path", str(tmp_path))
     mocker.patch("main.local_whisper_configuration")
     mocker.patch(
         "main.verify_nvidia_model_access",
@@ -173,3 +176,20 @@ async def test_nvidia_readiness_fails_closed_without_provider(
 
     assert caught.value.status_code == 503
     assert caught.value.detail == "NVIDIA endpoint unavailable."
+
+
+async def test_nvidia_readiness_fails_before_provider_without_obsidian(
+    mocker: MagicMock,
+) -> None:
+    mocker.patch.object(settings, "processing_mode", "nvidia_internal")
+    mocker.patch.object(settings, "obsidian_vault_path", "")
+    whisper = mocker.patch("main.local_whisper_configuration")
+    verify = mocker.patch("main.verify_nvidia_model_access", new=AsyncMock())
+
+    with pytest.raises(HTTPException) as caught:
+        await _require_processing_ready()
+
+    assert caught.value.status_code == 503
+    assert "OBSIDIAN_VAULT_PATH is required" in str(caught.value.detail)
+    whisper.assert_not_called()
+    verify.assert_not_awaited()

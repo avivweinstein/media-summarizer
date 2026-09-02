@@ -478,7 +478,7 @@ Copy `.env.example` to `.env` and fill in:
 | `LOCAL_FFMPEG_TIMEOUT_SECONDS` | No | Maximum local media-conversion runtime (default: 600) | — |
 | `LOCAL_WHISPER_TIMEOUT_SECONDS` | No | Maximum local transcription runtime (default: 14400) | — |
 | `UPLOAD_DIR`                | No       | Private crash-recovery storage for pending uploads | — |
-| `OBSIDIAN_VAULT_PATH`       | No       | Local canonical archive; must contain `.obsidian` | Your vault folder |
+| `OBSIDIAN_VAULT_PATH`       | NVIDIA mode | Required local archive; must contain `.obsidian` | Your vault folder |
 | `OBSIDIAN_RETAIN_TRANSCRIPT` | No      | Save full transcripts to Obsidian (default: true) | — |
 | `DB_RETAIN_TRANSCRIPT`      | No       | Retain full transcripts in SQLite after terminal jobs (default: false) | — |
 | `JOB_DB_PATH`               | No       | Operational SQLite path under Application Support | — |
