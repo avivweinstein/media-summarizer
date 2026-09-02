@@ -93,6 +93,7 @@ class Job(BaseModel):
     dedupe_key: str | None = None
     usage: UsageStats = Field(default_factory=UsageStats)
     interrupted: bool = False
+    interruption_count: int = 0
     processing_mode: str = "cloud_public"
     external_processing_approved: bool = False
 
@@ -157,6 +158,7 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     retry_count: int = 0
+    interruption_count: int = 0
     result: TranscriptResult | None = None
     summary: Summary | None = None
     notion_page_id: str | None = None

@@ -9,8 +9,10 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 import job_queue
-from models import JobStage, JobStatus, TranscriptResult, UsageStats
+from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
 
 
 async def test_create_job_has_correct_defaults(db_path: str) -> None:
@@ -236,6 +238,28 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
     assert migrated.usage == UsageStats()
 
 
+async def test_default_state_path_copies_legacy_database_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = tmp_path / "repo" / "jobs.db"
+    legacy.parent.mkdir()
+    await job_queue.init_db(str(legacy))
+    original = await job_queue.create_job(
+        "https://youtube.com/watch?v=legacy", db_path=str(legacy)
+    )
+    destination = tmp_path / "Application Support" / "media-summarizer" / "jobs.db"
+    monkeypatch.setattr(job_queue, "LEGACY_DB_PATH", legacy)
+    monkeypatch.setattr(job_queue, "DB_PATH", str(destination))
+
+    await job_queue.init_db(str(destination))
+
+    migrated = await job_queue.get_job(original.job_id, db_path=str(destination))
+    assert migrated is not None
+    assert migrated.url == original.url
+    assert legacy.is_file()
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
 async def test_create_or_get_job_deduplicates_concurrent_static_urls(db_path: str) -> None:
     results = await asyncio.gather(
         job_queue.create_or_get_job("https://youtube.com/watch?v=abc&t=30", db_path=db_path),
@@ -367,7 +391,8 @@ async def test_recover_incomplete_jobs_preserves_progress_and_orders_pending(
     assert reset is not None
     assert reset.status == JobStatus.pending
     assert reset.stage == JobStage.summarizing
-    assert reset.retry_count == 1
+    assert reset.retry_count == 0
+    assert reset.interruption_count == 1
     assert reset.interrupted
 
 
@@ -376,7 +401,7 @@ async def test_recovery_fails_job_after_interruption_budget_is_exhausted(
 ) -> None:
     job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
     job.status = JobStatus.processing
-    job.retry_count = job_queue.MAX_RETRIES - 1
+    job.interruption_count = job_queue.MAX_INTERRUPTION_RECOVERIES - 1
     await job_queue.update_job(job, db_path=db_path)
 
     recovered = await job_queue.recover_incomplete_jobs(db_path=db_path)
@@ -385,7 +410,101 @@ async def test_recovery_fails_job_after_interruption_budget_is_exhausted(
     failed = await job_queue.get_job(job.job_id, db_path=db_path)
     assert failed is not None
     assert failed.status == JobStatus.failed
-    assert failed.retry_count == job_queue.MAX_RETRIES
+    assert failed.retry_count == 0
+    assert failed.interruption_count == job_queue.MAX_INTERRUPTION_RECOVERIES
+
+
+async def test_recovery_finalizes_checkpoint_even_after_interruption_budget(
+    db_path: str,
+) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.processing
+    job.stage = JobStage.saving_notion
+    job.interruption_count = job_queue.MAX_INTERRUPTION_RECOVERIES - 1
+    job.result = TranscriptResult(
+        title="Archived",
+        source="youtube",
+        url=job.url,
+        channel_or_show="Channel",
+        duration_seconds=60,
+        transcript="durable transcript",
+        source_item_id="abc",
+    )
+    job.summary = Summary(
+        tldr="Archived summary",
+        key_points=["Point"],
+        tags=["test"],
+        worth_rewatching=False,
+    )
+    job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
+    await job_queue.update_job(job, db_path=db_path)
+
+    recovered = await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+    assert recovered == [job.job_id]
+    checkpoint = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert checkpoint is not None
+    assert checkpoint.status == JobStatus.pending
+    assert checkpoint.interruption_count == job_queue.MAX_INTERRUPTION_RECOVERIES
+
+
+async def test_archive_identity_survives_job_deletion(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.done
+    job.stage = JobStage.done
+    job.result = TranscriptResult(
+        title="Archived",
+        source="youtube",
+        url=job.url,
+        channel_or_show="Channel",
+        duration_seconds=60,
+        transcript="do not retain this transcript",
+        source_item_id="abc",
+    )
+    job.summary = Summary(
+        tldr="Archived summary",
+        key_points=["Point"],
+        tags=["test"],
+        worth_rewatching=False,
+    )
+    job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
+    job.notion_page_id = "notion-abc"
+    await job_queue.update_job(job, db_path=db_path)
+    await job_queue.record_archive(job, db_path=db_path)
+    await job_queue.delete_job(job.job_id, db_path=db_path)
+
+    reused, created = await job_queue.create_or_get_job(
+        "https://youtu.be/abc", db_path=db_path
+    )
+
+    assert not created
+    assert reused.status == JobStatus.done
+    assert reused.obsidian_note_path == job.obsidian_note_path
+    assert reused.notion_page_id == job.notion_page_id
+    assert reused.result is not None
+    assert reused.result.transcript == ""
+
+
+async def test_redact_job_transcript_preserves_metadata(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.result = TranscriptResult(
+        title="Metadata",
+        source="youtube",
+        url=job.url,
+        channel_or_show="Channel",
+        duration_seconds=60,
+        transcript="sensitive transcript",
+        source_item_id="abc",
+    )
+    await job_queue.update_job(job, db_path=db_path)
+
+    await job_queue.redact_job_transcript(job.job_id, db_path=db_path)
+
+    redacted = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert redacted is not None and redacted.result is not None
+    assert redacted.result.title == "Metadata"
+    assert redacted.result.transcript == ""
+    assert redacted.result.segments == []
 
 
 # ---------------------------------------------------------------------------

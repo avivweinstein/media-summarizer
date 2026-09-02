@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     notion_enabled: bool = False
     obsidian_vault_path: str = ""
     obsidian_retain_transcript: bool = True
+    db_retain_transcript: bool = False
+    job_db_path: str = "~/Library/Application Support/media-summarizer/jobs.db"
+    backup_dir: str = "~/Library/Application Support/media-summarizer/backups"
     podcast_index_api_key: str = ""
     podcast_index_api_secret: str = ""
     youtube_api_key: str = ""

@@ -12,6 +12,7 @@ import job_queue
 from config import settings
 from exceptions import UsageLimitError
 from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
+from obsidian_writer import source_id
 from pipeline import _notify_webhook, run_job
 
 
@@ -116,7 +117,8 @@ class TestRetryLogic:
         result = await job_queue.get_job(job.job_id, db_path=db_path)
         assert result is not None
         assert result.status == JobStatus.done
-        assert result.retry_count == 1
+        assert result.retry_count == 0
+        assert result.interruption_count == 1
 
     async def test_interrupted_notion_save_is_not_replayed(
         self, db_path: str, mocker: MagicMock
@@ -143,6 +145,60 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.done
         assert result.notion_error is not None
+
+    async def test_dynamic_source_reuses_permanent_archive_after_job_deletion(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        url = "https://feeds.example.com/show"
+        transcript = TranscriptResult(
+            title="Episode",
+            source="article",
+            url="https://example.com/episode",
+            channel_or_show="Show",
+            duration_seconds=0,
+            transcript="Archived source text.",
+            source_item_id="episode-1",
+        )
+        prior = await job_queue.create_job(
+            url,
+            processing_mode="local",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        prior.status = JobStatus.done
+        prior.stage = JobStage.done
+        prior.result = transcript
+        prior.summary = _summary()
+        prior.obsidian_note_path = f"Generated/Summaries/{source_id(transcript)}.md"
+        await job_queue.update_job(prior, db_path=db_path)
+        await job_queue.record_archive(prior, db_path=db_path)
+        await job_queue.delete_job(prior.job_id, db_path=db_path)
+        job, created = await job_queue.create_or_get_job(
+            url,
+            processing_mode="local",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        assert created
+
+        mocker.patch("pipeline.detect_source", return_value="article")
+        source = AsyncMock()
+        source.fetch.return_value = transcript
+        mocker.patch("pipeline.ArticleSource", return_value=source)
+        summarize_mock = mocker.patch("pipeline.summarize")
+        save = mocker.patch("pipeline.save_to_obsidian")
+        mocker.patch("pipeline._notify_webhook")
+        mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+        mocker.patch.object(settings, "notion_enabled", False)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        summarize_mock.assert_not_called()
+        save.assert_not_called()
+        completed = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert completed is not None
+        assert completed.status == JobStatus.done
+        assert completed.summary == _summary()
 
     async def test_provider_usage_reservation_survives_worker_cancellation(
         self, db_path: str, mocker: MagicMock

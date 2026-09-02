@@ -206,7 +206,10 @@ async def _persist_upload(file: UploadFile) -> str:
     return url
 
 
-def _job_to_response(job: Job) -> JobResponse:
+def _job_to_response(job: Job, *, include_transcript: bool = True) -> JobResponse:
+    result = job.result
+    if result is not None and not include_transcript:
+        result = result.model_copy(update={"transcript": "", "segments": []})
     return JobResponse(
         job_id=job.job_id,
         url=job.url,
@@ -215,7 +218,8 @@ def _job_to_response(job: Job) -> JobResponse:
         created_at=job.created_at,
         updated_at=job.updated_at,
         retry_count=job.retry_count,
-        result=job.result,
+        interruption_count=job.interruption_count,
+        result=result,
         summary=job.summary,
         notion_page_id=job.notion_page_id,
         notion_error=job.notion_error,
@@ -374,7 +378,7 @@ async def get_job(job_id: str) -> JobResponse:
 async def list_jobs() -> list[JobResponse]:
     """Return the 50 most recent jobs."""
     jobs = await job_queue.list_jobs(limit=50)
-    return [_job_to_response(j) for j in jobs]
+    return [_job_to_response(j, include_transcript=False) for j in jobs]
 
 
 @app.post("/job/{job_id}/cancel")
@@ -390,6 +394,9 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             status_code=409,
             detail=f"Job is already {status} and cannot be cancelled.",
         )
+    await job_worker.cancel(job_id)
+    if not settings.db_retain_transcript:
+        await job_queue.redact_job_transcript(job_id)
     cleanup_upload(job.url)
     logger.info("job_id=%s url=%.60s source=- event=job_cancelled_by_user", job.job_id, job.url)
     return {"status": "cancelled"}
@@ -439,7 +446,7 @@ async def jobs_stream() -> EventSourceResponse:
         while True:
             try:
                 jobs = await job_queue.list_jobs(limit=50)
-                responses = [_job_to_response(j) for j in jobs]
+                responses = [_job_to_response(j, include_transcript=False) for j in jobs]
                 snapshot = json.dumps(
                     [r.model_dump(mode="json") for r in responses],
                     default=str,

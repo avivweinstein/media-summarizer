@@ -4,8 +4,8 @@ If no native transcript is available, falls back to downloading audio via yt-dlp
 and transcribing with OpenAI Whisper.
 """
 
-import asyncio
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +19,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
+from async_utils import run_blocking
 from config import settings
 from exceptions import MetadataError, UsageLimitError
 from models import TranscriptionOutput, TranscriptResult, TranscriptSegment, UsageStats
@@ -123,10 +124,17 @@ def _parse_upload_date(raw: str | None) -> datetime | None:
         return None
 
 
-def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
+def _download_audio_sync(
+    url: str,
+    dest: Path,
+    max_bytes: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Download audio from a YouTube video via yt-dlp as MP3."""
 
     def enforce_size(progress: dict[str, object]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Media download cancelled.")
         downloaded = progress.get("downloaded_bytes", 0)
         if isinstance(downloaded, (int, float)) and downloaded > max_bytes:
             raise UsageLimitError("YouTube audio exceeds the configured download-size limit.")
@@ -188,18 +196,17 @@ class YouTubeSource(BaseSource):
         processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
-        loop = asyncio.get_event_loop()
         video_id = _extract_video_id(url)
 
         logger.info("%s event=metadata_fetch_start", log)
-        meta = await loop.run_in_executor(None, _fetch_metadata_sync, url, self.youtube_api_key)
+        meta = await run_blocking(_fetch_metadata_sync, url, self.youtube_api_key)
         logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
         duration_seconds = int(str(meta.get("duration") or 0))
         usage_tracker = usage or UsageStats()
 
         # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
-        transcription = await loop.run_in_executor(None, _fetch_transcript_sync, video_id)
+        transcription = await run_blocking(_fetch_transcript_sync, video_id)
 
         if transcription and transcription.text:
             transcription_model = "youtube/captions"
@@ -218,12 +225,14 @@ class YouTubeSource(BaseSource):
                 )
             dest = tmp_path_for_job(job_id)
             logger.info("%s event=audio_download_start", log)
-            await loop.run_in_executor(
-                None,
+            cancel_event = threading.Event()
+            await run_blocking(
                 _download_audio_sync,
                 url,
                 dest,
                 settings.max_audio_download_bytes,
+                cancel_event,
+                cancel=cancel_event.set,
             )
             logger.info(
                 "%s event=audio_download_done size_mb=%.1f",
