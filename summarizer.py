@@ -1,11 +1,13 @@
 """Claude API summarizer.
 
-Single API call returning structured JSON: tldr, key_points, tags, worth_rewatching.
+One or more API calls return structured JSON: tldr, key_points, tags, worth_rewatching.
 JSON is validated and coerced before returning a Summary model.
 """
 
+import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 
 from anthropic import (
     APIConnectionError,
@@ -17,13 +19,14 @@ from anthropic import (
 from anthropic.types import TextBlock
 
 from config import settings
-from exceptions import SummarizationError
-from models import Summary, TranscriptResult
+from exceptions import SummarizationError, UsageLimitError
+from models import Summary, TranscriptResult, UsageStats
 
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-20250514"
 MAX_OUTPUT_TOKENS = 1024
+_API_BACKOFF_SECONDS = (1, 2)
 
 CANONICAL_TAGS = [
     "fitness", "cycling", "running", "lifting", "nutrition", "health",
@@ -55,7 +58,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def _build_user_prompt(result: TranscriptResult) -> str:
+def _build_user_prompt(result: TranscriptResult, transcript: str | None = None) -> str:
     lines = [
         f"Title: {result.title}",
         f"Channel/Show: {result.channel_or_show}",
@@ -64,8 +67,118 @@ def _build_user_prompt(result: TranscriptResult) -> str:
     ]
     if result.published_at:
         lines.append(f"Published: {result.published_at.strftime('%Y-%m-%d')}")
-    lines += ["", "Transcript:", result.transcript]
+    lines += ["", "Transcript:", result.transcript if transcript is None else transcript]
     return "\n".join(lines)
+
+
+def _chunk_text(text: str, max_chars: int) -> list[str]:
+    """Split text at whitespace when possible, with a strict character ceiling."""
+    if max_chars <= 0:
+        raise SummarizationError("SUMMARY_CHUNK_CHARS must be greater than zero.")
+    chunks: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        split_at = remaining.rfind(" ", 0, max_chars + 1)
+        if split_at <= 0:
+            split_at = max_chars
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining or not chunks:
+        chunks.append(remaining)
+    return chunks
+
+
+def _usage_int(value: object) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def _anthropic_cost(input_tokens: int, output_tokens: int) -> float:
+    return (
+        input_tokens * settings.anthropic_input_cost_per_million_usd
+        + output_tokens * settings.anthropic_output_cost_per_million_usd
+    ) / 1_000_000
+
+
+async def _call_claude(
+    client: AsyncAnthropic,
+    *,
+    system: str,
+    prompt: str,
+    usage: UsageStats,
+    cost_budget_usd: float,
+    persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+) -> Summary:
+    estimated_input_tokens = max(1, (len(system) + len(prompt)) // 4)
+    projected_cost = _anthropic_cost(estimated_input_tokens, MAX_OUTPUT_TOKENS)
+    for api_attempt in range(len(_API_BACKOFF_SECONDS) + 1):
+        if usage.anthropic_requests >= settings.max_anthropic_requests_per_job:
+            raise UsageLimitError("Configured Anthropic per-job request limit reached.")
+        if usage.estimated_cost_usd + projected_cost > cost_budget_usd:
+            raise UsageLimitError(
+                "Estimated summarization cost would exceed the configured per-job limit."
+            )
+
+        usage.anthropic_requests += 1
+        usage.estimated_cost_usd = round(
+            usage.estimated_cost_usd + projected_cost,
+            6,
+        )
+        if persist_usage is not None:
+            await persist_usage(usage)
+
+        try:
+            message = await client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except BadRequestError as e:
+            msg = str(e).lower()
+            if any(word in msg for word in ("credit", "billing", "balance", "quota")):
+                raise SummarizationError(
+                    "Anthropic API credits exhausted. Please top up your account at "
+                    "console.anthropic.com/settings/billing."
+                ) from e
+            raise SummarizationError(f"Claude rejected the request: {e}") from e
+        except (RateLimitError, APIConnectionError) as e:
+            if api_attempt >= len(_API_BACKOFF_SECONDS):
+                if isinstance(e, RateLimitError):
+                    raise SummarizationError(
+                        "Claude API rate limit reached. Please try again in a moment."
+                    ) from e
+                raise SummarizationError(f"Could not connect to Claude API: {e}") from e
+            await asyncio.sleep(_API_BACKOFF_SECONDS[api_attempt])
+            continue
+        except APIStatusError as e:
+            if e.status_code >= 500 and api_attempt < len(_API_BACKOFF_SECONDS):
+                await asyncio.sleep(_API_BACKOFF_SECONDS[api_attempt])
+                continue
+            raise SummarizationError(
+                f"Claude API error (HTTP {e.status_code}): {e.message}"
+            ) from e
+
+        first_block = message.content[0]
+        if not isinstance(first_block, TextBlock):
+            raise SummarizationError(
+                f"Unexpected response block type from Claude: {type(first_block).__name__}"
+            )
+
+        input_tokens = _usage_int(getattr(message.usage, "input_tokens", 0))
+        output_tokens = _usage_int(getattr(message.usage, "output_tokens", 0))
+        usage.anthropic_input_tokens += input_tokens
+        usage.anthropic_output_tokens += output_tokens
+        actual_cost = _anthropic_cost(input_tokens, output_tokens)
+        if input_tokens or output_tokens:
+            usage.estimated_cost_usd = round(
+                usage.estimated_cost_usd - projected_cost + actual_cost,
+                6,
+            )
+        if persist_usage is not None:
+            await persist_usage(usage)
+        return _parse_response(first_block.text)
+
+    raise AssertionError("Claude retry loop exhausted unexpectedly.")
 
 
 def _parse_response(raw: str) -> Summary:
@@ -135,7 +248,14 @@ def _parse_response(raw: str) -> Summary:
     return Summary(tldr=tldr, key_points=key_points, tags=tags, worth_rewatching=worth_rewatching)
 
 
-async def summarize(result: TranscriptResult, job_id: str = "-") -> Summary:
+async def summarize(
+    result: TranscriptResult,
+    job_id: str = "-",
+    *,
+    cost_budget_usd: float | None = None,
+    usage: UsageStats | None = None,
+    persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+) -> Summary:
     """Call Claude to summarize a transcript. Returns a validated Summary.
 
     Raises SummarizationError on API failures, quota exhaustion, or bad responses.
@@ -143,43 +263,78 @@ async def summarize(result: TranscriptResult, job_id: str = "-") -> Summary:
     log = f"job_id={job_id} url={result.url[:60]!r} source={result.source}"
     logger.info("%s event=summarize_start transcript_chars=%d", log, len(result.transcript))
 
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    if len(result.transcript) > settings.max_transcript_chars:
+        raise UsageLimitError(
+            f"Transcript has {len(result.transcript):,} characters, exceeding the configured "
+            f"{settings.max_transcript_chars:,}-character per-job limit."
+        )
 
-    try:
-        message = await client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_OUTPUT_TOKENS,
+    chunks = _chunk_text(result.transcript, settings.summary_chunk_chars)
+    request_count = 1 if len(chunks) == 1 else len(chunks) + 1
+    usage_tracker = usage or UsageStats()
+    if (
+        usage_tracker.anthropic_requests + request_count
+        > settings.max_anthropic_requests_per_job
+    ):
+        raise UsageLimitError(
+            f"Transcript requires {request_count} Anthropic requests, exceeding the "
+            "remaining per-job request allowance."
+        )
+
+    client = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
+    budget = cost_budget_usd if cost_budget_usd is not None else settings.max_estimated_cost_usd
+
+    if len(chunks) == 1:
+        summary = await _call_claude(
+            client,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_prompt(result)}],
+            prompt=_build_user_prompt(result),
+            usage=usage_tracker,
+            cost_budget_usd=budget,
+            persist_usage=persist_usage,
         )
-    except RateLimitError as e:
-        raise SummarizationError(
-            "Claude API rate limit reached. Please try again in a moment."
-        ) from e
-    except BadRequestError as e:
-        msg = str(e).lower()
-        if any(word in msg for word in ("credit", "billing", "balance", "quota")):
-            raise SummarizationError(
-                "Anthropic API credits exhausted. Please top up your account at "
-                "console.anthropic.com/settings/billing."
-            ) from e
-        raise SummarizationError(f"Claude rejected the request: {e}") from e
-    except APIConnectionError as e:
-        raise SummarizationError(f"Could not connect to Claude API: {e}") from e
-    except APIStatusError as e:
-        raise SummarizationError(f"Claude API error (HTTP {e.status_code}): {e.message}") from e
-
-    first_block = message.content[0]
-    if not isinstance(first_block, TextBlock):
-        raise SummarizationError(
-            f"Unexpected response block type from Claude: {type(first_block).__name__}"
+    else:
+        partials: list[Summary] = []
+        for index, chunk in enumerate(chunks, start=1):
+            partials.append(
+                await _call_claude(
+                    client,
+                    system=SYSTEM_PROMPT,
+                    prompt=(
+                        _build_user_prompt(result, chunk)
+                        + f"\n\nThis is transcript chunk {index} of {len(chunks)}."
+                    ),
+                    usage=usage_tracker,
+                    cost_budget_usd=budget,
+                    persist_usage=persist_usage,
+                )
+            )
+        synthesis = json.dumps(
+            [partial.model_dump() for partial in partials],
+            ensure_ascii=False,
         )
-    summary = _parse_response(first_block.text)
+        summary = await _call_claude(
+            client,
+            system=SYSTEM_PROMPT,
+            prompt=(
+                _build_user_prompt(result, "")
+                + "\n\nCombine these chunk summaries into one non-redundant final summary:\n"
+                + synthesis
+            ),
+            usage=usage_tracker,
+            cost_budget_usd=budget,
+            persist_usage=persist_usage,
+        )
 
     logger.info(
-        "%s event=summarize_done tags=%r worth_rewatching=%s",
+        "%s event=summarize_done tags=%r worth_rewatching=%s requests=%d "
+        "input_tokens=%d output_tokens=%d estimated_cost_usd=%.4f",
         log,
         summary.tags,
         summary.worth_rewatching,
+        usage_tracker.anthropic_requests,
+        usage_tracker.anthropic_input_tokens,
+        usage_tracker.anthropic_output_tokens,
+        usage_tracker.estimated_cost_usd,
     )
     return summary

@@ -13,6 +13,8 @@ A personal media intelligence pipeline. Send YouTube or podcast URLs via the web
 - **Web dashboard** — real-time job tracking with dark mode, SSE live updates
 - **Job management** — cancel, delete, and auto-cleanup of old jobs
 - **Concurrent processing** — async worker pool handles multiple jobs without blocking
+- **Crash recovery and dedupe** — interrupted jobs resume after restart; equivalent submissions reuse existing work
+- **Bounded API usage** — long transcripts are chunked with per-job request, size, duration, and estimated-cost limits
 
 ## Requirements
 
@@ -154,8 +156,13 @@ launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
 
-The process pauses with the Mac and resumes after wake. Jobs interrupted by a
-process restart are not resumed automatically; delete and resubmit them.
+The process pauses with the Mac and resumes after wake. Pending and interrupted
+jobs are recovered from SQLite at the last durable transcript/summary checkpoint;
+retry counts and provider-usage reservations also survive a crash. A process lock
+prevents two local instances from replaying the same queue. Equivalent active
+submissions are deduplicated; completed static media such as a YouTube video is
+reused, while RSS/show URLs can be refreshed for newer episodes. RSS responses and
+audio downloads are streamed with time and size bounds.
 
 ### Linux (systemd)
 
@@ -388,10 +395,27 @@ Copy `.env.example` to `.env` and fill in:
 | `NOTION_DATABASE_ID`        | If enabled | Target Notion database ID                     | From your database URL |
 | `YOUTUBE_API_KEY`           | No       | YouTube Data API key (optional metadata optimization) | [Google Cloud Console](https://console.cloud.google.com) |
 | `OPENCLAW_WEBHOOK_URL`      | No       | Webhook URL for notifications                   | Your webhook endpoint |
+| `WEBHOOKS_ENABLED`          | No       | Explicitly enable outbound result webhooks (default: false) | — |
 | `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
 | `PODCAST_INDEX_API_SECRET`  | No       | Podcast Index API secret                        | Same as above |
 | `PORT`                      | No       | Server port (default: 8000)                     | — |
+| `SUMMARY_CHUNK_CHARS`       | No       | Transcript characters per summary chunk (default: 60,000) | — |
+| `MAX_TRANSCRIPT_CHARS`      | No       | Hard transcript-size limit per job (default: 600,000) | — |
+| `MAX_ANTHROPIC_REQUESTS_PER_JOB` | No | Anthropic request cap including retries (default: 12) | — |
+| `MAX_OPENAI_REQUESTS_PER_JOB` | No     | OpenAI request cap including retries (default: 3) | — |
+| `MAX_AUDIO_DURATION_SECONDS` | No      | Audio duration cap (default: 14,400 / 4 hours)  | — |
+| `MAX_AUDIO_DOWNLOAD_BYTES`  | No       | Download-size cap (default: 500 MB)             | — |
+| `MAX_ESTIMATED_COST_USD`    | No       | Combined estimated API spend cap per job (default: $2) | — |
+| `ANTHROPIC_INPUT_COST_PER_MILLION_USD` | No | Claude input-token estimate rate (default: $3) | Anthropic pricing |
+| `ANTHROPIC_OUTPUT_COST_PER_MILLION_USD` | No | Claude output-token estimate rate (default: $15) | Anthropic pricing |
+| `WHISPER_COST_PER_MINUTE_USD` | No     | Whisper estimate rate (default: $0.006)         | OpenAI pricing |
 | `NOTION_TEST_DATABASE_ID`   | No       | Separate Notion DB for integration tests (keeps test pages out of your real DB) | Create a blank database |
+
+Cost estimates use configurable rates matching the pinned models: Claude Sonnet
+input/output pricing and Whisper per-minute pricing. Check the official
+[Anthropic pricing](https://docs.anthropic.com/en/docs/about-claude/pricing) and
+[OpenAI Whisper pricing](https://developers.openai.com/api/docs/models/whisper-1)
+before changing models or relying on the estimate for budgeting.
 
 ---
 
@@ -407,7 +431,8 @@ One or more API keys are missing from your `.env` file. Check the [Environment V
 Whisper fallback and podcast compression require ffmpeg. Install it with `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux).
 
 **Jobs stuck after restart**
-Pending or processing jobs from before the server stopped are not re-enqueued automatically. You can delete them via the UI or API and resubmit.
+Pending or processing jobs are requeued automatically. If one remains stuck,
+inspect the service log and use the UI to cancel it before resubmitting.
 
 **Service won't start (systemd)**
 Check logs with `journalctl --user -u media-summarizer -n 50`. Common issues:

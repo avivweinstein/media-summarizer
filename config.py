@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,7 +16,18 @@ class Settings(BaseSettings):
     podcast_index_api_secret: str = ""
     youtube_api_key: str = ""
     openclaw_webhook_url: str = ""
+    webhooks_enabled: bool = False
     port: int = 8000
+    summary_chunk_chars: int = Field(default=60_000, gt=0)
+    max_transcript_chars: int = Field(default=600_000, gt=0)
+    max_anthropic_requests_per_job: int = Field(default=12, gt=0)
+    max_openai_requests_per_job: int = Field(default=3, gt=0)
+    max_audio_duration_seconds: int = Field(default=14_400, gt=0)
+    max_audio_download_bytes: int = Field(default=500_000_000, gt=0)
+    max_estimated_cost_usd: float = Field(default=2.0, gt=0)
+    anthropic_input_cost_per_million_usd: float = Field(default=3.0, ge=0)
+    anthropic_output_cost_per_million_usd: float = Field(default=15.0, ge=0)
+    whisper_cost_per_minute_usd: float = Field(default=0.006, ge=0)
 
 
 settings = Settings()

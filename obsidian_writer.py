@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from exceptions import ObsidianError
-from models import Summary, TranscriptResult
+from models import Summary, TranscriptResult, UsageStats
 
 SUMMARY_DIR = Path("Generated/Summaries")
 TRANSCRIPT_DIR = Path("Generated/Transcripts")
@@ -110,6 +110,7 @@ def _render_summary(
     added_at: datetime,
     summary_model: str,
     transcript_path: Path | None,
+    usage: UsageStats,
 ) -> str:
     published = result.published_at.date().isoformat() if result.published_at else ""
     tag_lines = ["tags:", *[f"  - {_yaml_string(tag)}" for tag in summary.tags]]
@@ -139,6 +140,12 @@ def _render_summary(
         f"summary_model: {_yaml_string(summary_model)}",
         f"transcription_model: {_yaml_string(result.transcription_model or 'unknown')}",
         f"transcript_retained: {'true' if transcript_path else 'false'}",
+        f"anthropic_requests: {usage.anthropic_requests}",
+        f"anthropic_input_tokens: {usage.anthropic_input_tokens}",
+        f"anthropic_output_tokens: {usage.anthropic_output_tokens}",
+        f"openai_requests: {usage.openai_requests}",
+        f"openai_audio_seconds: {round(usage.openai_audio_seconds, 3)}",
+        f"estimated_cost_usd: {round(usage.estimated_cost_usd, 6)}",
     ]
     if result.thumbnail_url:
         lines.append(f"thumbnail_url: {_yaml_string(result.thumbnail_url)}")
@@ -171,6 +178,7 @@ def _save_sync(
     retain_transcript: bool,
     summary_model: str,
     added_at: datetime,
+    usage: UsageStats,
 ) -> str:
     vault_path = vault_path.expanduser().resolve()
     if not vault_path.is_dir() or not (vault_path / ".obsidian").is_dir():
@@ -196,6 +204,7 @@ def _save_sync(
             added_at,
             summary_model,
             transcript_path,
+            usage,
         )
         _atomic_write_once(summary_path, content)
     return summary_path.relative_to(vault_path).as_posix()
@@ -209,6 +218,7 @@ async def save_to_obsidian(
     retain_transcript: bool,
     summary_model: str,
     added_at: datetime | None = None,
+    usage: UsageStats | None = None,
 ) -> str:
     """Save a summary and optional transcript, returning the vault-relative note path."""
     timestamp = added_at or datetime.now(UTC)
@@ -220,4 +230,5 @@ async def save_to_obsidian(
         retain_transcript,
         summary_model,
         timestamp,
+        usage or UsageStats(),
     )
