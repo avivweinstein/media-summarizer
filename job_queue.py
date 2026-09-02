@@ -96,7 +96,7 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         ),
         interrupted=bool(data.get("interrupted", 0)),
         interruption_count=int(data.get("interruption_count", 0)),
-        processing_mode=data.get("processing_mode") or "nvidia_internal",
+        processing_mode=data.get("processing_mode") or "cloud_public",
         external_processing_approved=bool(data.get("external_processing_approved", 0)),
     )
 
@@ -220,7 +220,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         if "processing_mode" not in columns:
             await db.execute(
-                "ALTER TABLE jobs ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'nvidia_internal'"
+                "ALTER TABLE jobs ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'cloud_public'"
             )
         if "external_processing_approved" not in columns:
             await db.execute(
@@ -229,7 +229,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         async with db.execute("SELECT job_id, url, processing_mode FROM jobs") as rows:
             for job_id, url, processing_mode in await rows.fetchall():
                 base_dedupe_key, _ = submission_identity(str(url))
-                dedupe_key = f"{base_dedupe_key}:{processing_mode or 'nvidia_internal'}"
+                dedupe_key = f"{base_dedupe_key}:{processing_mode or 'cloud_public'}"
                 await db.execute(
                     "UPDATE jobs SET dedupe_key = ? WHERE job_id = ?",
                     (dedupe_key, job_id),

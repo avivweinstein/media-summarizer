@@ -238,13 +238,14 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
         job.error = "Job has an invalid persisted processing mode."
         await job_queue.update_job(job, db_path=db_path)
         return
-    if (
-        settings.processing_mode == "nvidia_internal"
-        and job.processing_mode != "nvidia_internal"
+    if settings.processing_mode in {"nvidia_internal", "local"} and (
+        job.processing_mode != settings.processing_mode
     ):
         job.status = JobStatus.failed
         job.stage = JobStage.failed
-        job.error = "Persisted job processing mode is disabled by NVIDIA internal mode."
+        job.error = (
+            f"Persisted job processing mode is disabled by {settings.processing_mode} mode."
+        )
         await job_queue.update_job(job, db_path=db_path)
         return
     if job.processing_mode == "cloud_public" and not job.external_processing_approved:

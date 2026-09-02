@@ -236,6 +236,8 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
     assert migrated.notion_error is None
     assert migrated.obsidian_note_path is None
     assert migrated.dedupe_key is not None
+    assert migrated.dedupe_key.endswith(":cloud_public")
+    assert migrated.processing_mode == "cloud_public"
     assert migrated.usage == UsageStats()
 
 

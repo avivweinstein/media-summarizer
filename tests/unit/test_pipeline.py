@@ -438,8 +438,9 @@ class TestRetryLogic:
         source.assert_not_called()
         summarize_mock.assert_not_called()
 
-    async def test_internal_service_rejects_recovered_public_job(
-        self, db_path: str, mocker: MagicMock
+    @pytest.mark.parametrize("service_mode", ["nvidia_internal", "local"])
+    async def test_private_service_rejects_recovered_public_job(
+        self, service_mode: str, db_path: str, mocker: MagicMock
     ) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
@@ -447,7 +448,7 @@ class TestRetryLogic:
             external_processing_approved=True,
             db_path=db_path,
         )
-        mocker.patch.object(settings, "processing_mode", "nvidia_internal")
+        mocker.patch.object(settings, "processing_mode", service_mode)
         source = mocker.patch("pipeline.YouTubeSource")
         summarize_mock = mocker.patch("pipeline.summarize")
 
@@ -457,7 +458,7 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.failed
         assert result.error == (
-            "Persisted job processing mode is disabled by NVIDIA internal mode."
+            f"Persisted job processing mode is disabled by {service_mode} mode."
         )
         source.assert_not_called()
         summarize_mock.assert_not_called()

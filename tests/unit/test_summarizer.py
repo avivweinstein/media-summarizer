@@ -187,6 +187,11 @@ class TestSummarize:
         mock_client = AsyncMock()
         mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
         factory = mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        http_client = AsyncMock()
+        http_factory = mocker.patch(
+            "summarizer.httpx.AsyncClient",
+            return_value=http_client,
+        )
         mocker.patch.object(settings, "nvidia_inference_api_key", "nvidia-key")
         mocker.patch.object(
             settings,
@@ -202,7 +207,10 @@ class TestSummarize:
             api_key="nvidia-key",
             base_url="https://inference-api.nvidia.com",
             max_retries=0,
+            http_client=http_client,
         )
+        http_factory.assert_called_once_with(trust_env=False, follow_redirects=False)
+        http_client.aclose.assert_awaited_once()
         assert mock_client.messages.create.call_args.kwargs["model"] == "internal-model"
 
     async def test_nvidia_internal_missing_key_never_constructs_client(
@@ -224,6 +232,7 @@ class TestSummarize:
         mock_client = AsyncMock()
         mock_client.messages.create.return_value = response
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch("summarizer.httpx.AsyncClient", return_value=AsyncMock())
         mocker.patch.object(settings, "nvidia_inference_api_key", "nvidia-key")
 
         summary = await summarize(make_result(), processing_mode="nvidia_internal")

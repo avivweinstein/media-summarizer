@@ -385,6 +385,7 @@ async def summarize(
     usage_tracker = usage or UsageStats()
     local_mode = processing_mode == "local"
     nvidia_internal_mode = processing_mode == "nvidia_internal"
+    internal_http_client: httpx.AsyncClient | None = None
     if local_mode:
         if (
             usage_tracker.local_summary_requests + request_count
@@ -411,10 +412,15 @@ async def summarize(
                 validate_nvidia_configuration()
             except ValueError as error:
                 raise SummarizationError(str(error)) from error
+            internal_http_client = httpx.AsyncClient(
+                trust_env=False,
+                follow_redirects=False,
+            )
             client = AsyncAnthropic(
                 api_key=settings.nvidia_inference_api_key,
                 base_url=validated_nvidia_base_url(),
                 max_retries=0,
+                http_client=internal_http_client,
             )
             model = settings.nvidia_inference_model
             provider_name = "NVIDIA Inference Hub"
@@ -446,26 +452,30 @@ async def summarize(
             persist_usage=persist_usage,
         )
 
-    if len(chunks) == 1:
-        summary = await call_summary(_build_user_prompt(result, prompt_transcript))
-    else:
-        partials: list[Summary] = []
-        for index, chunk in enumerate(chunks, start=1):
-            partials.append(
-                await call_summary(
-                    _build_user_prompt(result, chunk)
-                    + f"\n\nThis is transcript chunk {index} of {len(chunks)}."
+    try:
+        if len(chunks) == 1:
+            summary = await call_summary(_build_user_prompt(result, prompt_transcript))
+        else:
+            partials: list[Summary] = []
+            for index, chunk in enumerate(chunks, start=1):
+                partials.append(
+                    await call_summary(
+                        _build_user_prompt(result, chunk)
+                        + f"\n\nThis is transcript chunk {index} of {len(chunks)}."
+                    )
                 )
+            synthesis = json.dumps(
+                [partial.model_dump() for partial in partials],
+                ensure_ascii=False,
             )
-        synthesis = json.dumps(
-            [partial.model_dump() for partial in partials],
-            ensure_ascii=False,
-        )
-        summary = await call_summary(
-            _build_user_prompt(result, "")
-            + "\n\nCombine these chunk summaries into one non-redundant final summary:\n"
-            + synthesis
-        )
+            summary = await call_summary(
+                _build_user_prompt(result, "")
+                + "\n\nCombine these chunk summaries into one non-redundant final summary:\n"
+                + synthesis
+            )
+    finally:
+        if internal_http_client is not None:
+            await internal_http_client.aclose()
 
     valid_timestamps = {round(segment.start_seconds) for segment in result.segments}
     summary.key_moments = [
