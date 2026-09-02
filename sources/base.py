@@ -15,7 +15,7 @@ class BaseSource(ABC):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         """Fetch transcript and metadata for the given URL."""
         ...

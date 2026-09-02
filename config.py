@@ -9,6 +9,9 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    nvidia_inference_api_key: str = ""
+    nvidia_inference_base_url: str = "https://inference-api.nvidia.com"
+    nvidia_inference_model: str = "us/azure/anthropic/eccn-claude-sonnet-5"
     notion_api_key: str = ""
     notion_database_id: str = ""
     notion_enabled: bool = False
@@ -25,7 +28,7 @@ class Settings(BaseSettings):
     library_qa_provider: Literal["extractive", "ollama"] = "extractive"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.2:3b"
-    processing_mode: Literal["cloud_public", "local"] = "cloud_public"
+    processing_mode: Literal["nvidia_internal", "cloud_public", "local"] = "nvidia_internal"
     upload_dir: str = "~/Library/Application Support/media-summarizer/uploads"
     local_whisper_executable: str = "whisper-cli"
     local_whisper_model: str = ""

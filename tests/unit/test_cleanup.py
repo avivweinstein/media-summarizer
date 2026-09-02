@@ -53,6 +53,7 @@ class TestEnsureTmpDir:
             path = tmp_path_for_job("job")
 
         assert target.is_dir()
+        assert target.stat().st_mode & 0o777 == 0o700
         assert path == target / "job.mp3"
 
     def test_creates_directory_if_missing(self, tmp_path: Path) -> None:
@@ -63,6 +64,26 @@ class TestEnsureTmpDir:
             ensure_tmp_dir()
 
         assert target.exists()
+        assert target.stat().st_mode & 0o777 == 0o700
+
+    def test_tightens_existing_directory_permissions(self, tmp_path: Path) -> None:
+        target = tmp_path / "media-summarizer"
+        target.mkdir(mode=0o755)
+
+        with patch("transcriber.TMP_DIR", target):
+            ensure_tmp_dir()
+
+        assert target.stat().st_mode & 0o777 == 0o700
+
+    def test_rejects_symlink_temp_directory(self, tmp_path: Path) -> None:
+        actual = tmp_path / "actual"
+        actual.mkdir()
+        target = tmp_path / "media-summarizer"
+        target.symlink_to(actual, target_is_directory=True)
+
+        with patch("transcriber.TMP_DIR", target):
+            with pytest.raises(TranscriptionError, match="not a symlink"):
+                ensure_tmp_dir()
 
     def test_idempotent_when_dir_already_exists(self, tmp_path: Path) -> None:
         target = tmp_path / "media-summarizer"
@@ -121,7 +142,12 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
         usage = UsageStats()
 
-        await transcribe(mp3, duration_seconds=120, usage=usage)
+        await transcribe(
+            mp3,
+            duration_seconds=120,
+            usage=usage,
+            processing_mode="cloud_public",
+        )
 
         assert usage.openai_requests == 1
         assert usage.openai_audio_seconds == 120
@@ -138,6 +164,27 @@ class TestTranscribeFileCleanup:
         result = await transcribe(media, job_id="local-job", processing_mode="local")
 
         assert result.text == "Local transcript."
+        local.assert_awaited_once()
+        openai.assert_not_called()
+
+    async def test_nvidia_internal_mode_never_calls_openai(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        media = tmp_path / "internal.mp3"
+        media.write_bytes(b"audio")
+        local = mocker.patch(
+            "transcriber._transcribe_local",
+            new=AsyncMock(return_value=TranscriptionOutput(text="Internal transcript.")),
+        )
+        openai = mocker.patch("transcriber.AsyncOpenAI")
+
+        result = await transcribe(
+            media,
+            job_id="internal-job",
+            processing_mode="nvidia_internal",
+        )
+
+        assert result.text == "Internal transcript."
         local.assert_awaited_once()
         openai.assert_not_called()
 
@@ -159,7 +206,12 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.side_effect = api_call
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        await transcribe(mp3, duration_seconds=60, persist_usage=persist)
+        await transcribe(
+            mp3,
+            duration_seconds=60,
+            persist_usage=persist,
+            processing_mode="cloud_public",
+        )
 
         assert events == ["persist", "api"]
 
@@ -173,7 +225,7 @@ class TestTranscribeFileCleanup:
         mocker.patch.object(settings, "max_audio_duration_seconds", 60)
 
         with pytest.raises(UsageLimitError, match="duration"):
-            await transcribe(mp3, duration_seconds=120)
+            await transcribe(mp3, duration_seconds=120, processing_mode="cloud_public")
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -185,7 +237,7 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
         with pytest.raises(TranscriptionError, match="determine audio duration"):
-            await transcribe(mp3, duration_seconds=30)
+            await transcribe(mp3, duration_seconds=30, processing_mode="cloud_public")
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -199,7 +251,12 @@ class TestTranscribeFileCleanup:
         usage = UsageStats(openai_requests=settings.max_openai_requests_per_job)
 
         with pytest.raises(UsageLimitError, match="request limit"):
-            await transcribe(mp3, duration_seconds=60, usage=usage)
+            await transcribe(
+                mp3,
+                duration_seconds=60,
+                usage=usage,
+                processing_mode="cloud_public",
+            )
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -211,7 +268,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = "Transcript text."
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        await transcribe(mp3)
+        await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -230,7 +287,7 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
         with pytest.raises(TranscriptionError):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -246,7 +303,7 @@ class TestTranscribeFileCleanup:
 
         # RuntimeError bubbles up as-is (not wrapped) since it's not an API error
         with pytest.raises(Exception):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -266,7 +323,7 @@ class TestTranscribeFileCleanup:
         )
 
         with pytest.raises(TranscriptionError, match="ffmpeg"):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         # API should never have been called
         mock_client.audio.transcriptions.create.assert_not_called()
@@ -290,7 +347,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = "Compressed transcript."
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        result = await transcribe(mp3)
+        result = await transcribe(mp3, processing_mode="cloud_public")
 
         assert result.text == "Compressed transcript."
         mock_client.audio.transcriptions.create.assert_called_once()
@@ -313,7 +370,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = response
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        result = await transcribe(mp3)
+        result = await transcribe(mp3, processing_mode="cloud_public")
 
         assert result.segments[1].start_seconds == 4.2
         call = mock_client.audio.transcriptions.create.call_args.kwargs
@@ -324,4 +381,4 @@ class TestTranscribeFileCleanup:
         missing = tmp_path / "does-not-exist.mp3"
 
         with pytest.raises(TranscriptionError, match="not found"):
-            await transcribe(missing)
+            await transcribe(missing, processing_mode="cloud_public")

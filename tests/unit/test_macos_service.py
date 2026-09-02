@@ -30,6 +30,9 @@ def test_build_plist_uses_localhost_and_project_environment() -> None:
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] == {"SuccessfulExit": False}
     assert str(plist["EnvironmentVariables"]["PATH"]).startswith("/opt/homebrew/bin:")
+    assert plist["EnvironmentVariables"]["PROCESSING_MODE"] == "nvidia_internal"
+    assert plist["EnvironmentVariables"]["NOTION_ENABLED"] == "false"
+    assert plist["EnvironmentVariables"]["WEBHOOKS_ENABLED"] == "false"
     assert plist["Umask"] == 0o077
 
 

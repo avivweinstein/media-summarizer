@@ -19,7 +19,6 @@ import json
 import logging
 import logging.config
 import os
-import shutil
 import tomllib
 import uuid
 from collections.abc import AsyncGenerator, Iterator
@@ -34,7 +33,7 @@ from sse_starlette.sse import EventSourceResponse
 
 import job_queue
 from config import settings
-from exceptions import UnsupportedURLError
+from exceptions import TranscriptionError, UnsupportedURLError
 from library import ask_library, search_library
 from models import (
     BulkSummarizeRequest,
@@ -48,9 +47,10 @@ from models import (
     SummarizeRequest,
     SummarizeResponse,
 )
+from nvidia_inference import NvidiaInferenceError, verify_nvidia_model_access
 from pipeline import _notify_webhook, detect_source, expand_playlist
 from sources.upload import UPLOAD_EXTENSIONS, cleanup_upload, reconcile_uploads, upload_path
-from transcriber import ensure_tmp_dir
+from transcriber import ensure_tmp_dir, local_whisper_configuration
 from worker import job_worker
 
 logger = logging.getLogger(__name__)
@@ -83,17 +83,44 @@ def _single_instance_lock(path: Path = _INSTANCE_LOCK_PATH) -> Iterator[None]:
 
 
 def _obsidian_destinations_writable(vault_path: Path, retain_transcript: bool) -> bool:
+    vault_path = vault_path.resolve()
     destinations = [vault_path / "Generated" / "Summaries"]
     if retain_transcript:
         destinations.append(vault_path / "Generated" / "Transcripts")
 
     for destination in destinations:
+        current = vault_path
+        for part in destination.relative_to(vault_path).parts:
+            current /= part
+            if current.is_symlink() or (current.exists() and not current.is_dir()):
+                return False
         existing = destination
         while not existing.exists() and existing != vault_path:
             existing = existing.parent
         if not existing.is_dir() or not os.access(existing, os.W_OK | os.X_OK):
             return False
     return True
+
+
+async def _require_processing_ready() -> None:
+    """Reject NVIDIA-internal submissions unless every required provider is ready."""
+    if settings.processing_mode != "nvidia_internal":
+        return
+    try:
+        if not settings.obsidian_vault_path:
+            raise ValueError("OBSIDIAN_VAULT_PATH is required in NVIDIA internal mode.")
+        vault_path = Path(settings.obsidian_vault_path).expanduser()
+        if not vault_path.is_dir() or not (vault_path / ".obsidian").is_dir():
+            raise ValueError("OBSIDIAN_VAULT_PATH is not a valid Obsidian vault.")
+        if not _obsidian_destinations_writable(
+            vault_path,
+            settings.obsidian_retain_transcript,
+        ):
+            raise ValueError("The configured Obsidian vault is not writable.")
+        local_whisper_configuration()
+        await verify_nvidia_model_access()
+    except (NvidiaInferenceError, TranscriptionError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 def _configure_logging() -> None:
@@ -149,6 +176,8 @@ async def _create_and_enqueue(
     external_processing_approved: bool = False,
 ) -> Job:
     mode = processing_mode or settings.processing_mode
+    if mode in {"nvidia_internal", "local"}:
+        webhook_url = None
     job, created = await job_queue.create_or_get_job(
         url,
         webhook_url,
@@ -255,6 +284,7 @@ async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
     into individual jobs; the first job_id is returned.
     """
     _require_processing_approval(request.external_processing_approved)
+    await _require_processing_ready()
     url = request.url.strip()
     try:
         source_type = detect_source(url)
@@ -300,6 +330,7 @@ async def submit_upload(
 ) -> SummarizeResponse:
     """Persist and enqueue an upload after an explicit data-boundary acknowledgement."""
     _require_processing_approval(external_processing_approved)
+    await _require_processing_ready()
     url = await _persist_upload(file)
     try:
         job = await _create_and_enqueue(
@@ -318,6 +349,7 @@ async def submit_upload(
 async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
     """Submit multiple URLs at once. Each gets its own job."""
     _require_processing_approval(request.external_processing_approved)
+    await _require_processing_ready()
     job_ids: list[str] = []
     errors: list[str] = []
 
@@ -516,7 +548,22 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         errors.append("db")
 
     # AI provider checks
-    if settings.processing_mode == "local":
+    if settings.processing_mode == "nvidia_internal":
+        checks["anthropic"] = "disabled (NVIDIA internal mode)"
+        checks["openai"] = "disabled (NVIDIA internal mode)"
+        try:
+            await verify_nvidia_model_access()
+            checks["nvidia_inference"] = "ok"
+        except (NvidiaInferenceError, ValueError) as error:
+            checks["nvidia_inference"] = f"error: {error}"
+            errors.append("nvidia_inference")
+        try:
+            local_whisper_configuration()
+            checks["local_whisper"] = "ok"
+        except TranscriptionError as error:
+            checks["local_whisper"] = f"error: {error}"
+            errors.append("local_whisper")
+    elif settings.processing_mode == "local":
         checks["anthropic"] = "disabled (local mode)"
         checks["openai"] = "disabled (local mode)"
         try:
@@ -545,12 +592,11 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         except Exception as e:
             checks["ollama"] = f"error: {e}"
             errors.append("ollama")
-        local_whisper = shutil.which(settings.local_whisper_executable)
-        local_model = Path(settings.local_whisper_model).expanduser()
-        if local_whisper and local_model.is_file():
+        try:
+            local_whisper_configuration()
             checks["local_whisper"] = "ok"
-        else:
-            checks["local_whisper"] = "not configured"
+        except TranscriptionError as error:
+            checks["local_whisper"] = f"error: {error}"
             errors.append("local_whisper")
     elif settings.anthropic_api_key:
         try:
@@ -571,7 +617,7 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         errors.append("anthropic")
 
     # OpenAI API key check (just validates the key, no actual transcription)
-    if settings.processing_mode == "local":
+    if settings.processing_mode in {"local", "nvidia_internal"}:
         pass
     elif settings.openai_api_key:
         try:
@@ -605,8 +651,8 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["obsidian"] = "not configured"
 
     # Notion API key check
-    if settings.processing_mode == "local":
-        checks["notion"] = "disabled (local mode)"
+    if settings.processing_mode in {"local", "nvidia_internal"}:
+        checks["notion"] = f"disabled ({settings.processing_mode} mode)"
     elif not settings.notion_enabled:
         checks["notion"] = "disabled"
     elif settings.notion_api_key:
@@ -623,8 +669,14 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["notion"] = "not configured"
         errors.append("notion")
 
+    if settings.processing_mode in {"local", "nvidia_internal"}:
+        checks["webhooks"] = f"disabled ({settings.processing_mode} mode)"
+    else:
+        checks["webhooks"] = "enabled" if settings.webhooks_enabled else "disabled"
+
     if not settings.obsidian_vault_path and (
-        settings.processing_mode == "local" or not settings.notion_enabled
+        settings.processing_mode in {"local", "nvidia_internal"}
+        or not settings.notion_enabled
     ):
         checks["storage"] = "no destination configured"
         errors.append("storage")
@@ -647,18 +699,43 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
 async def dashboard() -> HTMLResponse:
     """Serve the job status dashboard."""
     html = (Path(__file__).parent / "static" / "index.html").read_text()
-    if settings.processing_mode == "local":
+    if settings.processing_mode == "nvidia_internal":
+        mode_label = "NVIDIA internal processing"
+        boundary_message = (
+            "NVIDIA internal processing: public URLs still contact their source sites; "
+            "transcription stays on this Mac and summaries use NVIDIA Inference Hub. "
+            "Notion, webhooks, Anthropic public, and OpenAI are disabled."
+        )
+        url_approval = ""
+        upload_approval = ""
+        summary_provider_label = "NVIDIA"
+    elif settings.processing_mode == "local":
         mode_label = "Local-only mode"
         boundary_message = (
             "Local-only mode: transcripts stay on this Mac; Anthropic, OpenAI, "
             "Notion, and webhooks are disabled."
         )
+        url_approval = ""
+        upload_approval = ""
+        summary_provider_label = "local"
     else:
         mode_label = "Cloud-public mode"
         boundary_message = (
             "Cloud-public mode: submit only public content or material explicitly "
             "approved for external AI processing."
         )
+        url_approval = (
+            '<label class="approval-label"><input type="checkbox" id="url-approved" /> '
+            "Public or approved for external AI</label>"
+        )
+        upload_approval = (
+            '<label class="approval-label"><input type="checkbox" id="upload-approved" /> '
+            "Public or approved</label>"
+        )
+        summary_provider_label = "Anthropic"
     html = html.replace("__PROCESSING_MODE_LABEL__", mode_label)
     html = html.replace("__DATA_BOUNDARY_MESSAGE__", boundary_message)
+    html = html.replace("__URL_APPROVAL_CONTROL__", url_approval)
+    html = html.replace("__UPLOAD_APPROVAL_CONTROL__", upload_approval)
+    html = html.replace("__SUMMARY_PROVIDER_LABEL__", summary_provider_label)
     return HTMLResponse(content=html)

@@ -214,3 +214,42 @@ async def test_title_cannot_escape_generated_directory(tmp_path: Path) -> None:
     assert relative_path.startswith("Generated/Summaries/")
     assert ".." not in Path(relative_path).name
     assert not (tmp_path / "escape--youtube-abc123.md").exists()
+
+
+async def test_generated_directory_symlink_cannot_escape_vault(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "Generated").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ObsidianError, match="must not contain symlinks"):
+        await save_to_obsidian(
+            _result(),
+            _summary(),
+            str(vault),
+            retain_transcript=True,
+            summary_model="nvidia-inference/test-model",
+        )
+
+    assert not list(outside.iterdir())
+
+
+async def test_existing_note_symlink_is_rejected(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    summary_dir = vault / "Generated" / "Summaries"
+    summary_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("do not touch")
+    target = summary_dir / f"{source_id(_result())}.md"
+    target.symlink_to(outside)
+
+    with pytest.raises(ObsidianError, match="Unsafe Obsidian note path"):
+        await save_to_obsidian(
+            _result(),
+            _summary(),
+            str(vault),
+            retain_transcript=False,
+            summary_model="nvidia-inference/test-model",
+        )
+
+    assert outside.read_text() == "do not touch"

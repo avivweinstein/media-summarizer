@@ -27,6 +27,7 @@ async def test_local_upload_archives_and_retrieves_without_cloud(
     (vault / "Attachments").mkdir()
     upload_dir = tmp_path / "uploads"
     monkeypatch.setattr(settings, "obsidian_vault_path", str(vault))
+    monkeypatch.setattr(settings, "processing_mode", "local")
     monkeypatch.setattr(settings, "obsidian_retain_transcript", True)
     monkeypatch.setattr(settings, "upload_dir", str(upload_dir))
     monkeypatch.setattr(settings, "notion_enabled", True)

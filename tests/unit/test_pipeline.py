@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -12,16 +12,32 @@ import pytest
 import job_queue
 from config import settings
 from exceptions import UsageLimitError
-from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
+from models import Job, JobStage, JobStatus, Summary, TranscriptResult, UsageStats
 from obsidian_writer import source_id
 from pipeline import _notify_webhook, run_job
 
 
 @pytest.fixture(autouse=True)
 def _configure_output_defaults(mocker: MagicMock) -> None:
+    create_job = job_queue.create_job
+    create_or_get_job = job_queue.create_or_get_job
+
+    async def create_cloud_job(*args: Any, **kwargs: Any) -> Job:
+        kwargs.setdefault("processing_mode", "cloud_public")
+        kwargs.setdefault("external_processing_approved", True)
+        return await create_job(*args, **kwargs)
+
+    async def create_or_get_cloud_job(*args: Any, **kwargs: Any) -> tuple[Job, bool]:
+        kwargs.setdefault("processing_mode", "cloud_public")
+        kwargs.setdefault("external_processing_approved", True)
+        return await create_or_get_job(*args, **kwargs)
+
+    mocker.patch.object(job_queue, "create_job", side_effect=create_cloud_job)
+    mocker.patch.object(job_queue, "create_or_get_job", side_effect=create_or_get_cloud_job)
     mocker.patch.object(settings, "notion_enabled", True)
     mocker.patch.object(settings, "obsidian_vault_path", "")
     mocker.patch.object(settings, "webhooks_enabled", True)
+    mocker.patch.object(settings, "processing_mode", "cloud_public")
 
 
 def _transcript() -> TranscriptResult:
@@ -376,19 +392,20 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.done
 
-    async def test_local_mode_never_publishes_to_notion(
-        self, db_path: str, mocker: MagicMock
+    @pytest.mark.parametrize("processing_mode", ["local", "nvidia_internal"])
+    async def test_private_modes_never_publish_to_notion(
+        self, processing_mode: str, db_path: str, mocker: MagicMock
     ) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
-            processing_mode="local",
+            processing_mode=processing_mode,
             external_processing_approved=False,
             db_path=db_path,
         )
         _mock_happy_path(mocker)
         summarize_mock = mocker.patch("pipeline.summarize", return_value=_summary())
         notion = mocker.patch("pipeline.save_to_notion")
-        mocker.patch.object(settings, "processing_mode", "cloud_public")
+        mocker.patch.object(settings, "processing_mode", processing_mode)
         mocker.patch.object(settings, "obsidian_vault_path", "/configured-vault")
         mocker.patch("pipeline._notify_webhook")
 
@@ -398,7 +415,7 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.done
         notion.assert_not_awaited()
-        assert summarize_mock.call_args.kwargs["processing_mode"] == "local"
+        assert summarize_mock.call_args.kwargs["processing_mode"] == processing_mode
 
     async def test_unapproved_cloud_job_fails_before_source_fetch(
         self, db_path: str, mocker: MagicMock
@@ -418,6 +435,31 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.failed
         assert result.error == "External AI processing was not approved for this job."
+        source.assert_not_called()
+        summarize_mock.assert_not_called()
+
+    @pytest.mark.parametrize("service_mode", ["nvidia_internal", "local"])
+    async def test_private_service_rejects_recovered_public_job(
+        self, service_mode: str, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            processing_mode="cloud_public",
+            external_processing_approved=True,
+            db_path=db_path,
+        )
+        mocker.patch.object(settings, "processing_mode", service_mode)
+        source = mocker.patch("pipeline.YouTubeSource")
+        summarize_mock = mocker.patch("pipeline.summarize")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.failed
+        assert result.error == (
+            f"Persisted job processing mode is disabled by {service_mode} mode."
+        )
         source.assert_not_called()
         summarize_mock.assert_not_called()
 
@@ -673,6 +715,22 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_nvidia_internal_mode_never_sends_webhook(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            processing_mode="nvidia_internal",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await _notify_webhook(job, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_local_mode_never_sends_webhook(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",

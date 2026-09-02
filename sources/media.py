@@ -137,7 +137,7 @@ class MediaSource:
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         hostname = (urlparse(url).hostname or "").casefold().removeprefix("www.")
         is_vimeo = hostname in {"vimeo.com", "player.vimeo.com"}
