@@ -20,9 +20,7 @@ def test_feed_identity_ignores_only_known_tracking_parameters() -> None:
 
 
 def test_apple_episode_is_static_but_show_is_dynamic() -> None:
-    episode = submission_identity(
-        "https://podcasts.apple.com/us/podcast/show/id123?i=456"
-    )
+    episode = submission_identity("https://podcasts.apple.com/us/podcast/show/id123?i=456")
     show = submission_identity("https://podcasts.apple.com/us/podcast/show/id123")
 
     assert episode == ("apple-podcast:123:episode:456", True)
@@ -31,3 +29,15 @@ def test_apple_episode_is_static_but_show_is_dynamic() -> None:
 
 def test_direct_audio_is_static() -> None:
     assert submission_identity("https://cdn.example.com/audio.mp3?token=abc")[1] is True
+
+
+def test_vimeo_variants_share_a_static_identity() -> None:
+    standard = submission_identity("https://www.vimeo.com/76979871")
+    player = submission_identity("https://player.vimeo.com/video/76979871")
+
+    assert standard == ("vimeo:76979871", True)
+    assert player == standard
+
+
+def test_direct_video_is_static() -> None:
+    assert submission_identity("https://cdn.example.com/talk.webm?token=abc")[1] is True

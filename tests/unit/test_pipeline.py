@@ -12,7 +12,7 @@ import job_queue
 from config import settings
 from exceptions import UsageLimitError
 from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
-from pipeline import run_job
+from pipeline import _notify_webhook, run_job
 
 
 @pytest.fixture(autouse=True)
@@ -47,10 +47,14 @@ def _mock_happy_path(mocker: MagicMock, source_type: str = "youtube") -> None:
     mocker.patch("pipeline.detect_source", return_value=source_type)
     mock_source = AsyncMock()
     mock_source.fetch.return_value = _transcript()
-    if source_type == "youtube":
-        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
-    else:
-        mocker.patch("pipeline.PodcastSource", return_value=mock_source)
+    source_classes = {
+        "youtube": "YouTubeSource",
+        "podcast": "PodcastSource",
+        "media": "MediaSource",
+        "article": "ArticleSource",
+        "upload": "UploadSource",
+    }
+    mocker.patch(f"pipeline.{source_classes[source_type]}", return_value=mock_source)
     mocker.patch("pipeline.summarize", return_value=_summary())
     mocker.patch("pipeline.save_to_notion", return_value="page-abc-123")
     mocker.patch(
@@ -81,7 +85,10 @@ class TestRetryLogic:
         self, db_path: str, mocker: MagicMock
     ) -> None:
         job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
+            "https://youtube.com/watch?v=abc123",
+            processing_mode="local",
+            external_processing_approved=False,
+            db_path=db_path,
         )
         job.status = JobStatus.processing
         job.stage = JobStage.saving_obsidian
@@ -114,9 +121,7 @@ class TestRetryLogic:
     async def test_interrupted_notion_save_is_not_replayed(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         job.status = JobStatus.processing
         job.stage = JobStage.saving_notion
         job.result = _transcript()
@@ -142,15 +147,11 @@ class TestRetryLogic:
     async def test_provider_usage_reservation_survives_worker_cancellation(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
 
-        async def reserve_then_cancel(
-            *_args: object, **kwargs: object
-        ) -> TranscriptResult:
+        async def reserve_then_cancel(*_args: object, **kwargs: object) -> TranscriptResult:
             usage = cast(UsageStats, kwargs["usage"])
             usage.openai_requests += 1
             persist = cast(
@@ -170,12 +171,106 @@ class TestRetryLogic:
         assert recovered is not None
         assert recovered.usage.openai_requests == 1
 
+    @pytest.mark.parametrize("cancel_point", ["fetch", "summarize"])
+    async def test_database_cancellation_during_work_is_not_resurrected(
+        self,
+        cancel_point: str,
+        db_path: str,
+        mocker: MagicMock,
+    ) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        source = AsyncMock()
+
+        async def cancel_job() -> None:
+            current = await job_queue.get_job(job.job_id, db_path=db_path)
+            assert current is not None
+            current.status = JobStatus.cancelled
+            await job_queue.update_job(current, db_path=db_path)
+
+        async def fetch(*_args: object, **_kwargs: object) -> TranscriptResult:
+            if cancel_point == "fetch":
+                await cancel_job()
+            return _transcript()
+
+        async def summarize_result(*_args: object, **_kwargs: object) -> Summary:
+            if cancel_point == "summarize":
+                await cancel_job()
+            return _summary()
+
+        source.fetch.side_effect = fetch
+        mocker.patch("pipeline.YouTubeSource", return_value=source)
+        summary_call = mocker.patch("pipeline.summarize", side_effect=summarize_result)
+        notion = mocker.patch("pipeline.save_to_notion")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.cancelled
+        notion.assert_not_called()
+        if cancel_point == "fetch":
+            summary_call.assert_not_called()
+
+    @pytest.mark.parametrize("cancel_point", ["obsidian", "notion"])
+    async def test_cancellation_during_output_is_not_resurrected_or_notified(
+        self,
+        cancel_point: str,
+        db_path: str,
+        mocker: MagicMock,
+    ) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
+        _mock_happy_path(mocker)
+        webhook = mocker.patch("pipeline._notify_webhook")
+
+        async def cancel_job() -> None:
+            current = await job_queue.get_job(job.job_id, db_path=db_path)
+            assert current is not None
+            current.status = JobStatus.cancelled
+            await job_queue.update_job(current, db_path=db_path)
+
+        async def save_obsidian(*_args: object, **_kwargs: object) -> str:
+            await cancel_job()
+            return "Generated/Summaries/youtube-test.md"
+
+        async def save_notion(*_args: object, **_kwargs: object) -> str:
+            await cancel_job()
+            return "created-before-cancellation-was-observed"
+
+        if cancel_point == "obsidian":
+            mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+            mocker.patch("pipeline.save_to_obsidian", side_effect=save_obsidian)
+            notion = mocker.patch("pipeline.save_to_notion")
+        else:
+            mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+            notion = mocker.patch("pipeline.save_to_notion", side_effect=save_notion)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.cancelled
+        webhook.assert_not_called()
+        if cancel_point == "obsidian":
+            assert result.obsidian_note_path == "Generated/Summaries/youtube-test.md"
+            notion.assert_not_called()
+        else:
+            assert result.notion_page_id == "created-before-cancellation-was-observed"
+
+            retry = await job_queue.create_job(
+                "https://youtube.com/watch?v=abc123", db_path=db_path
+            )
+            await run_job(retry.job_id, db_path=db_path)
+            retried = await job_queue.get_job(retry.job_id, db_path=db_path)
+            assert retried is not None
+            assert retried.status == JobStatus.done
+            assert retried.notion_page_id == "created-before-cancellation-was-observed"
+            assert notion.await_count == 1
+
     async def test_usage_limit_failure_is_not_retried(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         summarize_mock = mocker.patch(
             "pipeline.summarize",
@@ -193,12 +288,8 @@ class TestRetryLogic:
         summarize_mock.assert_awaited_once()
         sleep_mock.assert_not_called()
 
-    async def test_succeeds_on_first_attempt(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+    async def test_succeeds_on_first_attempt(self, db_path: str, mocker: MagicMock) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         mocker.patch("pipeline._notify_webhook")
 
@@ -209,12 +300,69 @@ class TestRetryLogic:
         assert result.status == JobStatus.done
         assert result.retry_count == 0
 
-    async def test_retries_on_transient_failure_and_succeeds(
+    @pytest.mark.parametrize("source_type", ["article", "media", "upload"])
+    async def test_routes_additional_sources(
+        self, source_type: str, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job("https://example.com/item", db_path=db_path)
+        _mock_happy_path(mocker, source_type)
+        mocker.patch("pipeline._notify_webhook")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+
+    async def test_local_mode_never_publishes_to_notion(
         self, db_path: str, mocker: MagicMock
     ) -> None:
         job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
+            "https://youtube.com/watch?v=abc123",
+            processing_mode="local",
+            external_processing_approved=False,
+            db_path=db_path,
         )
+        _mock_happy_path(mocker)
+        summarize_mock = mocker.patch("pipeline.summarize", return_value=_summary())
+        notion = mocker.patch("pipeline.save_to_notion")
+        mocker.patch.object(settings, "processing_mode", "cloud_public")
+        mocker.patch.object(settings, "obsidian_vault_path", "/configured-vault")
+        mocker.patch("pipeline._notify_webhook")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+        notion.assert_not_awaited()
+        assert summarize_mock.call_args.kwargs["processing_mode"] == "local"
+
+    async def test_unapproved_cloud_job_fails_before_source_fetch(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            processing_mode="cloud_public",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        source = mocker.patch("pipeline.YouTubeSource")
+        summarize_mock = mocker.patch("pipeline.summarize")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.failed
+        assert result.error == "External AI processing was not approved for this job."
+        source.assert_not_called()
+        summarize_mock.assert_not_called()
+
+    async def test_retries_on_transient_failure_and_succeeds(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
         mock_source.fetch.side_effect = [RuntimeError("transient"), _transcript()]
@@ -231,12 +379,8 @@ class TestRetryLogic:
         assert result.status == JobStatus.done
         assert result.retry_count == 1  # second attempt (0-indexed)
 
-    async def test_exhausted_retries_marks_failed(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+    async def test_exhausted_retries_marks_failed(self, db_path: str, mocker: MagicMock) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
         mock_source.fetch.side_effect = RuntimeError("always fails")
@@ -254,9 +398,7 @@ class TestRetryLogic:
     async def test_error_message_is_from_last_attempt(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
         mock_source.fetch.side_effect = [
@@ -274,12 +416,8 @@ class TestRetryLogic:
         assert result is not None
         assert result.error == "final error"
 
-    async def test_retry_uses_increasing_backoff(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+    async def test_retry_uses_increasing_backoff(self, db_path: str, mocker: MagicMock) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
         mock_source.fetch.side_effect = RuntimeError("fail")
@@ -294,9 +432,31 @@ class TestRetryLogic:
         times = [call.args[0] for call in sleep_mock.call_args_list]
         assert times[0] < times[1]  # backoff increases
 
-    async def test_missing_job_returns_without_error(
-        self, db_path: str
+    async def test_cancellation_during_backoff_stops_retry(
+        self, db_path: str, mocker: MagicMock
     ) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mock_source = AsyncMock()
+        mock_source.fetch.side_effect = RuntimeError("retry me")
+        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
+
+        async def cancel_during_sleep(_seconds: int) -> None:
+            fresh = await job_queue.get_job(job.job_id, db_path=db_path)
+            assert fresh is not None
+            fresh.status = JobStatus.cancelled
+            await job_queue.update_job(fresh, db_path=db_path)
+
+        mocker.patch("pipeline.asyncio.sleep", side_effect=cancel_during_sleep)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        assert mock_source.fetch.await_count == 1
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.cancelled
+
+    async def test_missing_job_returns_without_error(self, db_path: str) -> None:
         await run_job("nonexistent-id", db_path=db_path)
 
 
@@ -304,9 +464,7 @@ class TestOutputRouting:
     async def test_usage_is_accumulated_and_persisted(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         mocker.patch("pipeline.detect_source", return_value="youtube")
         mock_source = AsyncMock()
 
@@ -346,16 +504,10 @@ class TestOutputRouting:
         assert result.usage.anthropic_requests == 1
         assert result.usage.anthropic_input_tokens == 100
         assert result.usage.estimated_cost_usd == pytest.approx(0.007)
-        assert obsidian.call_args.kwargs["usage"].estimated_cost_usd == pytest.approx(
-            0.007
-        )
+        assert obsidian.call_args.kwargs["usage"].estimated_cost_usd == pytest.approx(0.007)
 
-    async def test_obsidian_can_be_the_only_output(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+    async def test_obsidian_can_be_the_only_output(self, db_path: str, mocker: MagicMock) -> None:
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         mocker.patch("pipeline._notify_webhook")
         mock_settings = mocker.patch("pipeline.settings")
@@ -376,9 +528,7 @@ class TestOutputRouting:
     async def test_notion_failure_is_non_blocking_after_obsidian_success(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         mocker.patch("pipeline._notify_webhook")
         mock_settings = mocker.patch("pipeline.settings")
@@ -397,12 +547,33 @@ class TestOutputRouting:
         assert result.notion_page_id is None
         assert result.notion_error == "Notion unavailable"
 
+    async def test_existing_notion_page_for_same_obsidian_note_is_reused(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        prior = await job_queue.create_job("https://example.com/article", db_path=db_path)
+        prior.status = JobStatus.done
+        prior.obsidian_note_path = "Generated/Summaries/youtube-test.md"
+        prior.notion_page_id = "existing-notion-page"
+        await job_queue.update_job(prior, db_path=db_path)
+        job = await job_queue.create_job("https://example.com/article", db_path=db_path)
+        _mock_happy_path(mocker, "article")
+        notion = mocker.patch("pipeline.save_to_notion")
+        mocker.patch("pipeline._notify_webhook")
+        mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+        mocker.patch.object(settings, "notion_enabled", True)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+        assert result.notion_page_id == "existing-notion-page"
+        notion.assert_not_called()
+
     async def test_job_fails_when_no_output_is_configured(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         mocker.patch("pipeline._notify_webhook")
         mocker.patch("pipeline.asyncio.sleep")
@@ -421,9 +592,7 @@ class TestOutputRouting:
     async def test_notion_only_failure_preserves_original_error(
         self, db_path: str, mocker: MagicMock
     ) -> None:
-        job = await job_queue.create_job(
-            "https://youtube.com/watch?v=abc123", db_path=db_path
-        )
+        job = await job_queue.create_job("https://youtube.com/watch?v=abc123", db_path=db_path)
         _mock_happy_path(mocker)
         mocker.patch("pipeline._notify_webhook")
         mocker.patch("pipeline.asyncio.sleep")
@@ -442,6 +611,20 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_local_mode_never_sends_webhook(self, db_path: str, mocker: MagicMock) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            processing_mode="local",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await _notify_webhook(job, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_webhook_disabled_skips_configured_url(
         self, db_path: str, mocker: MagicMock
     ) -> None:
@@ -458,9 +641,7 @@ class TestWebhookNotifications:
 
         http_patch.assert_not_called()
 
-    async def test_webhook_fired_on_success(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
+    async def test_webhook_fired_on_success(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
             webhook_url="https://hooks.example.com/cb",
@@ -528,9 +709,7 @@ class TestWebhookNotifications:
             "https://hooks.example.com/second",
         ]
 
-    async def test_webhook_fired_on_final_failure(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
+    async def test_webhook_fired_on_final_failure(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
             webhook_url="https://hooks.example.com/cb",
@@ -547,9 +726,7 @@ class TestWebhookNotifications:
         assert payload["status"] == "failed"
         assert "boom" in str(payload["error"])
 
-    async def test_no_webhook_when_no_url_configured(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
+    async def test_no_webhook_when_no_url_configured(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
             webhook_url=None,
@@ -565,9 +742,7 @@ class TestWebhookNotifications:
 
         http_patch.assert_not_called()
 
-    async def test_webhook_failure_does_not_fail_job(
-        self, db_path: str, mocker: MagicMock
-    ) -> None:
+    async def test_webhook_failure_does_not_fail_job(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",
             webhook_url="https://hooks.example.com/cb",

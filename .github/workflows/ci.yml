@@ -29,3 +29,6 @@ jobs:
 
       - name: Unit tests
         run: uv run pytest -m "not integration"
+
+      - name: Credential-free integration test
+        run: uv run pytest -m integration tests/integration/test_local_archive.py

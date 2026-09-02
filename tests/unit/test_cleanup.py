@@ -7,6 +7,7 @@ Covers:
   - transcribe() deletes the file even when transcription raises
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,11 +16,45 @@ import pytest
 
 from config import settings
 from exceptions import TranscriptionError, UsageLimitError
-from models import UsageStats
-from transcriber import ensure_tmp_dir, transcribe
+from models import TranscriptionOutput, UsageStats
+from transcriber import _communicate_with_timeout, ensure_tmp_dir, tmp_path_for_job, transcribe
+
+
+class TestSubprocessCleanup:
+    async def test_timeout_terminates_process(self) -> None:
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=TimeoutError)
+        process.wait = AsyncMock(return_value=0)
+
+        with pytest.raises(TranscriptionError, match="configured 1-second timeout"):
+            await _communicate_with_timeout(process, 1, "Local Whisper")
+
+        process.terminate.assert_called_once()
+        process.wait.assert_awaited_once()
+
+    async def test_cancellation_terminates_process(self) -> None:
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+        process.wait = AsyncMock(return_value=0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _communicate_with_timeout(process, 1, "Local Whisper")
+
+        process.terminate.assert_called_once()
 
 
 class TestEnsureTmpDir:
+    def test_job_path_creates_missing_temp_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "missing" / "media-summarizer"
+
+        with patch("transcriber.TMP_DIR", target):
+            path = tmp_path_for_job("job")
+
+        assert target.is_dir()
+        assert path == target / "job.mp3"
+
     def test_creates_directory_if_missing(self, tmp_path: Path) -> None:
         target = tmp_path / "media-summarizer"
         assert not target.exists()
@@ -91,6 +126,20 @@ class TestTranscribeFileCleanup:
         assert usage.openai_requests == 1
         assert usage.openai_audio_seconds == 120
         assert usage.estimated_cost_usd == pytest.approx(0.012)
+
+    async def test_local_mode_never_calls_openai(self, tmp_path: Path, mocker: MagicMock) -> None:
+        media = tmp_path / "local.mp3"
+        media.write_bytes(b"audio")
+        local = mocker.patch(
+            "transcriber._transcribe_local",
+            new=AsyncMock(return_value=TranscriptionOutput(text="Local transcript.")),
+        )
+        openai = mocker.patch("transcriber.AsyncOpenAI")
+        result = await transcribe(media, job_id="local-job", processing_mode="local")
+
+        assert result.text == "Local transcript."
+        local.assert_awaited_once()
+        openai.assert_not_called()
 
     async def test_persists_reservation_before_openai_call(
         self, tmp_path: Path, mocker: MagicMock

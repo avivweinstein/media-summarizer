@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -17,16 +19,24 @@ class Settings(BaseSettings):
     youtube_api_key: str = ""
     openclaw_webhook_url: str = ""
     webhooks_enabled: bool = False
-    library_qa_provider: str = "extractive"
+    library_qa_provider: Literal["extractive", "ollama"] = "extractive"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.2:3b"
+    processing_mode: Literal["cloud_public", "local"] = "cloud_public"
+    upload_dir: str = "~/Library/Application Support/media-summarizer/uploads"
+    local_whisper_executable: str = "whisper-cli"
+    local_whisper_model: str = ""
+    local_ffmpeg_timeout_seconds: int = Field(default=600, gt=0)
+    local_whisper_timeout_seconds: int = Field(default=14_400, gt=0)
     port: int = 8000
     summary_chunk_chars: int = Field(default=60_000, gt=0)
     max_transcript_chars: int = Field(default=600_000, gt=0)
     max_anthropic_requests_per_job: int = Field(default=12, gt=0)
+    max_local_summary_requests_per_job: int = Field(default=12, gt=0)
     max_openai_requests_per_job: int = Field(default=3, gt=0)
     max_audio_duration_seconds: int = Field(default=14_400, gt=0)
     max_audio_download_bytes: int = Field(default=500_000_000, gt=0)
+    max_article_download_bytes: int = Field(default=5_000_000, gt=0)
     max_estimated_cost_usd: float = Field(default=2.0, gt=0)
     anthropic_input_cost_per_million_usd: float = Field(default=3.0, ge=0)
     anthropic_output_cost_per_million_usd: float = Field(default=15.0, ge=0)

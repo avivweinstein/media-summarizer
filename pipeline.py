@@ -19,16 +19,20 @@ from exceptions import UnsupportedURLError, UsageLimitError
 from models import Job, JobStage, JobStatus, TranscriptResult, UsageStats
 from notion_writer import save_to_notion
 from obsidian_writer import save_to_obsidian
+from sources.article import ArticleSource
+from sources.media import MediaSource
 from sources.podcast import PodcastSource
+from sources.upload import UploadSource, cleanup_upload
 from sources.youtube import YouTubeSource
-from summarizer import MODEL as SUMMARY_MODEL
-from summarizer import summarize
+from summarizer import summarize, summary_model_name
 
 logger = logging.getLogger(__name__)
 
 _YOUTUBE_HOSTNAMES = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 _SPOTIFY_HOSTNAMES = {"open.spotify.com"}
 _APPLE_HOSTNAMES = {"podcasts.apple.com"}
+_MEDIA_HOSTNAMES = {"vimeo.com", "player.vimeo.com"}
+_MEDIA_EXTENSIONS = {".m4a", ".mov", ".mp4", ".wav", ".webm"}
 _UNSUPPORTED_MEDIA_HOSTNAMES = {
     "soundcloud.com",
     "twitter.com",
@@ -44,6 +48,9 @@ def detect_source(url: str) -> str:
     parsed = urlparse(url.strip())
     hostname = (parsed.hostname or "").lower().lstrip("www.")
 
+    if parsed.scheme == "upload":
+        return "upload"
+
     if hostname in {"youtube.com", "youtu.be", "m.youtube.com"}:
         qs = parse_qs(parsed.query or "")
         # Playlist URL: has 'list' param but no 'v' param, or is /playlist path
@@ -54,17 +61,20 @@ def detect_source(url: str) -> str:
         is_watch = "watch" in parsed.path or parsed.hostname == "youtu.be"
         has_v = "v" in qs
         if not (is_watch or has_v):
-            raise UnsupportedURLError(
-                "Only YouTube video URLs or playlist URLs are supported."
-            )
+            raise UnsupportedURLError("Only YouTube video URLs or playlist URLs are supported.")
         return "youtube"
 
     if hostname == "open.spotify.com":
         raise UnsupportedURLError(
-            "Spotify is not currently supported. Try a YouTube URL or a direct podcast RSS/MP3 URL."
+            "Spotify does not expose a reliable canonical RSS mapping. Paste the show's RSS, "
+            "Apple Podcasts, or direct episode URL instead."
         )
 
-    if hostname == "podcasts.apple.com" or parsed.path.lower().endswith(".mp3"):
+    lower_path = parsed.path.lower()
+    if hostname in _MEDIA_HOSTNAMES or any(lower_path.endswith(ext) for ext in _MEDIA_EXTENSIONS):
+        return "media"
+
+    if hostname == "podcasts.apple.com" or lower_path.endswith(".mp3"):
         return "podcast"
 
     if parsed.scheme in {"http", "https"} and hostname:
@@ -73,9 +83,7 @@ def detect_source(url: str) -> str:
                 "This media host is not currently supported. Try YouTube, Apple Podcasts, "
                 "a podcast RSS URL, or a direct MP3 URL."
             )
-        # Opaque RSS URLs often have no feed-like hostname, extension, or path.
-        # PodcastSource performs the bounded fetch and verifies feed contents.
-        return "podcast"
+        return "article"
 
     raise UnsupportedURLError(
         "Unsupported source. Supported: YouTube (video or playlist), "
@@ -123,7 +131,7 @@ async def _notify_webhook(
     settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
-    if not settings.webhooks_enabled:
+    if job.processing_mode == "local" or not settings.webhooks_enabled:
         return
     if urls is None:
         fresh = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -186,13 +194,13 @@ async def _notify_webhook(
 async def _check_cancelled(job: Job, db_path: str) -> bool:
     """Re-read job from DB and return True if it's been cancelled."""
     fresh = await job_queue.get_job(job.job_id, db_path=db_path)
-    return fresh is not None and fresh.status == JobStatus.cancelled
+    return fresh is None or fresh.status == JobStatus.cancelled
 
 
-async def _set_stage(job: Job, stage: JobStage, db_path: str) -> None:
+async def _set_stage(job: Job, stage: JobStage, db_path: str) -> bool:
     """Update the job's stage and persist it."""
     job.stage = stage
-    await job_queue.update_job(job, db_path=db_path)
+    return await job_queue.update_job(job, db_path=db_path)
 
 
 async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
@@ -211,6 +219,19 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     interrupted_stage = job.stage if job.interrupted else None
     job.interrupted = False
 
+    if job.processing_mode not in {"cloud_public", "local"}:
+        job.status = JobStatus.failed
+        job.stage = JobStage.failed
+        job.error = "Job has an invalid persisted processing mode."
+        await job_queue.update_job(job, db_path=db_path)
+        return
+    if job.processing_mode == "cloud_public" and not job.external_processing_approved:
+        job.status = JobStatus.failed
+        job.stage = JobStage.failed
+        job.error = "External AI processing was not approved for this job."
+        await job_queue.update_job(job, db_path=db_path)
+        return
+
     async def persist_usage(_usage: UsageStats) -> None:
         await job_queue.update_usage(job.job_id, job.usage, db_path=db_path)
 
@@ -223,16 +244,24 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             backoff = _BACKOFF_SECONDS[attempt - 1]
             logger.warning(
                 "%s event=job_retry attempt=%d/%d backoff=%ds",
-                log, attempt + 1, MAX_RETRIES, backoff,
+                log,
+                attempt + 1,
+                MAX_RETRIES,
+                backoff,
             )
             await asyncio.sleep(backoff)
+            if await _check_cancelled(job, db_path):
+                logger.info("job_id=%s event=job_cancelled_during_backoff", job.job_id)
+                return
 
         job.status = JobStatus.processing
         job.retry_count = attempt
         if job.result is None:
-            await _set_stage(job, JobStage.detecting, db_path)
+            if not await _set_stage(job, JobStage.detecting, db_path):
+                return
         else:
-            await job_queue.update_job(job, db_path=db_path)
+            if not await job_queue.update_job(job, db_path=db_path):
+                return
 
         try:
             source_type = detect_source(job.url)
@@ -248,7 +277,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                 logger.info("%s event=transcript_reused_after_restart", log)
             else:
                 # --- Transcription stage ---
-                await _set_stage(job, JobStage.transcribing, db_path)
+                if not await _set_stage(job, JobStage.transcribing, db_path):
+                    return
                 if source_type == "youtube":
                     source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
                     result = await source.fetch(
@@ -256,17 +286,47 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
-                else:
+                elif source_type == "podcast":
                     result = await PodcastSource().fetch(
                         job.url,
                         job_id=job.job_id,
                         usage=job.usage,
                         persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
+                    )
+                elif source_type == "media":
+                    result = await MediaSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
+                    )
+                elif source_type == "article":
+                    result = await ArticleSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
+                    )
+                else:
+                    result = await UploadSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                        processing_mode=job.processing_mode,
                     )
 
                 job.result = result
-                await job_queue.update_job(job, db_path=db_path)
+                if not await job_queue.update_job(job, db_path=db_path):
+                    cleanup_upload(job.url)
+                    return
+
+            cleanup_upload(job.url)
 
             if await _check_cancelled(job, db_path):
                 return
@@ -276,15 +336,18 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                 logger.info("%s event=summary_reused_after_restart", log)
             else:
                 # --- Summarization stage ---
-                await _set_stage(job, JobStage.summarizing, db_path)
+                if not await _set_stage(job, JobStage.summarizing, db_path):
+                    return
                 summary = await summarize(
                     result,
                     job_id=job.job_id,
                     usage=job.usage,
                     persist_usage=persist_usage,
+                    processing_mode=job.processing_mode,
                 )
                 job.summary = summary
-                await job_queue.update_job(job, db_path=db_path)
+                if not await job_queue.update_job(job, db_path=db_path):
+                    return
 
             if await _check_cancelled(job, db_path):
                 return
@@ -293,20 +356,48 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             output_saved = bool(job.obsidian_note_path or job.notion_page_id)
             notion_failure: Exception | None = None
             if settings.obsidian_vault_path and not job.obsidian_note_path:
-                await _set_stage(job, JobStage.saving_obsidian, db_path)
+                if not await _set_stage(job, JobStage.saving_obsidian, db_path):
+                    return
                 job.obsidian_note_path = await save_to_obsidian(
                     result,
                     summary,
                     settings.obsidian_vault_path,
                     retain_transcript=settings.obsidian_retain_transcript,
-                    summary_model=SUMMARY_MODEL,
+                    summary_model=summary_model_name(job.processing_mode),
                     added_at=job.created_at,
                     usage=job.usage,
                 )
                 output_saved = True
+                await job_queue.update_output_paths(
+                    job.job_id,
+                    obsidian_note_path=job.obsidian_note_path,
+                    notion_page_id=job.notion_page_id,
+                    notion_error=job.notion_error,
+                    db_path=db_path,
+                )
 
-            if settings.notion_enabled and not job.notion_page_id:
-                if interrupted_stage == JobStage.saving_notion:
+            if await _check_cancelled(job, db_path):
+                return
+
+            if (
+                job.processing_mode != "local"
+                and settings.notion_enabled
+                and not job.notion_page_id
+            ):
+                prior_notion_page = (
+                    await job_queue.find_notion_page_for_obsidian_note(
+                        job.obsidian_note_path,
+                        exclude_job_id=job.job_id,
+                        db_path=db_path,
+                    )
+                    if job.obsidian_note_path
+                    else None
+                )
+                if prior_notion_page:
+                    job.notion_page_id = prior_notion_page
+                    output_saved = True
+                    logger.info("%s event=notion_page_reused", log)
+                elif interrupted_stage == JobStage.saving_notion:
                     job.notion_error = (
                         "Notion save was interrupted and was not replayed to avoid "
                         "creating a duplicate page."
@@ -316,13 +407,21 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         log,
                     )
                 else:
-                    await _set_stage(job, JobStage.saving_notion, db_path)
+                    if not await _set_stage(job, JobStage.saving_notion, db_path):
+                        return
                     try:
                         job.notion_page_id = await save_to_notion(
                             result, summary, job_id=job.job_id
                         )
                         job.notion_error = None
                         output_saved = True
+                        await job_queue.update_output_paths(
+                            job.job_id,
+                            obsidian_note_path=job.obsidian_note_path,
+                            notion_page_id=job.notion_page_id,
+                            notion_error=None,
+                            db_path=db_path,
+                        )
                     except Exception as notion_error:
                         notion_failure = notion_error
                         job.notion_error = str(notion_error)
@@ -332,6 +431,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                             job.notion_error,
                         )
 
+            if await _check_cancelled(job, db_path):
+                return
+
             if not output_saved:
                 if notion_failure is not None:
                     raise notion_failure
@@ -339,8 +441,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
             job.status = JobStatus.done
             job.stage = JobStage.done
+            if not await job_queue.update_job(job, db_path=db_path):
+                return
             logger.info("%s event=job_completed title=%r", log, result.title)
-            await job_queue.update_job(job, db_path=db_path)
             await _notify_webhook(job, db_path=db_path)
             return
 
@@ -352,12 +455,16 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             last_error = str(e)
             logger.error(
                 "%s event=attempt_failed attempt=%d/%d error=%r",
-                log, attempt + 1, MAX_RETRIES, last_error,
+                log,
+                attempt + 1,
+                MAX_RETRIES,
+                last_error,
             )
 
     job.status = JobStatus.failed
     job.stage = JobStage.failed
     job.error = last_error
-    logger.error("%s event=job_failed_final error=%r", log, last_error)
-    await job_queue.update_job(job, db_path=db_path)
-    await _notify_webhook(job, db_path=db_path)
+    if await job_queue.update_job(job, db_path=db_path):
+        logger.error("%s event=job_failed_final error=%r", log, last_error)
+        cleanup_upload(job.url)
+        await _notify_webhook(job, db_path=db_path)

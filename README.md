@@ -1,12 +1,13 @@
 # Media Summarizer
 
-A personal media intelligence pipeline. Send YouTube or podcast URLs via the web UI or HTTP API, and get structured AI summaries archived in Obsidian with optional Notion publishing.
+A personal media intelligence pipeline. Submit videos, podcasts, articles, newsletters, or local files and get structured summaries archived in Obsidian with optional Notion publishing.
 
 ## Features
 
 - **YouTube videos** — native transcript or automatic Whisper fallback when no transcript is available
 - **YouTube playlists** — auto-expands into individual video jobs
 - **Podcasts** — Apple Podcasts, RSS feeds, direct MP3 URLs
+- **More sources** — Vimeo, direct audio/video, web articles, newsletters, and local uploads
 - **AI summaries** — Claude generates TL;DR, key points, tags, and "worth rewatching" rating
 - **Obsidian archive** — durable local Markdown summaries with optional full transcripts
 - **Notion integration** — optionally publish each summary to a Notion database
@@ -73,11 +74,18 @@ The vault must already contain an `.obsidian` directory. Generated content is
 written only beneath `Generated/Summaries` and `Generated/Transcripts`; existing
 notes are never replaced.
 
-> **Data boundary:** the current pipeline sends transcripts to Anthropic for
-> summarization and may send downloaded audio to OpenAI for transcription. Use it
-> only for public or otherwise approved media. Do not submit confidential,
-> internal, restricted, or regulated material until an approved local-provider
-> mode is implemented. Notion is an additional external destination when enabled.
+> **Data boundary:** `cloud_public` mode sends transcripts to Anthropic and may
+> send downloaded audio to OpenAI. Every submission must explicitly confirm that
+> the content is public or approved for external AI. Never approve confidential,
+> internal, restricted, or regulated material in that mode. Notion is another
+> external destination when enabled.
+
+For local processing, set `PROCESSING_MODE=local`, run Ollama on a loopback
+address, and configure a local whisper.cpp executable/model. In local mode the
+pipeline does not call Anthropic or OpenAI, and Notion/webhooks are disabled.
+Deep health verifies the local providers. Spotify links remain unsupported
+because Spotify does not provide a reliable canonical RSS mapping; submit the
+show RSS or another exact episode URL instead.
 
 ### 6. Set up Notion (optional)
 
@@ -293,7 +301,8 @@ If you don't want Tailscale, you can bind to `0.0.0.0` to listen on all network 
 
 | Method   | Path               | Description                                           |
 |----------|--------------------|-------------------------------------------------------|
-| `POST`   | `/summarize`       | Submit a URL (video, podcast, or playlist) -> `{ job_id }` |
+| `POST`   | `/summarize`       | Submit a video, podcast, article, RSS, or playlist URL -> `{ job_id }` |
+| `POST`   | `/summarize/upload` | Upload txt, Markdown, audio, or video -> `{ job_id }` |
 | `POST`   | `/summarize/bulk`  | Submit multiple URLs -> `{ job_ids }` |
 | `GET`    | `/job/{job_id}`    | Check job status, result, and summary                 |
 | `GET`    | `/jobs`            | List last 50 jobs                                     |
@@ -311,7 +320,7 @@ If you don't want Tailscale, you can bind to `0.0.0.0` to listen on all network 
 # Submit a single video
 curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "external_processing_approved": true}'
 
 # Submit a playlist (auto-expands into individual jobs)
 curl -X POST http://localhost:8000/summarize \
@@ -398,6 +407,14 @@ Copy `.env.example` to `.env` and fill in:
 |-----------------------------|----------|-------------------------------------------------|-----------------|
 | `ANTHROPIC_API_KEY`         | Yes      | Claude API key for summarization                | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
 | `OPENAI_API_KEY`            | Yes      | OpenAI key for Whisper transcription            | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `PROCESSING_MODE`           | No       | `cloud_public` (default) or fully local providers | — |
+| `OLLAMA_BASE_URL`           | Local mode | Loopback Ollama URL (default: `http://127.0.0.1:11434`) | — |
+| `OLLAMA_MODEL`              | Local mode | Installed Ollama model name                    | — |
+| `LOCAL_WHISPER_EXECUTABLE`  | Local audio/video | whisper.cpp executable (default: `whisper-cli`) | — |
+| `LOCAL_WHISPER_MODEL`       | Local audio/video | Absolute path to a local whisper.cpp model     | — |
+| `LOCAL_FFMPEG_TIMEOUT_SECONDS` | No | Maximum local media-conversion runtime (default: 600) | — |
+| `LOCAL_WHISPER_TIMEOUT_SECONDS` | No | Maximum local transcription runtime (default: 14400) | — |
+| `UPLOAD_DIR`                | No       | Private crash-recovery storage for pending uploads | — |
 | `OBSIDIAN_VAULT_PATH`       | No       | Local canonical archive; must contain `.obsidian` | Your vault folder |
 | `OBSIDIAN_RETAIN_TRANSCRIPT` | No      | Save full transcripts to Obsidian (default: true) | — |
 | `NOTION_ENABLED`            | No       | Enable optional Notion publishing (default: false) | — |
@@ -415,6 +432,8 @@ Copy `.env.example` to `.env` and fill in:
 | `MAX_OPENAI_REQUESTS_PER_JOB` | No     | OpenAI request cap including retries (default: 3) | — |
 | `MAX_AUDIO_DURATION_SECONDS` | No      | Audio duration cap (default: 14,400 / 4 hours)  | — |
 | `MAX_AUDIO_DOWNLOAD_BYTES`  | No       | Download-size cap (default: 500 MB)             | — |
+| `MAX_ARTICLE_DOWNLOAD_BYTES` | No      | Article response-size cap (default: 5 MB)       | — |
+| `MAX_LOCAL_SUMMARY_REQUESTS_PER_JOB` | No | Local chunk/synthesis request cap (default: 12) | — |
 | `MAX_ESTIMATED_COST_USD`    | No       | Combined estimated API spend cap per job (default: $2) | — |
 | `ANTHROPIC_INPUT_COST_PER_MILLION_USD` | No | Claude input-token estimate rate (default: $3) | Anthropic pricing |
 | `ANTHROPIC_OUTPUT_COST_PER_MILLION_USD` | No | Claude output-token estimate rate (default: $15) | Anthropic pricing |
