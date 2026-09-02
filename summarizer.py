@@ -247,11 +247,11 @@ async def _call_claude(
                 f"{provider_name} returned HTTP {e.status_code}."
             ) from e
 
-        first_block = message.content[0]
-        if not isinstance(first_block, TextBlock):
-            raise SummarizationError(
-                f"Unexpected response block type from Claude: {type(first_block).__name__}"
-            )
+        response_text = "".join(
+            block.text for block in message.content if isinstance(block, TextBlock)
+        ).strip()
+        if not response_text:
+            raise SummarizationError(f"{provider_name} returned no summary text.")
 
         input_tokens = _usage_int(getattr(message.usage, "input_tokens", 0))
         output_tokens = _usage_int(getattr(message.usage, "output_tokens", 0))
@@ -265,7 +265,7 @@ async def _call_claude(
             )
         if persist_usage is not None:
             await persist_usage(usage)
-        return _parse_response(first_block.text)
+        return _parse_response(response_text)
 
     raise AssertionError("Claude retry loop exhausted unexpectedly.")
 
@@ -364,7 +364,7 @@ async def summarize(
     cost_budget_usd: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
 ) -> Summary:
     """Call Claude to summarize a transcript. Returns a validated Summary.
 

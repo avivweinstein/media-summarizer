@@ -17,6 +17,8 @@ def _enable_notion(monkeypatch: pytest.MonkeyPatch) -> None:
     from config import settings
 
     monkeypatch.setattr(settings, "notion_enabled", True)
+    monkeypatch.setattr(settings, "processing_mode", "cloud_public")
+    monkeypatch.setattr(settings, "obsidian_vault_path", "")
 
 
 async def test_full_pipeline_youtube_to_notion(
@@ -28,7 +30,12 @@ async def test_full_pipeline_youtube_to_notion(
     from config import settings
     monkeypatch.setattr(settings, "notion_database_id", notion_test_db_id)
 
-    job = await job_queue.create_job(_SHORT_VIDEO_URL, db_path=db_path)
+    job = await job_queue.create_job(
+        _SHORT_VIDEO_URL,
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
     await run_job(job.job_id, db_path=db_path)
 
     result = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -44,7 +51,12 @@ async def test_pipeline_result_has_transcript(
     from config import settings
     monkeypatch.setattr(settings, "notion_database_id", notion_test_db_id)
 
-    job = await job_queue.create_job(_SHORT_VIDEO_URL, db_path=db_path)
+    job = await job_queue.create_job(
+        _SHORT_VIDEO_URL,
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
     await run_job(job.job_id, db_path=db_path)
 
     result = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -61,7 +73,12 @@ async def test_pipeline_result_has_summary(
     from config import settings
     monkeypatch.setattr(settings, "notion_database_id", notion_test_db_id)
 
-    job = await job_queue.create_job(_SHORT_VIDEO_URL, db_path=db_path)
+    job = await job_queue.create_job(
+        _SHORT_VIDEO_URL,
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
     await run_job(job.job_id, db_path=db_path)
 
     result = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -79,7 +96,12 @@ async def test_pipeline_creates_notion_page(
     from config import settings
     monkeypatch.setattr(settings, "notion_database_id", notion_test_db_id)
 
-    job = await job_queue.create_job(_SHORT_VIDEO_URL, db_path=db_path)
+    job = await job_queue.create_job(
+        _SHORT_VIDEO_URL,
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
     await run_job(job.job_id, db_path=db_path)
 
     result = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -89,7 +111,12 @@ async def test_pipeline_creates_notion_page(
 
 
 async def test_invalid_url_job_fails(db_path: str) -> None:
-    job = await job_queue.create_job("https://open.spotify.com/episode/abc", db_path=db_path)
+    job = await job_queue.create_job(
+        "https://open.spotify.com/episode/abc",
+        processing_mode="cloud_public",
+        external_processing_approved=True,
+        db_path=db_path,
+    )
     await run_job(job.job_id, db_path=db_path)
 
     result = await job_queue.get_job(job.job_id, db_path=db_path)

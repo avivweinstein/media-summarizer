@@ -216,6 +216,20 @@ class TestSummarize:
 
         factory.assert_not_called()
 
+    async def test_nvidia_internal_ignores_non_text_response_blocks(
+        self, mocker: MagicMock
+    ) -> None:
+        response = make_claude_response(VALID_JSON)
+        response.content.insert(0, MagicMock(type="thinking"))
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = response
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch.object(settings, "nvidia_inference_api_key", "nvidia-key")
+
+        summary = await summarize(make_result(), processing_mode="nvidia_internal")
+
+        assert summary.tldr
+
     async def test_local_mode_never_calls_anthropic(self, mocker: MagicMock) -> None:
         response = MagicMock()
         response.json.return_value = {"message": {"content": VALID_JSON}}
@@ -396,7 +410,7 @@ class TestSummarize:
         mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
 
-        await summarize(make_result())
+        await summarize(make_result(), processing_mode="cloud_public")
 
         call_kwargs = mock_client.messages.create.call_args.kwargs
         assert call_kwargs["model"] == MODEL

@@ -96,7 +96,7 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         ),
         interrupted=bool(data.get("interrupted", 0)),
         interruption_count=int(data.get("interruption_count", 0)),
-        processing_mode=data.get("processing_mode") or "cloud_public",
+        processing_mode=data.get("processing_mode") or "nvidia_internal",
         external_processing_approved=bool(data.get("external_processing_approved", 0)),
     )
 
@@ -191,7 +191,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 usage TEXT,
                 interrupted INTEGER NOT NULL DEFAULT 0,
                 interruption_count INTEGER NOT NULL DEFAULT 0,
-                processing_mode TEXT NOT NULL DEFAULT 'cloud_public',
+                processing_mode TEXT NOT NULL DEFAULT 'nvidia_internal',
                 external_processing_approved INTEGER NOT NULL DEFAULT 0
             )
         """)
@@ -220,7 +220,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
             )
         if "processing_mode" not in columns:
             await db.execute(
-                "ALTER TABLE jobs ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'cloud_public'"
+                "ALTER TABLE jobs ADD COLUMN processing_mode TEXT NOT NULL DEFAULT 'nvidia_internal'"
             )
         if "external_processing_approved" not in columns:
             await db.execute(
@@ -229,7 +229,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
         async with db.execute("SELECT job_id, url, processing_mode FROM jobs") as rows:
             for job_id, url, processing_mode in await rows.fetchall():
                 base_dedupe_key, _ = submission_identity(str(url))
-                dedupe_key = f"{base_dedupe_key}:{processing_mode or 'cloud_public'}"
+                dedupe_key = f"{base_dedupe_key}:{processing_mode or 'nvidia_internal'}"
                 await db.execute(
                     "UPDATE jobs SET dedupe_key = ? WHERE job_id = ?",
                     (dedupe_key, job_id),
@@ -282,7 +282,7 @@ async def create_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     dedupe_key: str | None = None,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
     external_processing_approved: bool = True,
     db_path: str = DB_PATH,
 ) -> Job:
@@ -331,7 +331,7 @@ async def create_or_get_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     *,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
     external_processing_approved: bool = False,
     db_path: str = DB_PATH,
 ) -> tuple[Job, bool]:

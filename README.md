@@ -77,9 +77,10 @@ LOCAL_WHISPER_EXECUTABLE=whisper-cli
 LOCAL_WHISPER_MODEL=/absolute/path/to/ggml-large-v3-turbo.bin
 ```
 
-The configured model must be present in Inference Hub's live `/v1/models`
-catalog. The application rejects alternate gateway origins and never falls back
-to Anthropic's public API or OpenAI in this mode.
+The default model was verified against Inference Hub's live `/v1/models` catalog
+on 2026-09-02; deep health and every submission recheck access. The application
+rejects alternate gateway origins and never falls back to Anthropic's public API
+or OpenAI in this mode.
 
 ### 6. Configure Obsidian
 

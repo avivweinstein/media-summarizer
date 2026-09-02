@@ -252,7 +252,7 @@ async def transcribe(
     duration_seconds: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
 ) -> TranscriptionOutput:
     """Send an MP3 file to Whisper and return text with segment timestamps.
 

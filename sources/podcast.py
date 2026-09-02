@@ -459,7 +459,7 @@ class PodcastSource(BaseSource):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         parsed = urlparse(url)
@@ -500,7 +500,7 @@ class PodcastSource(BaseSource):
         job_id: str,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         """Download a direct MP3 URL and transcribe it."""
         dest = tmp_path_for_job(job_id)
@@ -531,7 +531,7 @@ class PodcastSource(BaseSource):
         job_id: str,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         """Resolve Apple Podcasts URL → iTunes → RSS → MP3 → transcribe."""
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
@@ -589,7 +589,7 @@ class PodcastSource(BaseSource):
         episode_id: str | None,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         """Pick the best episode from a parsed RSS feed, download and transcribe."""
         log = f"job_id={job_id} url={original_url[:60]!r} source=podcast"

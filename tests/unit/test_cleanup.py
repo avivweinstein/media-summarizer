@@ -121,7 +121,12 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
         usage = UsageStats()
 
-        await transcribe(mp3, duration_seconds=120, usage=usage)
+        await transcribe(
+            mp3,
+            duration_seconds=120,
+            usage=usage,
+            processing_mode="cloud_public",
+        )
 
         assert usage.openai_requests == 1
         assert usage.openai_audio_seconds == 120
@@ -180,7 +185,12 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.side_effect = api_call
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        await transcribe(mp3, duration_seconds=60, persist_usage=persist)
+        await transcribe(
+            mp3,
+            duration_seconds=60,
+            persist_usage=persist,
+            processing_mode="cloud_public",
+        )
 
         assert events == ["persist", "api"]
 
@@ -194,7 +204,7 @@ class TestTranscribeFileCleanup:
         mocker.patch.object(settings, "max_audio_duration_seconds", 60)
 
         with pytest.raises(UsageLimitError, match="duration"):
-            await transcribe(mp3, duration_seconds=120)
+            await transcribe(mp3, duration_seconds=120, processing_mode="cloud_public")
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -206,7 +216,7 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
         with pytest.raises(TranscriptionError, match="determine audio duration"):
-            await transcribe(mp3, duration_seconds=30)
+            await transcribe(mp3, duration_seconds=30, processing_mode="cloud_public")
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -220,7 +230,12 @@ class TestTranscribeFileCleanup:
         usage = UsageStats(openai_requests=settings.max_openai_requests_per_job)
 
         with pytest.raises(UsageLimitError, match="request limit"):
-            await transcribe(mp3, duration_seconds=60, usage=usage)
+            await transcribe(
+                mp3,
+                duration_seconds=60,
+                usage=usage,
+                processing_mode="cloud_public",
+            )
 
         mock_client.audio.transcriptions.create.assert_not_called()
 
@@ -232,7 +247,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = "Transcript text."
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        await transcribe(mp3)
+        await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -251,7 +266,7 @@ class TestTranscribeFileCleanup:
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
         with pytest.raises(TranscriptionError):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -267,7 +282,7 @@ class TestTranscribeFileCleanup:
 
         # RuntimeError bubbles up as-is (not wrapped) since it's not an API error
         with pytest.raises(Exception):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         assert not mp3.exists()
 
@@ -287,7 +302,7 @@ class TestTranscribeFileCleanup:
         )
 
         with pytest.raises(TranscriptionError, match="ffmpeg"):
-            await transcribe(mp3)
+            await transcribe(mp3, processing_mode="cloud_public")
 
         # API should never have been called
         mock_client.audio.transcriptions.create.assert_not_called()
@@ -311,7 +326,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = "Compressed transcript."
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        result = await transcribe(mp3)
+        result = await transcribe(mp3, processing_mode="cloud_public")
 
         assert result.text == "Compressed transcript."
         mock_client.audio.transcriptions.create.assert_called_once()
@@ -334,7 +349,7 @@ class TestTranscribeFileCleanup:
         mock_client.audio.transcriptions.create.return_value = response
         mocker.patch("transcriber.AsyncOpenAI", return_value=mock_client)
 
-        result = await transcribe(mp3)
+        result = await transcribe(mp3, processing_mode="cloud_public")
 
         assert result.segments[1].start_seconds == 4.2
         call = mock_client.audio.transcriptions.create.call_args.kwargs
@@ -345,4 +360,4 @@ class TestTranscribeFileCleanup:
         missing = tmp_path / "does-not-exist.mp3"
 
         with pytest.raises(TranscriptionError, match="not found"):
-            await transcribe(missing)
+            await transcribe(missing, processing_mode="cloud_public")

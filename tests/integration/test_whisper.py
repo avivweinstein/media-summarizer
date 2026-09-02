@@ -1,4 +1,4 @@
-"""Whisper integration tests — transcribe a real audio file via OpenAI API."""
+"""Whisper integration tests — transcribe a real audio file locally."""
 
 import shutil
 from pathlib import Path
@@ -21,7 +21,11 @@ async def test_transcribe_returns_timestamped_output() -> None:
     dest = TMP_DIR / "integration-whisper-test.mp3"
     shutil.copy(_FIXTURE_MP3, dest)
 
-    result = await transcribe(dest, job_id="integration-test")
+    result = await transcribe(
+        dest,
+        job_id="integration-test",
+        processing_mode="nvidia_internal",
+    )
 
     assert result.text
     assert result.segments
@@ -31,7 +35,11 @@ async def test_transcribe_cleans_up_file() -> None:
     dest = TMP_DIR / "integration-whisper-cleanup-test.mp3"
     shutil.copy(_FIXTURE_MP3, dest)
 
-    await transcribe(dest, job_id="integration-test")
+    await transcribe(
+        dest,
+        job_id="integration-test",
+        processing_mode="nvidia_internal",
+    )
 
     assert not dest.exists()
 
@@ -42,4 +50,8 @@ async def test_transcribe_missing_file_raises() -> None:
     missing = TMP_DIR / "does-not-exist-integration.mp3"
 
     with pytest.raises(TranscriptionError, match="not found"):
-        await transcribe(missing, job_id="integration-test")
+        await transcribe(
+            missing,
+            job_id="integration-test",
+            processing_mode="nvidia_internal",
+        )
