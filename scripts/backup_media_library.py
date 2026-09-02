@@ -156,6 +156,25 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _fsync_file(path: Path) -> None:
+    file_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(file_fd)
+    finally:
+        os.close(file_fd)
+
+
+def _fsync_restore_payload(database: Path, vault: Path) -> None:
+    _fsync_file(database)
+    paths = list(vault.rglob("*"))
+    for path in paths:
+        if path.is_file():
+            _fsync_file(path)
+    directories = [vault, *(path for path in paths if path.is_dir())]
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        _fsync_directory(directory)
+
+
 def _write_restore_marker(marker: Path, payload: dict[str, str]) -> None:
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=marker.parent, delete=False
@@ -244,6 +263,7 @@ def restore_backup(snapshot: Path, database_destination: Path, vault_destination
             integrity = db.execute("PRAGMA integrity_check").fetchone()
         if integrity != ("ok",) or not (vault_stage / ".obsidian").is_dir():
             raise ValueError("Staged backup restore failed validation.")
+        _fsync_restore_payload(database_stage, vault_stage)
         _write_restore_marker(
             marker,
             {

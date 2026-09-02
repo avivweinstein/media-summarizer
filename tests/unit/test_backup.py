@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import backup_media_library
 from scripts.backup_media_library import create_backup, restore_backup, verify_backup
 
 
@@ -132,6 +133,7 @@ def test_restore_fsyncs_each_publication_boundary(
     restored_db = tmp_path / "restore" / "jobs.db"
     restored_vault = tmp_path / "Restored-Library"
     calls: list[Path] = []
+    monkeypatch.setattr("scripts.backup_media_library._fsync_restore_payload", lambda *_: None)
     monkeypatch.setattr(
         "scripts.backup_media_library._fsync_directory",
         lambda path: calls.append(path),
@@ -145,3 +147,31 @@ def test_restore_fsyncs_each_publication_boundary(
         restored_vault.parent,
         restored_db.parent,
     ]
+
+
+def test_restore_fsyncs_payload_before_publishing_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, vault, destination = _fixture(tmp_path)
+    snapshot = create_backup(database, vault, destination)
+    restored_db = tmp_path / "restore" / "jobs.db"
+    restored_vault = tmp_path / "Restored-Library"
+    events: list[str] = []
+
+    real_payload_sync = backup_media_library._fsync_restore_payload
+    real_marker_write = backup_media_library._write_restore_marker
+
+    def sync_payload(database_path: Path, vault_path: Path) -> None:
+        events.append("payload")
+        real_payload_sync(database_path, vault_path)
+
+    def write_marker(marker: Path, payload: dict[str, str]) -> None:
+        events.append("marker")
+        real_marker_write(marker, payload)
+
+    monkeypatch.setattr(backup_media_library, "_fsync_restore_payload", sync_payload)
+    monkeypatch.setattr(backup_media_library, "_write_restore_marker", write_marker)
+
+    restore_backup(snapshot, restored_db, restored_vault)
+
+    assert events == ["payload", "marker"]
