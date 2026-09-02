@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     podcast_index_api_secret: str = ""
     youtube_api_key: str = ""
     openclaw_webhook_url: str = ""
+    webhooks_enabled: bool = False
     port: int = 8000
     summary_chunk_chars: int = Field(default=60_000, gt=0)
     max_transcript_chars: int = Field(default=600_000, gt=0)

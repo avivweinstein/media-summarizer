@@ -115,9 +115,12 @@ async def expand_playlist(url: str) -> list[str]:
 async def _notify_webhook(job: Job) -> None:
     """POST job result or error to the job's webhook URL (fire-and-forget).
 
-    Uses the per-job webhook_url; falls back to settings.openclaw_webhook_url.
+    When explicitly enabled, uses the per-job webhook_url and falls back to
+    settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
+    if not settings.webhooks_enabled:
+        return
     url = job.webhook_url or settings.openclaw_webhook_url
     if not url:
         return

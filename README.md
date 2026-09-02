@@ -392,6 +392,7 @@ Copy `.env.example` to `.env` and fill in:
 | `NOTION_DATABASE_ID`        | If enabled | Target Notion database ID                     | From your database URL |
 | `YOUTUBE_API_KEY`           | No       | YouTube Data API key (optional metadata optimization) | [Google Cloud Console](https://console.cloud.google.com) |
 | `OPENCLAW_WEBHOOK_URL`      | No       | Webhook URL for notifications                   | Your webhook endpoint |
+| `WEBHOOKS_ENABLED`          | No       | Explicitly enable outbound result webhooks (default: false) | — |
 | `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
 | `PODCAST_INDEX_API_SECRET`  | No       | Podcast Index API secret                        | Same as above |
 | `PORT`                      | No       | Server port (default: 8000)                     | — |

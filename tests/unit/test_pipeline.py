@@ -17,6 +17,7 @@ from pipeline import run_job
 def _configure_output_defaults(mocker: MagicMock) -> None:
     mocker.patch.object(settings, "notion_enabled", True)
     mocker.patch.object(settings, "obsidian_vault_path", "")
+    mocker.patch.object(settings, "webhooks_enabled", True)
 
 
 def _transcript() -> TranscriptResult:
@@ -346,6 +347,22 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_webhook_disabled_skips_configured_url(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            db_path=db_path,
+        )
+        _mock_happy_path(mocker)
+        mocker.patch.object(settings, "webhooks_enabled", False)
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_webhook_fired_on_success(
         self, db_path: str, mocker: MagicMock
     ) -> None:
