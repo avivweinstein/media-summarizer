@@ -181,6 +181,23 @@ class TestChunkText:
 
 
 class TestSummarize:
+    async def test_local_mode_never_calls_anthropic(self, mocker: MagicMock) -> None:
+        response = MagicMock()
+        response.json.return_value = {"message": {"content": VALID_JSON}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+        client.post.return_value = response
+        client_factory = mocker.patch("summarizer.httpx.AsyncClient", return_value=client)
+        anthropic = mocker.patch("summarizer.AsyncAnthropic")
+        mocker.patch.object(settings, "processing_mode", "local")
+
+        summary = await summarize(make_result())
+
+        assert summary.tldr
+        anthropic.assert_not_called()
+        assert client_factory.call_args.kwargs["trust_env"] is False
+
     async def test_successful_call_returns_summary(self, mocker: MagicMock) -> None:
         mock_client = AsyncMock()
         mock_client.messages.create.return_value = make_claude_response(VALID_JSON)

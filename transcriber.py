@@ -6,7 +6,9 @@ Large files (>25 MB) are re-encoded to 32 kbps mono via ffmpeg before upload.
 """
 
 import asyncio
+import json
 import logging
+import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -35,9 +37,11 @@ def ensure_tmp_dir() -> None:
     """Create the temp dir and delete any leftover MP3s from crashed jobs."""
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     removed = 0
-    for f in TMP_DIR.glob("*.mp3"):
-        f.unlink(missing_ok=True)
-        removed += 1
+    temporary_suffixes = {".json", ".m4a", ".mov", ".mp3", ".mp4", ".wav", ".webm"}
+    for file in TMP_DIR.iterdir():
+        if file.is_file() and file.suffix.casefold() in temporary_suffixes:
+            file.unlink(missing_ok=True)
+            removed += 1
     if removed:
         logger.warning(
             "job_id=- url=- source=- event=startup_cleanup removed_files=%d", removed
@@ -104,6 +108,86 @@ async def _probe_audio_duration(path: Path) -> float:
     return 0.0
 
 
+def transcription_model_name() -> str:
+    if settings.processing_mode == "local":
+        return "local/whisper.cpp"
+    return "openai/whisper-1"
+
+
+async def _transcribe_local(path: Path, job_id: str) -> TranscriptionOutput:
+    executable = shutil.which(settings.local_whisper_executable)
+    model = Path(settings.local_whisper_model).expanduser()
+    if executable is None or not model.is_file():
+        raise TranscriptionError(
+            "Local mode requires LOCAL_WHISPER_EXECUTABLE and a valid LOCAL_WHISPER_MODEL."
+        )
+    wav_path = TMP_DIR / f"{job_id}-local.wav"
+    output_prefix = TMP_DIR / f"{job_id}-local"
+    json_path = output_prefix.with_suffix(".json")
+    try:
+        ffmpeg = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(wav_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, ffmpeg_error = await ffmpeg.communicate()
+        if ffmpeg.returncode != 0:
+            raise TranscriptionError(
+                f"Local audio conversion failed: {ffmpeg_error.decode()[:300]}"
+            )
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            "-m",
+            str(model),
+            "-f",
+            str(wav_path),
+            "-oj",
+            "-of",
+            str(output_prefix),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0 or not json_path.is_file():
+            raise TranscriptionError(f"Local Whisper failed: {stderr.decode()[:300]}")
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        raw_segments = data.get("transcription") or data.get("segments") or []
+        segments: list[TranscriptSegment] = []
+        for item in raw_segments:
+            if not isinstance(item, dict):
+                continue
+            offsets = item.get("offsets", {})
+            start = item.get("start", 0)
+            end = item.get("end", 0)
+            if isinstance(offsets, dict) and "from" in offsets and "to" in offsets:
+                start = float(offsets.get("from", 0)) / 1000
+                end = float(offsets.get("to", 0)) / 1000
+            text = str(item.get("text", "")).strip()
+            if text:
+                segments.append(
+                    TranscriptSegment(start_seconds=float(start), end_seconds=float(end), text=text)
+                )
+        transcript = " ".join(segment.text for segment in segments)
+        if not transcript:
+            transcript = str(data.get("text", "")).strip()
+        if not transcript:
+            raise TranscriptionError("Local Whisper returned an empty transcript.")
+        return TranscriptionOutput(text=transcript, segments=segments)
+    except (OSError, json.JSONDecodeError) as error:
+        raise TranscriptionError(f"Local Whisper output could not be read: {error}") from error
+    finally:
+        wav_path.unlink(missing_ok=True)
+        json_path.unlink(missing_ok=True)
+
+
 async def transcribe(
     mp3_path: Path,
     job_id: str = "-",
@@ -154,6 +238,10 @@ async def transcribe(
                 f"Audio duration is {audio_seconds / 3600:.1f} hours, exceeding the "
                 f"configured {settings.max_audio_duration_seconds / 3600:.1f}-hour limit."
             )
+        if settings.processing_mode == "local":
+            result = await _transcribe_local(mp3_path, job_id)
+            logger.info("%s event=transcribe_done chars=%d provider=local", log, len(result.text))
+            return result
         estimated_cost = audio_seconds / 60 * settings.whisper_cost_per_minute_usd
         if usage_tracker.estimated_cost_usd + estimated_cost > settings.max_estimated_cost_usd:
             raise UsageLimitError(

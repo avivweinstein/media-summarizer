@@ -34,7 +34,7 @@ from config import settings
 from exceptions import TranscriptionError, UnsupportedURLError, UsageLimitError
 from models import TranscriptResult, UsageStats
 from sources.base import BaseSource
-from transcriber import tmp_path_for_job, transcribe
+from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +532,7 @@ class PodcastSource(BaseSource):
             duration_seconds=0,
             transcript=transcription.text,
             segments=transcription.segments,
-            transcription_model="openai/whisper-1",
+            transcription_model=transcription_model_name(),
             source_item_id=url,
         )
 
@@ -574,7 +574,7 @@ class PodcastSource(BaseSource):
                 transcript=transcription.text,
                 segments=transcription.segments,
                 published_at=_parse_iso_datetime(episode.get("releaseDate")),
-                transcription_model="openai/whisper-1",
+                transcription_model=transcription_model_name(),
                 source_item_id=episode_id,
             )
 
@@ -634,6 +634,6 @@ class PodcastSource(BaseSource):
             transcript=transcription.text,
             segments=transcription.segments,
             published_at=published_at,
-            transcription_model="openai/whisper-1",
+            transcription_model=transcription_model_name(),
             source_item_id=source_item_id,
         )

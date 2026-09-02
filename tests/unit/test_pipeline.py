@@ -12,7 +12,7 @@ import job_queue
 from config import settings
 from exceptions import UsageLimitError
 from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
-from pipeline import run_job
+from pipeline import _notify_webhook, run_job
 
 
 @pytest.fixture(autouse=True)
@@ -47,10 +47,14 @@ def _mock_happy_path(mocker: MagicMock, source_type: str = "youtube") -> None:
     mocker.patch("pipeline.detect_source", return_value=source_type)
     mock_source = AsyncMock()
     mock_source.fetch.return_value = _transcript()
-    if source_type == "youtube":
-        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
-    else:
-        mocker.patch("pipeline.PodcastSource", return_value=mock_source)
+    source_classes = {
+        "youtube": "YouTubeSource",
+        "podcast": "PodcastSource",
+        "media": "MediaSource",
+        "article": "ArticleSource",
+        "upload": "UploadSource",
+    }
+    mocker.patch(f"pipeline.{source_classes[source_type]}", return_value=mock_source)
     mocker.patch("pipeline.summarize", return_value=_summary())
     mocker.patch("pipeline.save_to_notion", return_value="page-abc-123")
     mocker.patch(
@@ -208,6 +212,39 @@ class TestRetryLogic:
         assert result is not None
         assert result.status == JobStatus.done
         assert result.retry_count == 0
+
+    @pytest.mark.parametrize("source_type", ["article", "media", "upload"])
+    async def test_routes_additional_sources(
+        self, source_type: str, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job("https://example.com/item", db_path=db_path)
+        _mock_happy_path(mocker, source_type)
+        mocker.patch("pipeline._notify_webhook")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+
+    async def test_local_mode_never_publishes_to_notion(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        _mock_happy_path(mocker)
+        notion = mocker.patch("pipeline.save_to_notion")
+        mocker.patch.object(settings, "processing_mode", "local")
+        mocker.patch.object(settings, "obsidian_vault_path", "/configured-vault")
+        mocker.patch("pipeline._notify_webhook")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+        notion.assert_not_awaited()
 
     async def test_retries_on_transient_failure_and_succeeds(
         self, db_path: str, mocker: MagicMock
@@ -442,6 +479,21 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_local_mode_never_sends_webhook(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            db_path=db_path,
+        )
+        mocker.patch.object(settings, "processing_mode", "local")
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await _notify_webhook(job, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_webhook_disabled_skips_configured_url(
         self, db_path: str, mocker: MagicMock
     ) -> None:

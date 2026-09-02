@@ -15,7 +15,7 @@ import pytest
 
 from config import settings
 from exceptions import TranscriptionError, UsageLimitError
-from models import UsageStats
+from models import TranscriptionOutput, UsageStats
 from transcriber import ensure_tmp_dir, transcribe
 
 
@@ -91,6 +91,24 @@ class TestTranscribeFileCleanup:
         assert usage.openai_requests == 1
         assert usage.openai_audio_seconds == 120
         assert usage.estimated_cost_usd == pytest.approx(0.012)
+
+    async def test_local_mode_never_calls_openai(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        media = tmp_path / "local.mp3"
+        media.write_bytes(b"audio")
+        local = mocker.patch(
+            "transcriber._transcribe_local",
+            new=AsyncMock(return_value=TranscriptionOutput(text="Local transcript.")),
+        )
+        openai = mocker.patch("transcriber.AsyncOpenAI")
+        mocker.patch.object(settings, "processing_mode", "local")
+
+        result = await transcribe(media, job_id="local-job")
+
+        assert result.text == "Local transcript."
+        local.assert_awaited_once()
+        openai.assert_not_called()
 
     async def test_persists_reservation_before_openai_call(
         self, tmp_path: Path, mocker: MagicMock

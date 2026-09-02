@@ -8,7 +8,9 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlparse
 
+import httpx
 from anthropic import (
     APIConnectionError,
     APIStatusError,
@@ -27,6 +29,12 @@ logger = logging.getLogger(__name__)
 MODEL = "claude-sonnet-4-20250514"
 MAX_OUTPUT_TOKENS = 1024
 _API_BACKOFF_SECONDS = (1, 2)
+
+
+def summary_model_name() -> str:
+    if settings.processing_mode == "local":
+        return f"ollama/{settings.ollama_model}"
+    return f"anthropic/{MODEL}"
 
 CANONICAL_TAGS = [
     "fitness",
@@ -132,6 +140,37 @@ def _anthropic_cost(input_tokens: int, output_tokens: int) -> float:
         input_tokens * settings.anthropic_input_cost_per_million_usd
         + output_tokens * settings.anthropic_output_cost_per_million_usd
     ) / 1_000_000
+
+
+def _local_ollama_url() -> str:
+    parsed = urlparse(settings.ollama_base_url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise SummarizationError("Local processing requires a loopback Ollama HTTP endpoint.")
+    return f"{settings.ollama_base_url.rstrip('/')}/api/chat"
+
+
+async def _call_local_ollama(system: str, prompt: str) -> Summary:
+    async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+        response = await client.post(
+            _local_ollama_url(),
+            json={
+                "model": settings.ollama_model,
+                "stream": False,
+                "format": "json",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {"temperature": 0},
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+    message = data.get("message", {})
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if not isinstance(content, str) or not content.strip():
+        raise SummarizationError("The local Ollama model returned an empty summary.")
+    return _parse_response(content)
 
 
 async def _call_claude(
@@ -326,55 +365,58 @@ async def summarize(
     chunks = _chunk_text(prompt_transcript, settings.summary_chunk_chars)
     request_count = 1 if len(chunks) == 1 else len(chunks) + 1
     usage_tracker = usage or UsageStats()
-    if usage_tracker.anthropic_requests + request_count > settings.max_anthropic_requests_per_job:
-        raise UsageLimitError(
-            f"Transcript requires {request_count} Anthropic requests, exceeding the "
-            "remaining per-job request allowance."
-        )
-
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
+    local_mode = settings.processing_mode == "local"
+    if local_mode:
+        if request_count > settings.max_local_summary_requests_per_job:
+            raise UsageLimitError(
+                f"Transcript requires {request_count} local summary requests, exceeding the "
+                "configured per-job request allowance."
+            )
+        client = None
+    else:
+        if (
+            usage_tracker.anthropic_requests + request_count
+            > settings.max_anthropic_requests_per_job
+        ):
+            raise UsageLimitError(
+                f"Transcript requires {request_count} Anthropic requests, exceeding the "
+                "remaining per-job request allowance."
+            )
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
     budget = cost_budget_usd if cost_budget_usd is not None else settings.max_estimated_cost_usd
 
-    if len(chunks) == 1:
-        summary = await _call_claude(
+    async def call_summary(prompt: str) -> Summary:
+        if local_mode:
+            return await _call_local_ollama(SYSTEM_PROMPT, prompt)
+        assert client is not None
+        return await _call_claude(
             client,
             system=SYSTEM_PROMPT,
-            prompt=_build_user_prompt(result, prompt_transcript),
+            prompt=prompt,
             usage=usage_tracker,
             cost_budget_usd=budget,
             persist_usage=persist_usage,
         )
+
+    if len(chunks) == 1:
+        summary = await call_summary(_build_user_prompt(result, prompt_transcript))
     else:
         partials: list[Summary] = []
         for index, chunk in enumerate(chunks, start=1):
             partials.append(
-                await _call_claude(
-                    client,
-                    system=SYSTEM_PROMPT,
-                    prompt=(
-                        _build_user_prompt(result, chunk)
-                        + f"\n\nThis is transcript chunk {index} of {len(chunks)}."
-                    ),
-                    usage=usage_tracker,
-                    cost_budget_usd=budget,
-                    persist_usage=persist_usage,
+                await call_summary(
+                    _build_user_prompt(result, chunk)
+                    + f"\n\nThis is transcript chunk {index} of {len(chunks)}."
                 )
             )
         synthesis = json.dumps(
             [partial.model_dump() for partial in partials],
             ensure_ascii=False,
         )
-        summary = await _call_claude(
-            client,
-            system=SYSTEM_PROMPT,
-            prompt=(
-                _build_user_prompt(result, "")
-                + "\n\nCombine these chunk summaries into one non-redundant final summary:\n"
-                + synthesis
-            ),
-            usage=usage_tracker,
-            cost_budget_usd=budget,
-            persist_usage=persist_usage,
+        summary = await call_summary(
+            _build_user_prompt(result, "")
+            + "\n\nCombine these chunk summaries into one non-redundant final summary:\n"
+            + synthesis
         )
 
     valid_timestamps = {round(segment.start_seconds) for segment in result.segments}

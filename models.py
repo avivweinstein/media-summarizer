@@ -97,6 +97,7 @@ class Job(BaseModel):
 class SummarizeRequest(BaseModel):
     url: str
     webhook_url: str | None = None
+    external_processing_approved: bool = False
 
 
 class SummarizeResponse(BaseModel):
@@ -108,6 +109,7 @@ class BulkSummarizeRequest(BaseModel):
 
     urls: list[str]
     webhook_url: str | None = None
+    external_processing_approved: bool = False
 
 
 class BulkSummarizeResponse(BaseModel):

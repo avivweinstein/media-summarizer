@@ -19,16 +19,20 @@ from exceptions import UnsupportedURLError, UsageLimitError
 from models import Job, JobStage, JobStatus, TranscriptResult, UsageStats
 from notion_writer import save_to_notion
 from obsidian_writer import save_to_obsidian
+from sources.article import ArticleSource
+from sources.media import MediaSource
 from sources.podcast import PodcastSource
+from sources.upload import UploadSource, cleanup_upload
 from sources.youtube import YouTubeSource
-from summarizer import MODEL as SUMMARY_MODEL
-from summarizer import summarize
+from summarizer import summarize, summary_model_name
 
 logger = logging.getLogger(__name__)
 
 _YOUTUBE_HOSTNAMES = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 _SPOTIFY_HOSTNAMES = {"open.spotify.com"}
 _APPLE_HOSTNAMES = {"podcasts.apple.com"}
+_MEDIA_HOSTNAMES = {"vimeo.com", "player.vimeo.com"}
+_MEDIA_EXTENSIONS = {".m4a", ".mov", ".mp4", ".wav", ".webm"}
 _UNSUPPORTED_MEDIA_HOSTNAMES = {
     "soundcloud.com",
     "twitter.com",
@@ -43,6 +47,9 @@ def detect_source(url: str) -> str:
     """Return source type ('youtube' | 'podcast' | 'youtube_playlist') or raise UnsupportedURLError."""
     parsed = urlparse(url.strip())
     hostname = (parsed.hostname or "").lower().lstrip("www.")
+
+    if parsed.scheme == "upload":
+        return "upload"
 
     if hostname in {"youtube.com", "youtu.be", "m.youtube.com"}:
         qs = parse_qs(parsed.query or "")
@@ -61,10 +68,15 @@ def detect_source(url: str) -> str:
 
     if hostname == "open.spotify.com":
         raise UnsupportedURLError(
-            "Spotify is not currently supported. Try a YouTube URL or a direct podcast RSS/MP3 URL."
+            "Spotify does not expose a reliable canonical RSS mapping. Paste the show's RSS, "
+            "Apple Podcasts, or direct episode URL instead."
         )
 
-    if hostname == "podcasts.apple.com" or parsed.path.lower().endswith(".mp3"):
+    lower_path = parsed.path.lower()
+    if hostname in _MEDIA_HOSTNAMES or any(lower_path.endswith(ext) for ext in _MEDIA_EXTENSIONS):
+        return "media"
+
+    if hostname == "podcasts.apple.com" or lower_path.endswith(".mp3"):
         return "podcast"
 
     if parsed.scheme in {"http", "https"} and hostname:
@@ -73,9 +85,12 @@ def detect_source(url: str) -> str:
                 "This media host is not currently supported. Try YouTube, Apple Podcasts, "
                 "a podcast RSS URL, or a direct MP3 URL."
             )
-        # Opaque RSS URLs often have no feed-like hostname, extension, or path.
-        # PodcastSource performs the bounded fetch and verifies feed contents.
-        return "podcast"
+        if (
+            hostname.startswith(("feed.", "feeds.", "rss."))
+            or any(marker in lower_path for marker in ("/feed", "podcast", ".rss", ".xml"))
+        ):
+            return "podcast"
+        return "article"
 
     raise UnsupportedURLError(
         "Unsupported source. Supported: YouTube (video or playlist), "
@@ -123,7 +138,7 @@ async def _notify_webhook(
     settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
-    if not settings.webhooks_enabled:
+    if settings.processing_mode == "local" or not settings.webhooks_enabled:
         return
     if urls is None:
         fresh = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -257,8 +272,29 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         usage=job.usage,
                         persist_usage=persist_usage,
                     )
-                else:
+                elif source_type == "podcast":
                     result = await PodcastSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                    )
+                elif source_type == "media":
+                    result = await MediaSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                    )
+                elif source_type == "article":
+                    result = await ArticleSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                    )
+                else:
+                    result = await UploadSource().fetch(
                         job.url,
                         job_id=job.job_id,
                         usage=job.usage,
@@ -267,6 +303,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
                 job.result = result
                 await job_queue.update_job(job, db_path=db_path)
+
+            cleanup_upload(job.url)
 
             if await _check_cancelled(job, db_path):
                 return
@@ -299,13 +337,17 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     summary,
                     settings.obsidian_vault_path,
                     retain_transcript=settings.obsidian_retain_transcript,
-                    summary_model=SUMMARY_MODEL,
+                    summary_model=summary_model_name(),
                     added_at=job.created_at,
                     usage=job.usage,
                 )
                 output_saved = True
 
-            if settings.notion_enabled and not job.notion_page_id:
+            if (
+                settings.processing_mode != "local"
+                and settings.notion_enabled
+                and not job.notion_page_id
+            ):
                 if interrupted_stage == JobStage.saving_notion:
                     job.notion_error = (
                         "Notion save was interrupted and was not replayed to avoid "
@@ -360,4 +402,5 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     job.error = last_error
     logger.error("%s event=job_failed_final error=%r", log, last_error)
     await job_queue.update_job(job, db_path=db_path)
+    cleanup_upload(job.url)
     await _notify_webhook(job, db_path=db_path)

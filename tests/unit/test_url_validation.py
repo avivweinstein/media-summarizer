@@ -85,9 +85,20 @@ class TestPodcast:
         assert detect_source(url) == "podcast"
 
 
+class TestAdditionalSources:
+    def test_vimeo_url(self) -> None:
+        assert detect_source("https://vimeo.com/123456") == "media"
+
+    def test_direct_video_url(self) -> None:
+        assert detect_source("https://cdn.example.com/talk.mp4?token=abc") == "media"
+
+    def test_article_url(self) -> None:
+        assert detect_source("https://example.com/research/new-chip") == "article"
+
+
 class TestUnsupportedURLs:
     def test_opaque_feed_candidate_is_accepted_for_bounded_sniffing(self) -> None:
-        assert detect_source("https://example.com/opaque-feed-id") == "podcast"
+        assert detect_source("https://example.com/opaque-feed-id") == "article"
 
     def test_twitter(self) -> None:
         with pytest.raises(UnsupportedURLError):

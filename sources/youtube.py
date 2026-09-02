@@ -23,7 +23,7 @@ from config import settings
 from exceptions import MetadataError, UsageLimitError
 from models import TranscriptionOutput, TranscriptResult, TranscriptSegment, UsageStats
 from sources.base import BaseSource
-from transcriber import tmp_path_for_job, transcribe
+from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,7 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
     opts: dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
+        "proxy": "",
         "skip_download": True,
     }
     if youtube_api_key:
@@ -105,7 +106,7 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
         try:
             info: dict[str, object] | None = ydl.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as e:
-            raise MetadataError(f"Failed to fetch YouTube metadata: {e}") from e
+            raise MetadataError(f"Failed to fetch media metadata: {e}") from e
 
     if info is None:
         raise MetadataError("yt-dlp returned no metadata for this URL.")
@@ -133,6 +134,7 @@ def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
     opts: dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
+        "proxy": "",
         "format": "bestaudio/best",
         "max_filesize": max_bytes,
         "outtmpl": str(dest.with_suffix(".%(ext)s")),
@@ -149,7 +151,7 @@ def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.download([url])
         if result != 0:
-            raise MetadataError("yt-dlp could not download the YouTube audio.")
+            raise MetadataError("yt-dlp could not download the media audio.")
         # yt-dlp may produce dest.mp3 — rename to the exact path we want
         actual = dest.with_suffix(".mp3")
         if actual.exists() and actual != dest:
@@ -234,7 +236,7 @@ class YouTubeSource(BaseSource):
                 usage=usage_tracker,
                 persist_usage=persist_usage,
             )
-            transcription_model = "openai/whisper-1"
+            transcription_model = transcription_model_name()
             logger.info(
                 "%s event=transcript_fetch_done chars=%d method=whisper",
                 log,
