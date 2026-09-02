@@ -24,6 +24,8 @@ async def test_transcript_is_non_empty(youtube_api_key: str) -> None:
     result = await source.fetch(_SHORT_VIDEO_URL, job_id="integration-test")
 
     assert len(result.transcript) > 10
+    assert result.segments
+    assert result.segments[0].start_seconds >= 0
 
 
 async def test_title_is_populated(youtube_api_key: str) -> None:

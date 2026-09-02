@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from exceptions import ObsidianError
-from models import Summary, TranscriptResult, UsageStats
+from models import KeyMoment, Summary, TranscriptResult, TranscriptSegment, UsageStats
 from obsidian_writer import save_to_obsidian, source_id
 
 
@@ -20,6 +20,13 @@ def _result(**overrides: object) -> TranscriptResult:
         "transcript": "A complete transcript.",
         "published_at": datetime(2026, 8, 1, tzinfo=UTC),
         "transcription_model": "youtube/captions",
+        "segments": [
+            TranscriptSegment(
+                start_seconds=65,
+                end_seconds=70,
+                text="A complete transcript.",
+            )
+        ],
     }
     values.update(overrides)
     return TranscriptResult(**values)  # type: ignore[arg-type]
@@ -31,6 +38,7 @@ def _summary(**overrides: object) -> Summary:
         "key_points": ["First point.", "Second point."],
         "tags": ["fitness", "health"],
         "worth_rewatching": True,
+        "key_moments": [KeyMoment(timestamp_seconds=65, point="The practical advice starts.")],
     }
     values.update(overrides)
     return Summary(**values)  # type: ignore[arg-type]
@@ -52,12 +60,8 @@ def test_youtube_source_id_uses_video_id() -> None:
 
 def test_podcast_source_id_uses_episode_identity() -> None:
     feed_url = "https://example.com/show.xml"
-    first = source_id(
-        _result(source="podcast", url=feed_url, source_item_id="episode-guid-1")
-    )
-    second = source_id(
-        _result(source="podcast", url=feed_url, source_item_id="episode-guid-2")
-    )
+    first = source_id(_result(source="podcast", url=feed_url, source_item_id="episode-guid-1"))
+    second = source_id(_result(source="podcast", url=feed_url, source_item_id="episode-guid-2"))
 
     assert first != second
 
@@ -93,13 +97,16 @@ async def test_save_creates_summary_and_transcript_with_metadata(tmp_path: Path)
     assert 'summary_model: "anthropic/test-model"' in content
     assert 'transcription_model: "youtube/captions"' in content
     assert 'source_item_id: "youtube-abc123"' in content
-    assert "key_points:\n  - \"First point.\"\n  - \"Second point.\"" in content
+    assert 'key_points:\n  - "First point."\n  - "Second point."' in content
+    assert 'key_moments:\n  - "00:01:05 The practical advice starts."' in content
     assert "- First point." in content
+    assert "[00:01:05](https://www.youtube.com/watch?v=abc123&t=65s)" in content
     assert "worth_rewatching: true" in content
     assert "anthropic_input_tokens: 100" in content
     assert "estimated_cost_usd: 0.00105" in content
     assert "![[Generated/Transcripts/" in content
     assert "A complete transcript." in transcript_path.read_text()
+    assert "**00:01:05** A complete transcript." in transcript_path.read_text()
     assert summary_path.stat().st_mode & 0o777 == 0o600
     assert transcript_path.stat().st_mode & 0o777 == 0o600
 
