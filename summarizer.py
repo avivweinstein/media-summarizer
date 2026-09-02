@@ -23,6 +23,7 @@ from anthropic.types import TextBlock
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
 from models import KeyMoment, Summary, TranscriptResult, UsageStats
+from nvidia_inference import validate_nvidia_configuration, validated_nvidia_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ _API_BACKOFF_SECONDS = (1, 2)
 def summary_model_name(processing_mode: str) -> str:
     if processing_mode == "local":
         return f"ollama/{settings.ollama_model}"
+    if processing_mode == "nvidia_internal":
+        return f"nvidia-inference/{settings.nvidia_inference_model}"
     return f"anthropic/{MODEL}"
 
 
@@ -187,6 +190,8 @@ async def _call_local_ollama(
 async def _call_claude(
     client: AsyncAnthropic,
     *,
+    model: str,
+    provider_name: str,
     system: str,
     prompt: str,
     usage: UsageStats,
@@ -213,7 +218,7 @@ async def _call_claude(
 
         try:
             message = await client.messages.create(
-                model=MODEL,
+                model=model,
                 max_tokens=MAX_OUTPUT_TOKENS,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
@@ -222,24 +227,25 @@ async def _call_claude(
             msg = str(e).lower()
             if any(word in msg for word in ("credit", "billing", "balance", "quota")):
                 raise SummarizationError(
-                    "Anthropic API credits exhausted. Please top up your account at "
-                    "console.anthropic.com/settings/billing."
+                    f"{provider_name} credit, quota, or billing allowance is exhausted."
                 ) from e
-            raise SummarizationError(f"Claude rejected the request: {e}") from e
+            raise SummarizationError(f"{provider_name} rejected the request.") from e
         except (RateLimitError, APIConnectionError) as e:
             if api_attempt >= len(_API_BACKOFF_SECONDS):
                 if isinstance(e, RateLimitError):
                     raise SummarizationError(
-                        "Claude API rate limit reached. Please try again in a moment."
+                        f"{provider_name} rate limit reached. Please try again in a moment."
                     ) from e
-                raise SummarizationError(f"Could not connect to Claude API: {e}") from e
+                raise SummarizationError(f"Could not connect to {provider_name}.") from e
             await asyncio.sleep(_API_BACKOFF_SECONDS[api_attempt])
             continue
         except APIStatusError as e:
             if e.status_code >= 500 and api_attempt < len(_API_BACKOFF_SECONDS):
                 await asyncio.sleep(_API_BACKOFF_SECONDS[api_attempt])
                 continue
-            raise SummarizationError(f"Claude API error (HTTP {e.status_code}): {e.message}") from e
+            raise SummarizationError(
+                f"{provider_name} returned HTTP {e.status_code}."
+            ) from e
 
         first_block = message.content[0]
         if not isinstance(first_block, TextBlock):
@@ -378,6 +384,7 @@ async def summarize(
     request_count = 1 if len(chunks) == 1 else len(chunks) + 1
     usage_tracker = usage or UsageStats()
     local_mode = processing_mode == "local"
+    nvidia_internal_mode = processing_mode == "nvidia_internal"
     if local_mode:
         if (
             usage_tracker.local_summary_requests + request_count
@@ -388,6 +395,8 @@ async def summarize(
                 "configured per-job request allowance."
             )
         client = None
+        model = settings.ollama_model
+        provider_name = "Local Ollama"
     else:
         if (
             usage_tracker.anthropic_requests + request_count
@@ -397,7 +406,24 @@ async def summarize(
                 f"Transcript requires {request_count} Anthropic requests, exceeding the "
                 "remaining per-job request allowance."
             )
-        client = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
+        if nvidia_internal_mode:
+            try:
+                validate_nvidia_configuration()
+            except ValueError as error:
+                raise SummarizationError(str(error)) from error
+            client = AsyncAnthropic(
+                api_key=settings.nvidia_inference_api_key,
+                base_url=validated_nvidia_base_url(),
+                max_retries=0,
+            )
+            model = settings.nvidia_inference_model
+            provider_name = "NVIDIA Inference Hub"
+        elif processing_mode == "cloud_public":
+            client = AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
+            model = MODEL
+            provider_name = "Anthropic API"
+        else:
+            raise SummarizationError("Unsupported processing mode.")
     budget = cost_budget_usd if cost_budget_usd is not None else settings.max_estimated_cost_usd
 
     async def call_summary(prompt: str) -> Summary:
@@ -411,6 +437,8 @@ async def summarize(
         assert client is not None
         return await _call_claude(
             client,
+            model=model,
+            provider_name=provider_name,
             system=SYSTEM_PROMPT,
             prompt=prompt,
             usage=usage_tracker,

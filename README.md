@@ -1,6 +1,7 @@
 # Media Summarizer
 
-A personal media intelligence pipeline. Submit videos, podcasts, articles, newsletters, or local files and get structured summaries archived in Obsidian with optional Notion publishing.
+An NVIDIA-internal media intelligence pipeline. Submit videos, podcasts, articles,
+newsletters, or local files and get structured summaries archived in a local Obsidian vault.
 
 ## Features
 
@@ -9,9 +10,10 @@ A personal media intelligence pipeline. Submit videos, podcasts, articles, newsl
 - **X/Twitter videos** — public post videos through yt-dlp, with Whisper transcription
 - **Podcasts** — Apple Podcasts, RSS feeds, direct MP3 URLs
 - **More sources** — Vimeo, direct audio/video, web articles, newsletters, and local uploads
-- **AI summaries** — Claude generates TL;DR, key points, tags, and "worth rewatching" rating
+- **NVIDIA-internal summaries** — Inference Hub generates TL;DR, key points, tags, and a "worth rewatching" rating
+- **Local transcription** — whisper.cpp keeps audio and transcripts off public AI APIs
 - **Obsidian archive** — durable local Markdown summaries with optional full transcripts
-- **Notion integration** — optionally publish each summary to a Notion database
+- **Fail-closed output policy** — NVIDIA-internal mode writes only to local Obsidian
 - **Web dashboard** — real-time job tracking with dark mode, SSE live updates
 - **Job management** — cancel, delete, and auto-cleanup of old jobs
 - **Concurrent processing** — async worker pool handles multiple jobs without blocking
@@ -24,6 +26,8 @@ A personal media intelligence pipeline. Submit videos, podcasts, articles, newsl
 - **Python 3.11+**
 - **[`uv`](https://docs.astral.sh/uv/)** — Python package manager
 - **`ffmpeg`** — required for podcast audio compression and YouTube Whisper fallback
+- **`whisper.cpp` plus a local model** — required for audio and video transcription
+- **NVIDIA network access and an Inference Hub key** — required for summarization
 
 ## Setup
 
@@ -54,7 +58,7 @@ cd media-summarizer
 cp .env.example .env
 ```
 
-Edit `.env` and fill in your API keys (see [Environment Variables](#environment-variables) below for where to get each one).
+Edit `.env` and configure the NVIDIA Inference Hub key and local Whisper model.
 
 ### 4. Create venv and install dependencies
 
@@ -62,7 +66,22 @@ Edit `.env` and fill in your API keys (see [Environment Variables](#environment-
 uv sync --extra dev --locked
 ```
 
-### 5. Configure Obsidian
+### 5. Configure NVIDIA-internal processing
+
+```dotenv
+PROCESSING_MODE=nvidia_internal
+NVIDIA_INFERENCE_API_KEY=<owner-only NVIDIA key>
+NVIDIA_INFERENCE_BASE_URL=https://inference-api.nvidia.com
+NVIDIA_INFERENCE_MODEL=us/azure/anthropic/eccn-claude-sonnet-5
+LOCAL_WHISPER_EXECUTABLE=whisper-cli
+LOCAL_WHISPER_MODEL=/absolute/path/to/ggml-large-v3-turbo.bin
+```
+
+The configured model must be present in Inference Hub's live `/v1/models`
+catalog. The application rejects alternate gateway origins and never falls back
+to Anthropic's public API or OpenAI in this mode.
+
+### 6. Configure Obsidian
 
 Create or choose an Obsidian vault, then set its absolute path in `.env`:
 
@@ -75,11 +94,10 @@ The vault must already contain an `.obsidian` directory. Generated content is
 written only beneath `Generated/Summaries` and `Generated/Transcripts`; existing
 notes are never replaced.
 
-> **Data boundary:** `cloud_public` mode sends transcripts to Anthropic and may
-> send downloaded audio to OpenAI. Every submission must explicitly confirm that
-> the content is public or approved for external AI. Never approve confidential,
-> internal, restricted, or regulated material in that mode. Notion is another
-> external destination when enabled.
+> **Data boundary:** `nvidia_internal` mode transcribes downloaded media locally
+> with whisper.cpp and sends transcript text only to NVIDIA Inference Hub.
+> Notion, webhooks, Anthropic's public API, and OpenAI are disabled. Public URL
+> ingestion still contacts the source website to retrieve public metadata or media.
 
 For local processing, set `PROCESSING_MODE=local`, run Ollama on a loopback
 address, and configure a local whisper.cpp executable/model. In local mode the
@@ -94,9 +112,10 @@ Private, deleted, age-gated, or login-required posts are rejected.
 Posts containing multiple videos are rejected rather than selecting one
 ambiguously; single-video `/video/N` URL variants are normalized automatically.
 
-### 6. Set up Notion (optional)
+### 7. Set up Notion (legacy cloud-public mode only)
 
-Notion publishing is disabled by default. To publish a secondary copy, set
+Notion is always disabled in `nvidia_internal` and `local` modes. In the legacy
+`cloud_public` mode, publishing is disabled by default. To publish a secondary copy, set
 `NOTION_ENABLED=true`, then:
 
 1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) and create a new **Internal Integration**.
@@ -120,7 +139,7 @@ Notion publishing is disabled by default. To publish a secondary copy, set
 4. Click **Share** on your database and invite your integration.
 5. Copy the database ID from the URL (`https://notion.so/yourworkspace/<DATABASE_ID>?v=...`) into `NOTION_DATABASE_ID`.
 
-### 7. Start the server
+### 8. Start the server
 
 ```bash
 uv run uvicorn main:app --host 127.0.0.1 --port 8000
@@ -128,7 +147,7 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 
 Open `http://localhost:8000` in your browser. You should see the dashboard.
 
-### 8. Verify everything works
+### 9. Verify everything works
 
 ```bash
 # Quick health check
@@ -140,7 +159,7 @@ curl "http://localhost:8000/health?deep=true"
 
 A healthy response looks like:
 ```json
-{"status": "ok", "db": "ok", "anthropic": "ok", "openai": "ok", "obsidian": "ok", "notion": "ok", "worker_queue_size": 0}
+{"status":"ok","db":"ok","nvidia_inference":"ok","local_whisper":"ok","anthropic":"disabled (NVIDIA internal mode)","openai":"disabled (NVIDIA internal mode)","obsidian":"ok","notion":"disabled (nvidia_internal mode)","webhooks":"disabled (nvidia_internal mode)","worker_queue_size":0}
 ```
 
 ---
@@ -156,19 +175,17 @@ and writes logs under `~/Library/Logs/media-summarizer/`.
 ```bash
 uv sync --extra dev
 uv run python scripts/install_macos_service.py install \
-  --obsidian-vault "$HOME/Documents/Media-Library" \
-  --disable-notion
+  --obsidian-vault "$HOME/Documents/Media-Library"
 
 # Inspect or remove the service
 uv run python scripts/install_macos_service.py status
 uv run python scripts/install_macos_service.py uninstall
 ```
 
-The installer requires `.env` and `.venv/bin/uvicorn` to exist. The Obsidian
+The installer pins `PROCESSING_MODE=nvidia_internal` and disables Notion and
+webhooks regardless of `.env`. It requires `.env` and `.venv/bin/uvicorn` to exist. The Obsidian
 argument configures the vault without placing its path in `.env`.
-`--disable-notion` keeps the Mac service's output local even if `.env` enables
-Notion; omit it when you intentionally want both destinations. The generated
-launchd configuration uses an owner-only umask so newly created runtime files
+The generated launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
 
@@ -359,7 +376,7 @@ If you don't want Tailscale, you can bind to `0.0.0.0` to listen on all network 
 # Submit a single video
 curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "external_processing_approved": true}'
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 
 # Submit a playlist (auto-expands into individual jobs)
 curl -X POST http://localhost:8000/summarize \
@@ -369,7 +386,7 @@ curl -X POST http://localhost:8000/summarize \
 # Submit a public X/Twitter video post
 curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://x.com/example/status/1234567890", "external_processing_approved": true}'
+  -d '{"url": "https://x.com/example/status/1234567890"}'
 
 # Submit multiple URLs at once
 curl -X POST http://localhost:8000/summarize/bulk \
@@ -402,21 +419,18 @@ Async Worker Pool (concurrency=2)
   |
   v
 Source.fetch()
-  - YouTube: native transcript -> Whisper fallback if unavailable
-  - X/Twitter and Vimeo: yt-dlp audio extraction -> Whisper transcription
-  - Podcast: Apple/RSS -> MP3 download -> Whisper transcription
+  - YouTube: native transcript -> local whisper.cpp fallback if unavailable
+  - X/Twitter and Vimeo: yt-dlp audio extraction -> local whisper.cpp
+  - Podcast: Apple/RSS -> MP3 download -> local whisper.cpp
   |
   v
-summarize() via Claude API -> structured JSON (tldr, key_points, tags, worth_rewatching)
+summarize() via NVIDIA Inference Hub -> structured JSON
   |
   v
 save_to_obsidian() -> local Markdown summary + optional transcript
   |
   v
-save_to_notion() -> optional Notion database page with properties + body
-  |
-  v
-Job marked done, webhook fired (if configured)
+Job marked done; external outputs remain disabled
 ```
 
 ### Pipeline Stages
@@ -438,7 +452,7 @@ uv run mypy .
 # Run unit tests (no API keys needed)
 uv run pytest
 
-# Run integration tests (requires real API keys in .env)
+# Run integration tests (requires configured providers in .env)
 uv run pytest -m integration
 ```
 
@@ -450,13 +464,16 @@ Copy `.env.example` to `.env` and fill in:
 
 | Variable                    | Required | Description                                     | Where to get it |
 |-----------------------------|----------|-------------------------------------------------|-----------------|
-| `ANTHROPIC_API_KEY`         | Yes      | Claude API key for summarization                | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
-| `OPENAI_API_KEY`            | Yes      | OpenAI key for Whisper transcription            | [platform.openai.com](https://platform.openai.com/api-keys) |
-| `PROCESSING_MODE`           | No       | `cloud_public` (default) or fully local providers | — |
+| `PROCESSING_MODE`           | No       | `nvidia_internal` (default), legacy `cloud_public`, or `local` | — |
+| `NVIDIA_INFERENCE_API_KEY`  | NVIDIA mode | Owner-only NVIDIA Inference Hub key           | NVIDIA Inference Hub |
+| `NVIDIA_INFERENCE_BASE_URL` | NVIDIA mode | Must be exactly `https://inference-api.nvidia.com` | — |
+| `NVIDIA_INFERENCE_MODEL`    | NVIDIA mode | Model ID verified against `/v1/models`       | — |
+| `ANTHROPIC_API_KEY`         | Legacy cloud mode | Public Claude API key                    | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| `OPENAI_API_KEY`            | Legacy cloud mode | Public Whisper API key                   | [platform.openai.com](https://platform.openai.com/api-keys) |
 | `OLLAMA_BASE_URL`           | Local mode | Loopback Ollama URL (default: `http://127.0.0.1:11434`) | — |
 | `OLLAMA_MODEL`              | Local mode | Installed Ollama model name                    | — |
-| `LOCAL_WHISPER_EXECUTABLE`  | Local audio/video | whisper.cpp executable (default: `whisper-cli`) | — |
-| `LOCAL_WHISPER_MODEL`       | Local audio/video | Absolute path to a local whisper.cpp model     | — |
+| `LOCAL_WHISPER_EXECUTABLE`  | NVIDIA/local audio | whisper.cpp executable (default: `whisper-cli`) | — |
+| `LOCAL_WHISPER_MODEL`       | NVIDIA/local audio | Absolute path to a local whisper.cpp model     | — |
 | `LOCAL_FFMPEG_TIMEOUT_SECONDS` | No | Maximum local media-conversion runtime (default: 600) | — |
 | `LOCAL_WHISPER_TIMEOUT_SECONDS` | No | Maximum local transcription runtime (default: 14400) | — |
 | `UPLOAD_DIR`                | No       | Private crash-recovery storage for pending uploads | — |
@@ -465,19 +482,19 @@ Copy `.env.example` to `.env` and fill in:
 | `DB_RETAIN_TRANSCRIPT`      | No       | Retain full transcripts in SQLite after terminal jobs (default: false) | — |
 | `JOB_DB_PATH`               | No       | Operational SQLite path under Application Support | — |
 | `BACKUP_DIR`                | No       | Destination for verified local snapshots | — |
-| `NOTION_ENABLED`            | No       | Enable optional Notion publishing (default: false) | — |
+| `NOTION_ENABLED`            | Legacy cloud mode | Enable optional Notion publishing (default: false) | — |
 | `NOTION_API_KEY`            | If enabled | Notion integration token                      | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
 | `NOTION_DATABASE_ID`        | If enabled | Target Notion database ID                     | From your database URL |
 | `YOUTUBE_API_KEY`           | No       | YouTube Data API key (optional metadata optimization) | [Google Cloud Console](https://console.cloud.google.com) |
 | `OPENCLAW_WEBHOOK_URL`      | No       | Webhook URL for notifications                   | Your webhook endpoint |
-| `WEBHOOKS_ENABLED`          | No       | Explicitly enable outbound result webhooks (default: false) | — |
+| `WEBHOOKS_ENABLED`          | Legacy cloud mode | Explicitly enable outbound result webhooks | — |
 | `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
 | `PODCAST_INDEX_API_SECRET`  | No       | Podcast Index API secret                        | Same as above |
 | `PORT`                      | No       | Server port (default: 8000)                     | — |
 | `SUMMARY_CHUNK_CHARS`       | No       | Transcript characters per summary chunk (default: 60,000) | — |
 | `MAX_TRANSCRIPT_CHARS`      | No       | Hard transcript-size limit per job (default: 600,000) | — |
-| `MAX_ANTHROPIC_REQUESTS_PER_JOB` | No | Anthropic request cap including retries (default: 12) | — |
-| `MAX_OPENAI_REQUESTS_PER_JOB` | No     | OpenAI request cap including retries (default: 3) | — |
+| `MAX_ANTHROPIC_REQUESTS_PER_JOB` | No | Anthropic-protocol summary request cap including retries (default: 12) | — |
+| `MAX_OPENAI_REQUESTS_PER_JOB` | Legacy cloud mode | OpenAI request cap including retries (default: 3) | — |
 | `MAX_AUDIO_DURATION_SECONDS` | No      | Audio duration cap (default: 14,400 / 4 hours)  | — |
 | `MAX_AUDIO_DOWNLOAD_BYTES`  | No       | Download-size cap (default: 500 MB)             | — |
 | `SOURCE_FETCH_TIMEOUT_SECONDS` | No    | Network timeout for video metadata and captions (default: 120) | — |
@@ -486,21 +503,21 @@ Copy `.env.example` to `.env` and fill in:
 | `MAX_ESTIMATED_COST_USD`    | No       | Combined estimated API spend cap per job (default: $2) | — |
 | `ANTHROPIC_INPUT_COST_PER_MILLION_USD` | No | Claude input-token estimate rate (default: $3) | Anthropic pricing |
 | `ANTHROPIC_OUTPUT_COST_PER_MILLION_USD` | No | Claude output-token estimate rate (default: $15) | Anthropic pricing |
-| `WHISPER_COST_PER_MINUTE_USD` | No     | Whisper estimate rate (default: $0.006)         | OpenAI pricing |
+| `WHISPER_COST_PER_MINUTE_USD` | Legacy cloud mode | Whisper estimate rate (default: $0.006) | OpenAI pricing |
 | `NOTION_TEST_DATABASE_ID`   | No       | Separate Notion DB for integration tests (keeps test pages out of your real DB) | Create a blank database |
 
-Cost estimates use configurable rates matching the pinned models: Claude Sonnet
-input/output pricing and Whisper per-minute pricing. Check the official
-[Anthropic pricing](https://docs.anthropic.com/en/docs/about-claude/pricing) and
-[OpenAI Whisper pricing](https://developers.openai.com/api/docs/models/whisper-1)
-before changing models or relying on the estimate for budgeting.
+Request, token, transcript-size, media-duration, and estimated-cost bounds remain
+enforced in NVIDIA-internal mode. The configurable cost rates are conservative
+accounting controls; they are not a statement of internal chargeback pricing.
 
 ---
 
 ## Troubleshooting
 
 **"No transcript available" for a YouTube video**
-The video may not have captions. Media Summarizer will automatically fall back to Whisper transcription (downloading the audio and transcribing it). If this also fails, ensure `ffmpeg` is installed.
+The video may not have captions. Media Summarizer falls back to local whisper.cpp
+after downloading the audio. Verify `ffmpeg`, `whisper-cli`, and
+`LOCAL_WHISPER_MODEL` with the deep health endpoint.
 
 **Deep health check shows "not configured"**
 One or more API keys are missing from your `.env` file. Check the [Environment Variables](#environment-variables) table.

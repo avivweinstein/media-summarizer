@@ -673,6 +673,22 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_nvidia_internal_mode_never_sends_webhook(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            processing_mode="nvidia_internal",
+            external_processing_approved=False,
+            db_path=db_path,
+        )
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await _notify_webhook(job, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_local_mode_never_sends_webhook(self, db_path: str, mocker: MagicMock) -> None:
         job = await job_queue.create_job(
             "https://youtube.com/watch?v=abc123",

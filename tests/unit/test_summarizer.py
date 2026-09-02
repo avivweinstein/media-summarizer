@@ -181,6 +181,41 @@ class TestChunkText:
 
 
 class TestSummarize:
+    async def test_nvidia_internal_uses_only_internal_endpoint(
+        self, mocker: MagicMock
+    ) -> None:
+        mock_client = AsyncMock()
+        mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
+        factory = mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch.object(settings, "nvidia_inference_api_key", "nvidia-key")
+        mocker.patch.object(
+            settings,
+            "nvidia_inference_base_url",
+            "https://inference-api.nvidia.com",
+        )
+        mocker.patch.object(settings, "nvidia_inference_model", "internal-model")
+        mocker.patch.object(settings, "anthropic_api_key", "public-key-must-not-be-used")
+
+        await summarize(make_result(), processing_mode="nvidia_internal")
+
+        factory.assert_called_once_with(
+            api_key="nvidia-key",
+            base_url="https://inference-api.nvidia.com",
+            max_retries=0,
+        )
+        assert mock_client.messages.create.call_args.kwargs["model"] == "internal-model"
+
+    async def test_nvidia_internal_missing_key_never_constructs_client(
+        self, mocker: MagicMock
+    ) -> None:
+        factory = mocker.patch("summarizer.AsyncAnthropic")
+        mocker.patch.object(settings, "nvidia_inference_api_key", "")
+
+        with pytest.raises(SummarizationError, match="NVIDIA_INFERENCE_API_KEY"):
+            await summarize(make_result(), processing_mode="nvidia_internal")
+
+        factory.assert_not_called()
+
     async def test_local_mode_never_calls_anthropic(self, mocker: MagicMock) -> None:
         response = MagicMock()
         response.json.return_value = {"message": {"content": VALID_JSON}}

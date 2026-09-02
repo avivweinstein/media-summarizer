@@ -141,6 +141,27 @@ class TestTranscribeFileCleanup:
         local.assert_awaited_once()
         openai.assert_not_called()
 
+    async def test_nvidia_internal_mode_never_calls_openai(
+        self, tmp_path: Path, mocker: MagicMock
+    ) -> None:
+        media = tmp_path / "internal.mp3"
+        media.write_bytes(b"audio")
+        local = mocker.patch(
+            "transcriber._transcribe_local",
+            new=AsyncMock(return_value=TranscriptionOutput(text="Internal transcript.")),
+        )
+        openai = mocker.patch("transcriber.AsyncOpenAI")
+
+        result = await transcribe(
+            media,
+            job_id="internal-job",
+            processing_mode="nvidia_internal",
+        )
+
+        assert result.text == "Internal transcript."
+        local.assert_awaited_once()
+        openai.assert_not_called()
+
     async def test_persists_reservation_before_openai_call(
         self, tmp_path: Path, mocker: MagicMock
     ) -> None:

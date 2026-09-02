@@ -144,7 +144,7 @@ async def _notify_webhook(
     settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
-    if job.processing_mode == "local" or not settings.webhooks_enabled:
+    if job.processing_mode in {"local", "nvidia_internal"} or not settings.webhooks_enabled:
         return
     if urls is None:
         fresh = await job_queue.get_job(job.job_id, db_path=db_path)
@@ -232,7 +232,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     interrupted_stage = job.stage if job.interrupted else None
     job.interrupted = False
 
-    if job.processing_mode not in {"cloud_public", "local"}:
+    if job.processing_mode not in {"nvidia_internal", "cloud_public", "local"}:
         job.status = JobStatus.failed
         job.stage = JobStage.failed
         job.error = "Job has an invalid persisted processing mode."
@@ -406,7 +406,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                 return
 
             if (
-                job.processing_mode != "local"
+                job.processing_mode == "cloud_public"
                 and settings.notion_enabled
                 and not job.notion_page_id
             ):
