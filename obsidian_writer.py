@@ -1,6 +1,5 @@
 """Write durable, idempotent Markdown records into an Obsidian vault."""
 
-import asyncio
 import hashlib
 import json
 import os
@@ -10,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from async_utils import run_blocking
 from exceptions import ObsidianError
 from models import Summary, TranscriptResult, UsageStats
 
@@ -264,7 +264,7 @@ async def save_to_obsidian(
 ) -> str:
     """Save a summary and optional transcript, returning the vault-relative note path."""
     timestamp = added_at or datetime.now(UTC)
-    return await asyncio.to_thread(
+    return await run_blocking(
         _save_sync,
         result,
         summary,

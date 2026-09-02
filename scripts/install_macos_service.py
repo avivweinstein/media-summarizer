@@ -8,9 +8,12 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 LABEL = "com.avivw.media-summarizer"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+BACKUP_LABEL = f"{LABEL}.backup"
+BACKUP_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{BACKUP_LABEL}.plist"
 LOG_DIR = Path.home() / "Library" / "Logs" / "media-summarizer"
 
 
@@ -53,15 +56,39 @@ def build_plist(
     }
 
 
-def _target() -> str:
-    return f"gui/{os.getuid()}/{LABEL}"
+def build_backup_plist(project_dir: Path, obsidian_vault_path: Path) -> dict[str, Any]:
+    """Build a daily, local snapshot job for the database and Obsidian vault."""
+    return {
+        "Label": BACKUP_LABEL,
+        "ProgramArguments": [
+            str(project_dir / ".venv" / "bin" / "python"),
+            "-m",
+            "scripts.backup_media_library",
+            "create",
+        ],
+        "WorkingDirectory": str(project_dir),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "OBSIDIAN_VAULT_PATH": str(obsidian_vault_path),
+        },
+        "RunAtLoad": True,
+        "StartInterval": 86_400,
+        "ProcessType": "Background",
+        "StandardOutPath": str(LOG_DIR / "backup.log"),
+        "StandardErrorPath": str(LOG_DIR / "backup-error.log"),
+        "Umask": 0o077,
+    }
 
 
-def _wait_until_unloaded(timeout_seconds: float = 5.0) -> None:
+def _target(label: str = LABEL) -> str:
+    return f"gui/{os.getuid()}/{label}"
+
+
+def _wait_until_unloaded(timeout_seconds: float = 5.0, *, label: str = LABEL) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         result = subprocess.run(
-            ["launchctl", "print", _target()],
+            ["launchctl", "print", _target(label)],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -69,7 +96,29 @@ def _wait_until_unloaded(timeout_seconds: float = 5.0) -> None:
         if result.returncode != 0:
             return
         time.sleep(0.1)
-    raise SystemExit(f"Timed out waiting for {_target()} to unload.")
+    raise SystemExit(f"Timed out waiting for {_target(label)} to unload.")
+
+
+def _wait_until_healthy(host: str, port: int, timeout_seconds: float = 20.0) -> None:
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(f"http://{probe_host}:{port}/health", timeout=1) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        time.sleep(0.1)
+    raise SystemExit("Timed out waiting for the media summarizer to initialize.")
+
+
+def _write_plist(path: Path, payload: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        plistlib.dump(payload, temp)
+        temp_path = Path(temp.name)
+    temp_path.chmod(0o600)
+    temp_path.replace(path)
 
 
 def install(
@@ -94,7 +143,8 @@ def install(
             raise SystemExit(f"Not an Obsidian vault: {obsidian_vault_path}")
 
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    LOG_DIR.chmod(0o700)
     payload = build_plist(
         project_dir,
         host,
@@ -102,11 +152,7 @@ def install(
         obsidian_vault_path,
         disable_notion=disable_notion,
     )
-    with tempfile.NamedTemporaryFile(dir=PLIST_PATH.parent, delete=False) as temp:
-        plistlib.dump(payload, temp)
-        temp_path = Path(temp.name)
-    temp_path.chmod(0o600)
-    temp_path.replace(PLIST_PATH)
+    _write_plist(PLIST_PATH, payload)
 
     subprocess.run(
         ["launchctl", "bootout", _target()],
@@ -119,6 +165,33 @@ def install(
     subprocess.run(["launchctl", "bootstrap", domain, str(PLIST_PATH)], check=True)
     subprocess.run(["launchctl", "enable", _target()], check=True)
     subprocess.run(["launchctl", "kickstart", "-k", _target()], check=True)
+    if obsidian_vault_path is not None:
+        _wait_until_healthy(host, port)
+        backup_payload = build_backup_plist(project_dir, obsidian_vault_path)
+        _write_plist(BACKUP_PLIST_PATH, backup_payload)
+        subprocess.run(
+            ["launchctl", "bootout", _target(BACKUP_LABEL)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_until_unloaded(label=BACKUP_LABEL)
+        subprocess.run(
+            ["launchctl", "bootstrap", domain, str(BACKUP_PLIST_PATH)], check=True
+        )
+        subprocess.run(["launchctl", "enable", _target(BACKUP_LABEL)], check=True)
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", _target(BACKUP_LABEL)], check=True
+        )
+    else:
+        subprocess.run(
+            ["launchctl", "bootout", _target(BACKUP_LABEL)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_until_unloaded(label=BACKUP_LABEL)
+        BACKUP_PLIST_PATH.unlink(missing_ok=True)
 
 
 def uninstall() -> None:
@@ -131,11 +204,20 @@ def uninstall() -> None:
     )
     _wait_until_unloaded()
     PLIST_PATH.unlink(missing_ok=True)
+    subprocess.run(
+        ["launchctl", "bootout", _target(BACKUP_LABEL)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _wait_until_unloaded(label=BACKUP_LABEL)
+    BACKUP_PLIST_PATH.unlink(missing_ok=True)
 
 
 def status() -> None:
     """Print the launchd service status."""
     subprocess.run(["launchctl", "print", _target()], check=True)
+    subprocess.run(["launchctl", "print", _target(BACKUP_LABEL)], check=False)
 
 
 def main() -> None:

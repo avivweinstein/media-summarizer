@@ -1,7 +1,15 @@
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
-from scripts.install_macos_service import LABEL, _wait_until_unloaded, build_plist, uninstall
+from scripts.install_macos_service import (
+    BACKUP_LABEL,
+    LABEL,
+    _wait_until_healthy,
+    _wait_until_unloaded,
+    build_backup_plist,
+    build_plist,
+    uninstall,
+)
 
 
 def test_build_plist_uses_localhost_and_project_environment() -> None:
@@ -49,6 +57,19 @@ def test_build_plist_can_disable_notion() -> None:
     assert plist["EnvironmentVariables"]["NOTION_ENABLED"] == "false"
 
 
+def test_build_backup_plist_runs_daily_with_private_files() -> None:
+    plist = build_backup_plist(
+        Path("/Users/test/media-summarizer"),
+        Path("/Users/test/Documents/Media-Library"),
+    )
+
+    assert plist["Label"] == BACKUP_LABEL
+    assert plist["ProgramArguments"][-2:] == ["scripts.backup_media_library", "create"]
+    assert plist["StartInterval"] == 86_400
+    assert plist["RunAtLoad"] is True
+    assert plist["Umask"] == 0o077
+
+
 def test_wait_until_unloaded_retries_until_launchd_forgets_service(mocker: MagicMock) -> None:
     run = mocker.patch("scripts.install_macos_service.subprocess.run")
     run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
@@ -59,16 +80,34 @@ def test_wait_until_unloaded_retries_until_launchd_forgets_service(mocker: Magic
     assert run.call_count == 2
 
 
+def test_wait_until_healthy_retries_until_service_is_ready(mocker: MagicMock) -> None:
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    request = mocker.patch(
+        "scripts.install_macos_service.urlopen",
+        side_effect=[OSError("not ready"), response],
+    )
+    mocker.patch("scripts.install_macos_service.time.sleep")
+
+    _wait_until_healthy("127.0.0.1", 8000)
+
+    assert request.call_count == 2
+
+
 def test_uninstall_waits_for_service_before_removing_plist(
     mocker: MagicMock, tmp_path: Path
 ) -> None:
     plist_path = tmp_path / "service.plist"
+    backup_plist_path = tmp_path / "backup.plist"
     plist_path.touch()
+    backup_plist_path.touch()
     mocker.patch("scripts.install_macos_service.PLIST_PATH", plist_path)
+    mocker.patch("scripts.install_macos_service.BACKUP_PLIST_PATH", backup_plist_path)
     mocker.patch("scripts.install_macos_service.subprocess.run")
     wait = mocker.patch("scripts.install_macos_service._wait_until_unloaded")
 
     uninstall()
 
-    wait.assert_called_once_with()
+    assert wait.call_args_list == [call(), call(label=BACKUP_LABEL)]
     assert not plist_path.exists()
+    assert not backup_plist_path.exists()

@@ -14,11 +14,12 @@ import httpx
 import yt_dlp
 
 import job_queue
+from async_utils import run_blocking
 from config import settings
 from exceptions import UnsupportedURLError, UsageLimitError
 from models import Job, JobStage, JobStatus, TranscriptResult, UsageStats
 from notion_writer import save_to_notion
-from obsidian_writer import save_to_obsidian
+from obsidian_writer import SUMMARY_DIR, save_to_obsidian, source_id
 from sources.article import ArticleSource
 from sources.media import MediaSource
 from sources.podcast import PodcastSource
@@ -98,6 +99,7 @@ def _extract_playlist_videos_sync(url: str) -> list[str]:
         "no_warnings": True,
         "extract_flat": True,
         "skip_download": True,
+        "socket_timeout": settings.source_fetch_timeout_seconds,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -116,8 +118,7 @@ def _extract_playlist_videos_sync(url: str) -> list[str]:
 
 async def expand_playlist(url: str) -> list[str]:
     """Expand a playlist URL into individual video URLs. Runs yt-dlp in executor."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _extract_playlist_videos_sync, url)
+    return await run_blocking(_extract_playlist_videos_sync, url)
 
 
 async def _notify_webhook(
@@ -331,6 +332,19 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             if await _check_cancelled(job, db_path):
                 return
 
+            if job.summary is None and settings.obsidian_vault_path:
+                expected_note = (SUMMARY_DIR / f"{source_id(result)}.md").as_posix()
+                archived = await job_queue.find_archived_output(
+                    expected_note,
+                    processing_mode=job.processing_mode,
+                    db_path=db_path,
+                )
+                if archived is not None:
+                    job.summary, job.obsidian_note_path, job.notion_page_id = archived
+                    if not await job_queue.update_job(job, db_path=db_path):
+                        return
+                    logger.info("%s event=archive_output_reused", log)
+
             if job.summary is not None:
                 summary = job.summary
                 logger.info("%s event=summary_reused_after_restart", log)
@@ -439,6 +453,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     raise notion_failure
                 raise RuntimeError("No configured output destination succeeded.")
 
+            await job_queue.record_archive(job, db_path=db_path)
+            if not settings.db_retain_transcript:
+                job.result = result.model_copy(update={"transcript": "", "segments": []})
             job.status = JobStatus.done
             job.stage = JobStage.done
             if not await job_queue.update_job(job, db_path=db_path):
@@ -464,6 +481,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     job.status = JobStatus.failed
     job.stage = JobStage.failed
     job.error = last_error
+    if job.result is not None and not settings.db_retain_transcript:
+        job.result = job.result.model_copy(update={"transcript": "", "segments": []})
     if await job_queue.update_job(job, db_path=db_path):
         logger.error("%s event=job_failed_final error=%r", log, last_error)
         cleanup_upload(job.url)

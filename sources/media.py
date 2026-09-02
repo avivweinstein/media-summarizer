@@ -1,10 +1,11 @@
 """Generic hosted media source, including Vimeo."""
 
-import asyncio
+import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
+from async_utils import run_blocking
 from config import settings
 from exceptions import UnsupportedURLError, UsageLimitError
 from models import TranscriptResult, UsageStats
@@ -33,7 +34,6 @@ class MediaSource:
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
         processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
-        loop = asyncio.get_running_loop()
         hostname = (urlparse(url).hostname or "").casefold().removeprefix("www.")
         is_vimeo = hostname in {"vimeo.com", "player.vimeo.com"}
         metadata: dict[str, object] = {}
@@ -42,7 +42,7 @@ class MediaSource:
         if is_vimeo:
             media_url = _vimeo_player_url(url)
             await _validate_public_http_url(media_url)
-            metadata = await loop.run_in_executor(None, _fetch_metadata_sync, media_url)
+            metadata = await run_blocking(_fetch_metadata_sync, media_url)
         else:
             media_url = url
             raw_suffix = Path(urlparse(url).path).suffix.casefold() or ".media"
@@ -59,12 +59,14 @@ class MediaSource:
         if duration_seconds > settings.max_audio_duration_seconds:
             raise UsageLimitError("Media exceeds the configured duration limit.")
         if is_vimeo:
-            await loop.run_in_executor(
-                None,
+            cancel_event = threading.Event()
+            await run_blocking(
                 _download_audio_sync,
                 media_url,
                 destination,
                 settings.max_audio_download_bytes,
+                cancel_event,
+                cancel=cancel_event.set,
             )
         transcription = await transcribe(
             destination,

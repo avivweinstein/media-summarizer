@@ -4,13 +4,15 @@ If no native transcript is available, falls back to downloading audio via yt-dlp
 and transcribing with OpenAI Whisper.
 """
 
-import asyncio
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import requests
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -19,6 +21,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
+from async_utils import run_blocking
 from config import settings
 from exceptions import MetadataError, UsageLimitError
 from models import TranscriptionOutput, TranscriptResult, TranscriptSegment, UsageStats
@@ -26,6 +29,14 @@ from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 
 logger = logging.getLogger(__name__)
+
+
+class _TimeoutSession(requests.Session):
+    def request(
+        self, method: str | bytes, url: str | bytes, *args: Any, **kwargs: Any
+    ) -> requests.Response:
+        kwargs.setdefault("timeout", settings.source_fetch_timeout_seconds)
+        return super().request(method, url, *args, **kwargs)
 
 
 def _extract_video_id(url: str) -> str:
@@ -49,32 +60,35 @@ def _fetch_transcript_sync(video_id: str) -> TranscriptionOutput | None:
     Tries native English transcript first, falls back to any language.
     Returns None (instead of raising) so the caller can fall back to Whisper.
     """
-    api = YouTubeTranscriptApi()
-    try:
-        listing = api.list(video_id)
-    except (TranscriptsDisabled, VideoUnavailable):
-        return None
-    except Exception:
-        return None
+    with _TimeoutSession() as session:
+        api = YouTubeTranscriptApi(http_client=session)
+        try:
+            listing = api.list(video_id)
+        except (TranscriptsDisabled, VideoUnavailable):
+            return None
+        except Exception:
+            return None
 
-    available = list(listing)
-    if not available:
-        return None
+        available = list(listing)
+        if not available:
+            return None
 
-    # Prefer human-made English, then any English, then first available
-    try:
-        transcript_obj = listing.find_transcript(["en", "en-US", "en-GB", "en-CA", "en-AU"])
-    except NoTranscriptFound:
-        transcript_obj = available[0]
-        logger.warning(
-            "url=- source=youtube event=non_english_transcript lang=%s",
-            transcript_obj.language_code,
-        )
+        # Prefer human-made English, then any English, then first available
+        try:
+            transcript_obj = listing.find_transcript(
+                ["en", "en-US", "en-GB", "en-CA", "en-AU"]
+            )
+        except NoTranscriptFound:
+            transcript_obj = available[0]
+            logger.warning(
+                "url=- source=youtube event=non_english_transcript lang=%s",
+                transcript_obj.language_code,
+            )
 
-    try:
-        fetched = transcript_obj.fetch()
-    except Exception:
-        return None
+        try:
+            fetched = transcript_obj.fetch()
+        except Exception:
+            return None
 
     segments = [
         TranscriptSegment(
@@ -98,6 +112,7 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
         "no_warnings": True,
         "proxy": "",
         "skip_download": True,
+        "socket_timeout": settings.source_fetch_timeout_seconds,
     }
     if youtube_api_key:
         opts["youtube_api_key"] = youtube_api_key
@@ -123,10 +138,17 @@ def _parse_upload_date(raw: str | None) -> datetime | None:
         return None
 
 
-def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
+def _download_audio_sync(
+    url: str,
+    dest: Path,
+    max_bytes: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Download audio from a YouTube video via yt-dlp as MP3."""
 
     def enforce_size(progress: dict[str, object]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Media download cancelled.")
         downloaded = progress.get("downloaded_bytes", 0)
         if isinstance(downloaded, (int, float)) and downloaded > max_bytes:
             raise UsageLimitError("YouTube audio exceeds the configured download-size limit.")
@@ -139,6 +161,7 @@ def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
         "max_filesize": max_bytes,
         "outtmpl": str(dest.with_suffix(".%(ext)s")),
         "progress_hooks": [enforce_size],
+        "socket_timeout": settings.source_fetch_timeout_seconds,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -188,18 +211,17 @@ class YouTubeSource(BaseSource):
         processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
-        loop = asyncio.get_event_loop()
         video_id = _extract_video_id(url)
 
         logger.info("%s event=metadata_fetch_start", log)
-        meta = await loop.run_in_executor(None, _fetch_metadata_sync, url, self.youtube_api_key)
+        meta = await run_blocking(_fetch_metadata_sync, url, self.youtube_api_key)
         logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
         duration_seconds = int(str(meta.get("duration") or 0))
         usage_tracker = usage or UsageStats()
 
         # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
-        transcription = await loop.run_in_executor(None, _fetch_transcript_sync, video_id)
+        transcription = await run_blocking(_fetch_transcript_sync, video_id)
 
         if transcription and transcription.text:
             transcription_model = "youtube/captions"
@@ -218,12 +240,14 @@ class YouTubeSource(BaseSource):
                 )
             dest = tmp_path_for_job(job_id)
             logger.info("%s event=audio_download_start", log)
-            await loop.run_in_executor(
-                None,
+            cancel_event = threading.Event()
+            await run_blocking(
                 _download_audio_sync,
                 url,
                 dest,
                 settings.max_audio_download_bytes,
+                cancel_event,
+                cancel=cancel_event.set,
             )
             logger.info(
                 "%s event=audio_download_done size_mb=%.1f",
