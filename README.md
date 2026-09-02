@@ -124,7 +124,11 @@ uv run python scripts/install_macos_service.py uninstall
 
 The installer requires `.env` and `.venv/bin/uvicorn` to exist. Its generated
 launchd configuration uses an owner-only umask so newly created runtime files
-are not readable by other local users.
+are not readable by other local users, and includes standard Homebrew paths so
+`ffmpeg` remains available outside an interactive shell.
+
+The process pauses with the Mac and resumes after wake. Jobs interrupted by a
+process restart are not resumed automatically; delete and resubmit them.
 
 ### Linux (systemd)
 
@@ -369,8 +373,8 @@ One or more API keys are missing from your `.env` file. Check the [Environment V
 **"ffmpeg not installed" error**
 Whisper fallback and podcast compression require ffmpeg. Install it with `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux).
 
-**Jobs stuck in "processing" after restart**
-Jobs that were mid-processing when the server stopped may remain in "processing" status. They will not auto-retry. You can delete them via the UI or API and resubmit.
+**Jobs stuck after restart**
+Pending or processing jobs from before the server stopped are not re-enqueued automatically. You can delete them via the UI or API and resubmit.
 
 **Service won't start (systemd)**
 Check logs with `journalctl --user -u media-summarizer -n 50`. Common issues:

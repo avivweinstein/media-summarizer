@@ -1,6 +1,7 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
-from scripts.install_macos_service import LABEL, build_plist
+from scripts.install_macos_service import LABEL, _wait_until_unloaded, build_plist, uninstall
 
 
 def test_build_plist_uses_localhost_and_project_environment() -> None:
@@ -20,4 +21,30 @@ def test_build_plist_uses_localhost_and_project_environment() -> None:
     ]
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] == {"SuccessfulExit": False}
+    assert str(plist["EnvironmentVariables"]["PATH"]).startswith("/opt/homebrew/bin:")
     assert plist["Umask"] == 0o077
+
+
+def test_wait_until_unloaded_retries_until_launchd_forgets_service(mocker: MagicMock) -> None:
+    run = mocker.patch("scripts.install_macos_service.subprocess.run")
+    run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
+    mocker.patch("scripts.install_macos_service.time.sleep")
+
+    _wait_until_unloaded()
+
+    assert run.call_count == 2
+
+
+def test_uninstall_waits_for_service_before_removing_plist(
+    mocker: MagicMock, tmp_path: Path
+) -> None:
+    plist_path = tmp_path / "service.plist"
+    plist_path.touch()
+    mocker.patch("scripts.install_macos_service.PLIST_PATH", plist_path)
+    mocker.patch("scripts.install_macos_service.subprocess.run")
+    wait = mocker.patch("scripts.install_macos_service._wait_until_unloaded")
+
+    uninstall()
+
+    wait.assert_called_once_with()
+    assert not plist_path.exists()

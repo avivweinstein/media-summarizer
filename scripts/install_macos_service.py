@@ -5,6 +5,7 @@ import os
 import plistlib
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ def build_plist(project_dir: Path, host: str, port: int) -> dict[str, Any]:
             str(port),
         ],
         "WorkingDirectory": str(project_dir),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ProcessType": "Background",
@@ -38,6 +42,21 @@ def build_plist(project_dir: Path, host: str, port: int) -> dict[str, Any]:
 
 def _target() -> str:
     return f"gui/{os.getuid()}/{LABEL}"
+
+
+def _wait_until_unloaded(timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["launchctl", "print", _target()],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"Timed out waiting for {_target()} to unload.")
 
 
 def install(project_dir: Path, host: str, port: int) -> None:
@@ -65,6 +84,7 @@ def install(project_dir: Path, host: str, port: int) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _wait_until_unloaded()
     domain = f"gui/{os.getuid()}"
     subprocess.run(["launchctl", "bootstrap", domain, str(PLIST_PATH)], check=True)
     subprocess.run(["launchctl", "enable", _target()], check=True)
@@ -79,6 +99,7 @@ def uninstall() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _wait_until_unloaded()
     PLIST_PATH.unlink(missing_ok=True)
 
 
