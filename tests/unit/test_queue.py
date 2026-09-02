@@ -286,6 +286,38 @@ async def test_processing_boundary_persists_and_separates_deduplication(
     assert cloud.job_id != local.job_id
 
 
+async def test_finds_prior_notion_page_for_canonical_obsidian_note(db_path: str) -> None:
+    prior = await job_queue.create_job("https://example.com/article", db_path=db_path)
+    prior.status = JobStatus.done
+    prior.obsidian_note_path = "Generated/Summaries/article-123.md"
+    prior.notion_page_id = "notion-page-123"
+    await job_queue.update_job(prior, db_path=db_path)
+
+    found = await job_queue.find_notion_page_for_obsidian_note(
+        prior.obsidian_note_path,
+        exclude_job_id="new-job",
+        db_path=db_path,
+    )
+
+    assert found == "notion-page-123"
+
+
+async def test_finds_recorded_notion_page_from_cancelled_job(db_path: str) -> None:
+    prior = await job_queue.create_job("https://example.com/article", db_path=db_path)
+    prior.status = JobStatus.cancelled
+    prior.obsidian_note_path = "Generated/Summaries/article-123.md"
+    prior.notion_page_id = "notion-page-created-before-cancel"
+    await job_queue.update_job(prior, db_path=db_path)
+
+    found = await job_queue.find_notion_page_for_obsidian_note(
+        prior.obsidian_note_path,
+        exclude_job_id="new-job",
+        db_path=db_path,
+    )
+
+    assert found == "notion-page-created-before-cancel"
+
+
 async def test_create_or_get_job_refreshes_completed_feed(db_path: str) -> None:
     url = "https://feeds.example.com/show"
     job, _ = await job_queue.create_or_get_job(url, db_path=db_path)
@@ -385,6 +417,36 @@ async def test_cancelled_status(db_path: str) -> None:
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.status == JobStatus.cancelled
+
+
+async def test_stale_worker_update_cannot_resurrect_cancelled_job(db_path: str) -> None:
+    stale = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    cancelled = stale.model_copy(deep=True)
+    cancelled.status = JobStatus.cancelled
+    await job_queue.update_job(cancelled, db_path=db_path)
+    stale.status = JobStatus.processing
+    stale.stage = JobStage.summarizing
+
+    updated = await job_queue.update_job(stale, db_path=db_path)
+
+    assert not updated
+    fetched = await job_queue.get_job(stale.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.status == JobStatus.cancelled
+
+
+async def test_atomic_cancel_does_not_overwrite_completed_job(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.done
+    job.stage = JobStage.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    cancelled = await job_queue.mark_job_cancelled(job.job_id, db_path=db_path)
+
+    assert not cancelled
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.status == JobStatus.done
 
 
 async def test_parent_job_id_persists(db_path: str) -> None:

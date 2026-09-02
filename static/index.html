@@ -90,6 +90,7 @@
     }
     header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; }
     .header-right { display: flex; align-items: center; gap: 1rem; }
+    .mode-badge { font-size: 0.75rem; font-weight: 600; }
     #refresh-status { font-size: 0.75rem; color: var(--text-muted); }
 
     /* Theme toggle */
@@ -273,6 +274,7 @@
 <header>
   <h1>Media Summarizer</h1>
   <div class="header-right">
+    <span class="mode-badge">__PROCESSING_MODE_LABEL__</span>
     <span id="refresh-status">Connecting...</span>
     <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">
       <span id="theme-icon">&#9790;</span>
@@ -293,7 +295,7 @@
       <button type="submit" class="submit-btn" id="upload-btn">Upload</button>
     </form>
     <div class="submit-error" id="submit-error"></div>
-    <p class="data-boundary">Public or approved media only. Transcripts are sent to external AI providers.</p>
+    <p class="data-boundary">__DATA_BOUNDARY_MESSAGE__</p>
   </div>
   <div id="jobs-container"></div>
   <div id="empty" style="display:none">

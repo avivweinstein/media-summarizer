@@ -41,7 +41,6 @@ from models import (
     BulkSummarizeResponse,
     Job,
     JobResponse,
-    JobStage,
     JobStatus,
     LibraryAnswer,
     LibraryAskRequest,
@@ -384,14 +383,13 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     job = await job_queue.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found.")
-    if job.status in (JobStatus.done, JobStatus.failed, JobStatus.cancelled):
+    if not await job_queue.mark_job_cancelled(job_id):
+        current = await job_queue.get_job(job_id)
+        status = current.status.value if current else "deleted"
         raise HTTPException(
             status_code=409,
-            detail=f"Job is already {job.status.value} and cannot be cancelled.",
+            detail=f"Job is already {status} and cannot be cancelled.",
         )
-    job.status = JobStatus.cancelled
-    job.stage = JobStage.failed
-    await job_queue.update_job(job)
     cleanup_upload(job.url)
     logger.info("job_id=%s url=%.60s source=- event=job_cancelled_by_user", job.job_id, job.url)
     return {"status": "cancelled"}
@@ -642,4 +640,18 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
 async def dashboard() -> HTMLResponse:
     """Serve the job status dashboard."""
     html = (Path(__file__).parent / "static" / "index.html").read_text()
+    if settings.processing_mode == "local":
+        mode_label = "Local-only mode"
+        boundary_message = (
+            "Local-only mode: transcripts stay on this Mac; Anthropic, OpenAI, "
+            "Notion, and webhooks are disabled."
+        )
+    else:
+        mode_label = "Cloud-public mode"
+        boundary_message = (
+            "Cloud-public mode: submit only public content or material explicitly "
+            "approved for external AI processing."
+        )
+    html = html.replace("__PROCESSING_MODE_LABEL__", mode_label)
+    html = html.replace("__DATA_BOUNDARY_MESSAGE__", boundary_message)
     return HTMLResponse(content=html)

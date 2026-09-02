@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from config import settings
-from main import _create_and_enqueue, _obsidian_destinations_writable, _single_instance_lock, health
+from main import (
+    _create_and_enqueue,
+    _obsidian_destinations_writable,
+    _single_instance_lock,
+    dashboard,
+    health,
+)
 from models import Job, JobStatus
 
 
@@ -16,6 +22,17 @@ def test_single_instance_lock_rejects_second_owner(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="already owns"):
             with _single_instance_lock(lock_path):
                 pass
+
+
+async def test_dashboard_labels_local_data_boundary(mocker: MagicMock) -> None:
+    mocker.patch.object(settings, "processing_mode", "local")
+
+    response = await dashboard()
+    body = bytes(response.body).decode()
+
+    assert "Local-only mode" in body
+    assert "transcripts stay on this Mac" in body
+    assert "__PROCESSING_MODE_LABEL__" not in body
 
 
 async def test_completed_duplicate_notifies_requesting_webhook(
@@ -65,9 +82,7 @@ def test_obsidian_destinations_check_existing_generated_dirs(
     assert not _obsidian_destinations_writable(tmp_path, retain_transcript=True)
 
 
-async def test_local_health_never_checks_cloud_providers(
-    tmp_path: Path, mocker: MagicMock
-) -> None:
+async def test_local_health_never_checks_cloud_providers(tmp_path: Path, mocker: MagicMock) -> None:
     vault = tmp_path / "vault"
     (vault / ".obsidian").mkdir(parents=True)
     model = tmp_path / "whisper.bin"

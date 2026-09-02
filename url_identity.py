@@ -29,6 +29,14 @@ def submission_identity(url: str) -> tuple[str, bool]:
         if podcast_id and episode_id:
             return f"apple-podcast:{podcast_id}:episode:{episode_id}", True
 
+    if hostname in {"vimeo.com", "player.vimeo.com"}:
+        video_id = next(
+            (part for part in reversed(parsed.path.split("/")) if part.isdigit()),
+            "",
+        )
+        if video_id:
+            return f"vimeo:{video_id}", True
+
     filtered_query = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
@@ -45,5 +53,7 @@ def submission_identity(url: str) -> tuple[str, bool]:
         )
     )
     digest = hashlib.sha256(normalized.encode()).hexdigest()
-    is_direct_media = parsed.path.lower().endswith((".mp3", ".m4a", ".wav"))
+    is_direct_media = parsed.path.lower().endswith(
+        (".m4a", ".mov", ".mp3", ".mp4", ".wav", ".webm")
+    )
     return f"url:{digest}", is_direct_media

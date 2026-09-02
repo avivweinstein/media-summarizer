@@ -328,6 +328,26 @@ async def list_active_upload_urls(db_path: str = DB_PATH) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
+async def find_notion_page_for_obsidian_note(
+    obsidian_note_path: str,
+    *,
+    exclude_job_id: str,
+    db_path: str = DB_PATH,
+) -> str | None:
+    """Return the prior Notion page paired with a canonical Obsidian note."""
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """SELECT notion_page_id FROM jobs
+               WHERE obsidian_note_path = ?
+                 AND notion_page_id IS NOT NULL
+                 AND job_id != ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (obsidian_note_path, exclude_job_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+    return str(row[0]) if row else None
+
+
 async def recover_incomplete_jobs(db_path: str = DB_PATH) -> list[str]:
     """Requeue interrupted jobs without discarding their stage or retry budget."""
     async with aiosqlite.connect(db_path) as db:
@@ -375,12 +395,12 @@ async def update_usage(
         await db.commit()
 
 
-async def update_job(job: Job, db_path: str = DB_PATH) -> None:
-    """Persist all mutable fields of a job back to SQLite."""
+async def update_job(job: Job, db_path: str = DB_PATH) -> bool:
+    """Persist a job unless doing so would resurrect a cancelled row."""
     job.updated_at = _utcnow()
     data = _serialize_job(job)
     async with aiosqlite.connect(db_path) as db:
-        await db.execute(
+        cursor = await db.execute(
             """
             UPDATE jobs SET
                 status        = :status,
@@ -396,10 +416,53 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
                 interrupted    = :interrupted,
                 error         = :error
             WHERE job_id = :job_id
+              AND (status != 'cancelled' OR :status = 'cancelled')
             """,
             data,
         )
         await db.commit()
+        return cursor.rowcount > 0
+
+
+async def update_output_paths(
+    job_id: str,
+    *,
+    obsidian_note_path: str | None,
+    notion_page_id: str | None,
+    notion_error: str | None,
+    db_path: str = DB_PATH,
+) -> None:
+    """Record completed output side effects without changing job status."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """UPDATE jobs SET
+                   obsidian_note_path = ?,
+                   notion_page_id = ?,
+                   notion_error = ?,
+                   updated_at = ?
+               WHERE job_id = ?""",
+            (
+                obsidian_note_path,
+                notion_page_id,
+                notion_error,
+                _utcnow().isoformat(),
+                job_id,
+            ),
+        )
+        await db.commit()
+
+
+async def mark_job_cancelled(job_id: str, db_path: str = DB_PATH) -> bool:
+    """Atomically cancel only a job that has not already reached a final state."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            """UPDATE jobs
+               SET status = 'cancelled', stage = 'failed', updated_at = ?
+               WHERE job_id = ? AND status IN ('pending', 'processing')""",
+            (_utcnow().isoformat(), job_id),
+        )
+        await db.commit()
+    return cursor.rowcount > 0
 
 
 async def delete_job(job_id: str, db_path: str = DB_PATH) -> bool:

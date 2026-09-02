@@ -197,10 +197,10 @@ async def _check_cancelled(job: Job, db_path: str) -> bool:
     return fresh is None or fresh.status == JobStatus.cancelled
 
 
-async def _set_stage(job: Job, stage: JobStage, db_path: str) -> None:
+async def _set_stage(job: Job, stage: JobStage, db_path: str) -> bool:
     """Update the job's stage and persist it."""
     job.stage = stage
-    await job_queue.update_job(job, db_path=db_path)
+    return await job_queue.update_job(job, db_path=db_path)
 
 
 async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
@@ -257,9 +257,11 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
         job.status = JobStatus.processing
         job.retry_count = attempt
         if job.result is None:
-            await _set_stage(job, JobStage.detecting, db_path)
+            if not await _set_stage(job, JobStage.detecting, db_path):
+                return
         else:
-            await job_queue.update_job(job, db_path=db_path)
+            if not await job_queue.update_job(job, db_path=db_path):
+                return
 
         try:
             source_type = detect_source(job.url)
@@ -275,7 +277,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                 logger.info("%s event=transcript_reused_after_restart", log)
             else:
                 # --- Transcription stage ---
-                await _set_stage(job, JobStage.transcribing, db_path)
+                if not await _set_stage(job, JobStage.transcribing, db_path):
+                    return
                 if source_type == "youtube":
                     source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
                     result = await source.fetch(
@@ -319,7 +322,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     )
 
                 job.result = result
-                await job_queue.update_job(job, db_path=db_path)
+                if not await job_queue.update_job(job, db_path=db_path):
+                    cleanup_upload(job.url)
+                    return
 
             cleanup_upload(job.url)
 
@@ -331,7 +336,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                 logger.info("%s event=summary_reused_after_restart", log)
             else:
                 # --- Summarization stage ---
-                await _set_stage(job, JobStage.summarizing, db_path)
+                if not await _set_stage(job, JobStage.summarizing, db_path):
+                    return
                 summary = await summarize(
                     result,
                     job_id=job.job_id,
@@ -340,7 +346,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     processing_mode=job.processing_mode,
                 )
                 job.summary = summary
-                await job_queue.update_job(job, db_path=db_path)
+                if not await job_queue.update_job(job, db_path=db_path):
+                    return
 
             if await _check_cancelled(job, db_path):
                 return
@@ -349,7 +356,8 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             output_saved = bool(job.obsidian_note_path or job.notion_page_id)
             notion_failure: Exception | None = None
             if settings.obsidian_vault_path and not job.obsidian_note_path:
-                await _set_stage(job, JobStage.saving_obsidian, db_path)
+                if not await _set_stage(job, JobStage.saving_obsidian, db_path):
+                    return
                 job.obsidian_note_path = await save_to_obsidian(
                     result,
                     summary,
@@ -360,13 +368,36 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     usage=job.usage,
                 )
                 output_saved = True
+                await job_queue.update_output_paths(
+                    job.job_id,
+                    obsidian_note_path=job.obsidian_note_path,
+                    notion_page_id=job.notion_page_id,
+                    notion_error=job.notion_error,
+                    db_path=db_path,
+                )
+
+            if await _check_cancelled(job, db_path):
+                return
 
             if (
                 job.processing_mode != "local"
                 and settings.notion_enabled
                 and not job.notion_page_id
             ):
-                if interrupted_stage == JobStage.saving_notion:
+                prior_notion_page = (
+                    await job_queue.find_notion_page_for_obsidian_note(
+                        job.obsidian_note_path,
+                        exclude_job_id=job.job_id,
+                        db_path=db_path,
+                    )
+                    if job.obsidian_note_path
+                    else None
+                )
+                if prior_notion_page:
+                    job.notion_page_id = prior_notion_page
+                    output_saved = True
+                    logger.info("%s event=notion_page_reused", log)
+                elif interrupted_stage == JobStage.saving_notion:
                     job.notion_error = (
                         "Notion save was interrupted and was not replayed to avoid "
                         "creating a duplicate page."
@@ -376,13 +407,21 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                         log,
                     )
                 else:
-                    await _set_stage(job, JobStage.saving_notion, db_path)
+                    if not await _set_stage(job, JobStage.saving_notion, db_path):
+                        return
                     try:
                         job.notion_page_id = await save_to_notion(
                             result, summary, job_id=job.job_id
                         )
                         job.notion_error = None
                         output_saved = True
+                        await job_queue.update_output_paths(
+                            job.job_id,
+                            obsidian_note_path=job.obsidian_note_path,
+                            notion_page_id=job.notion_page_id,
+                            notion_error=None,
+                            db_path=db_path,
+                        )
                     except Exception as notion_error:
                         notion_failure = notion_error
                         job.notion_error = str(notion_error)
@@ -392,6 +431,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                             job.notion_error,
                         )
 
+            if await _check_cancelled(job, db_path):
+                return
+
             if not output_saved:
                 if notion_failure is not None:
                     raise notion_failure
@@ -399,8 +441,9 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
             job.status = JobStatus.done
             job.stage = JobStage.done
+            if not await job_queue.update_job(job, db_path=db_path):
+                return
             logger.info("%s event=job_completed title=%r", log, result.title)
-            await job_queue.update_job(job, db_path=db_path)
             await _notify_webhook(job, db_path=db_path)
             return
 
@@ -421,7 +464,7 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     job.status = JobStatus.failed
     job.stage = JobStage.failed
     job.error = last_error
-    logger.error("%s event=job_failed_final error=%r", log, last_error)
-    await job_queue.update_job(job, db_path=db_path)
-    cleanup_upload(job.url)
-    await _notify_webhook(job, db_path=db_path)
+    if await job_queue.update_job(job, db_path=db_path):
+        logger.error("%s event=job_failed_final error=%r", log, last_error)
+        cleanup_upload(job.url)
+        await _notify_webhook(job, db_path=db_path)
