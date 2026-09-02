@@ -81,6 +81,7 @@ def ensure_tmp_dir() -> None:
 
 
 def tmp_path_for_job(job_id: str) -> Path:
+    TMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     return TMP_DIR / f"{job_id}.mp3"
 
 

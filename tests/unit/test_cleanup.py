@@ -17,7 +17,7 @@ import pytest
 from config import settings
 from exceptions import TranscriptionError, UsageLimitError
 from models import TranscriptionOutput, UsageStats
-from transcriber import _communicate_with_timeout, ensure_tmp_dir, transcribe
+from transcriber import _communicate_with_timeout, ensure_tmp_dir, tmp_path_for_job, transcribe
 
 
 class TestSubprocessCleanup:
@@ -46,6 +46,15 @@ class TestSubprocessCleanup:
 
 
 class TestEnsureTmpDir:
+    def test_job_path_creates_missing_temp_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "missing" / "media-summarizer"
+
+        with patch("transcriber.TMP_DIR", target):
+            path = tmp_path_for_job("job")
+
+        assert target.is_dir()
+        assert path == target / "job.mp3"
+
     def test_creates_directory_if_missing(self, tmp_path: Path) -> None:
         target = tmp_path / "media-summarizer"
         assert not target.exists()
