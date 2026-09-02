@@ -12,6 +12,13 @@ pytestmark = pytest.mark.integration
 _SHORT_VIDEO_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
 
+@pytest.fixture(autouse=True)
+def _enable_notion(monkeypatch: pytest.MonkeyPatch) -> None:
+    from config import settings
+
+    monkeypatch.setattr(settings, "notion_enabled", True)
+
+
 async def test_full_pipeline_youtube_to_notion(
     db_path: str,
     notion_test_db_id: str,

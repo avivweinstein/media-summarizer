@@ -138,14 +138,16 @@ class YouTubeSource(BaseSource):
     async def fetch(self, url: str, job_id: str = "-") -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
         loop = asyncio.get_event_loop()
+        video_id = _extract_video_id(url)
 
         # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
         transcript = await loop.run_in_executor(
-            None, _fetch_transcript_sync, _extract_video_id(url)
+            None, _fetch_transcript_sync, video_id
         )
 
         if transcript:
+            transcription_model = "youtube/captions"
             logger.info("%s event=transcript_fetch_done chars=%d method=native", log, len(transcript))
         else:
             # Fall back to Whisper: download audio, transcribe
@@ -158,6 +160,7 @@ class YouTubeSource(BaseSource):
                 log, dest.stat().st_size / 1e6 if dest.exists() else 0,
             )
             transcript = await transcribe(dest, job_id)
+            transcription_model = "openai/whisper-1"
             logger.info("%s event=transcript_fetch_done chars=%d method=whisper", log, len(transcript))
 
         logger.info("%s event=metadata_fetch_start", log)
@@ -180,4 +183,6 @@ class YouTubeSource(BaseSource):
             thumbnail_url=thumbnail_url,
             transcript=transcript,
             published_at=_parse_upload_date(upload_date),
+            transcription_model=transcription_model,
+            source_item_id=video_id,
         )

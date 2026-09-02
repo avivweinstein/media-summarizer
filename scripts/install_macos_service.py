@@ -14,9 +14,24 @@ PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 LOG_DIR = Path.home() / "Library" / "Logs" / "media-summarizer"
 
 
-def build_plist(project_dir: Path, host: str, port: int) -> dict[str, Any]:
+def build_plist(
+    project_dir: Path,
+    host: str,
+    port: int,
+    obsidian_vault_path: Path | None = None,
+    *,
+    disable_notion: bool = False,
+) -> dict[str, Any]:
     """Build the launchd configuration for a project checkout."""
     uvicorn = project_dir / ".venv" / "bin" / "uvicorn"
+    environment = {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    if obsidian_vault_path is not None:
+        environment["OBSIDIAN_VAULT_PATH"] = str(obsidian_vault_path)
+    if disable_notion:
+        environment["NOTION_ENABLED"] = "false"
+
     return {
         "Label": LABEL,
         "ProgramArguments": [
@@ -28,9 +43,7 @@ def build_plist(project_dir: Path, host: str, port: int) -> dict[str, Any]:
             str(port),
         ],
         "WorkingDirectory": str(project_dir),
-        "EnvironmentVariables": {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
+        "EnvironmentVariables": environment,
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ProcessType": "Background",
@@ -59,7 +72,14 @@ def _wait_until_unloaded(timeout_seconds: float = 5.0) -> None:
     raise SystemExit(f"Timed out waiting for {_target()} to unload.")
 
 
-def install(project_dir: Path, host: str, port: int) -> None:
+def install(
+    project_dir: Path,
+    host: str,
+    port: int,
+    obsidian_vault_path: Path | None = None,
+    *,
+    disable_notion: bool = False,
+) -> None:
     """Write, load, and start the launchd service."""
     project_dir = project_dir.resolve()
     uvicorn = project_dir / ".venv" / "bin" / "uvicorn"
@@ -68,10 +88,20 @@ def install(project_dir: Path, host: str, port: int) -> None:
         raise SystemExit(f"Missing {uvicorn}; install the project environment first.")
     if not env_file.is_file():
         raise SystemExit(f"Missing {env_file}; configure API credentials first.")
+    if obsidian_vault_path is not None:
+        obsidian_vault_path = obsidian_vault_path.expanduser().resolve()
+        if not (obsidian_vault_path / ".obsidian").is_dir():
+            raise SystemExit(f"Not an Obsidian vault: {obsidian_vault_path}")
 
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = build_plist(project_dir, host, port)
+    payload = build_plist(
+        project_dir,
+        host,
+        port,
+        obsidian_vault_path,
+        disable_notion=disable_notion,
+    )
     with tempfile.NamedTemporaryFile(dir=PLIST_PATH.parent, delete=False) as temp:
         plistlib.dump(payload, temp)
         temp_path = Path(temp.name)
@@ -113,10 +143,23 @@ def main() -> None:
     parser.add_argument("action", choices=("install", "uninstall", "status"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--obsidian-vault", default="")
+    parser.add_argument(
+        "--disable-notion",
+        action="store_true",
+        help="Disable optional Notion publishing for this service.",
+    )
     args = parser.parse_args()
 
     if args.action == "install":
-        install(Path(__file__).resolve().parents[1], args.host, args.port)
+        obsidian_vault = Path(args.obsidian_vault) if args.obsidian_vault else None
+        install(
+            Path(__file__).resolve().parents[1],
+            args.host,
+            args.port,
+            obsidian_vault,
+            disable_notion=args.disable_notion,
+        )
     elif args.action == "uninstall":
         uninstall()
     else:
