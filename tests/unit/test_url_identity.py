@@ -55,5 +55,5 @@ def test_twitter_selected_media_has_distinct_identity() -> None:
     first = submission_identity("https://x.com/example/status/1234567890/video/1")
     second = submission_identity("https://x.com/example/status/1234567890/video/2")
 
-    assert first == ("twitter:1234567890:media:1", True)
+    assert first == ("twitter:1234567890", True)
     assert second == ("twitter:1234567890:media:2", True)

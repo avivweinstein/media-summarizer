@@ -70,7 +70,7 @@ def submission_identity(url: str) -> tuple[str, bool]:
 
     if twitter_parts := twitter_status_parts(url):
         status_id, media_index = twitter_parts
-        suffix = f":media:{media_index}" if media_index else ""
+        suffix = f":media:{media_index}" if media_index not in {None, "1"} else ""
         return f"twitter:{status_id}{suffix}", True
 
     filtered_query = [

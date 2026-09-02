@@ -148,6 +148,7 @@ def _download_audio_sync(
     max_bytes: int,
     cancel_event: threading.Event | None = None,
     no_playlist: bool = False,
+    media_info: dict[str, object] | None = None,
 ) -> None:
     """Download audio from one hosted video via yt-dlp as MP3."""
 
@@ -179,7 +180,11 @@ def _download_audio_sync(
         opts["noplaylist"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            result = ydl.download([url])
+            if media_info is not None:
+                ydl.process_info(dict(media_info))
+                result = 0
+            else:
+                result = ydl.download([url])
         if result != 0:
             raise MetadataError("yt-dlp could not download the media audio.")
         # yt-dlp may produce dest.mp3 — rename to the exact path we want

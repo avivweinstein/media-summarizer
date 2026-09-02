@@ -91,6 +91,8 @@ because Spotify does not provide a reliable canonical RSS mapping; submit the
 show RSS or another exact episode URL instead.
 Public X/Twitter post URLs are supported without accessing browser cookies.
 Private, deleted, age-gated, or login-required posts are rejected.
+For posts containing multiple videos, submit the specific URL ending in
+`/video/1`, `/video/2`, and so on.
 
 ### 6. Set up Notion (optional)
 
