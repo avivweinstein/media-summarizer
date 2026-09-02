@@ -60,6 +60,7 @@ class Job(BaseModel):
     error: str | None = None
     webhook_url: str | None = None
     parent_job_id: str | None = None  # set when this job was spawned from a playlist/bulk
+    dedupe_key: str | None = None
 
 
 class SummarizeRequest(BaseModel):

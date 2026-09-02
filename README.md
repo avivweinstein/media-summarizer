@@ -13,6 +13,7 @@ A personal media intelligence pipeline. Send YouTube or podcast URLs via the web
 - **Web dashboard** — real-time job tracking with dark mode, SSE live updates
 - **Job management** — cancel, delete, and auto-cleanup of old jobs
 - **Concurrent processing** — async worker pool handles multiple jobs without blocking
+- **Crash recovery and dedupe** — interrupted jobs resume after restart; equivalent submissions reuse existing work
 
 ## Requirements
 
@@ -154,8 +155,10 @@ launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
 
-The process pauses with the Mac and resumes after wake. Jobs interrupted by a
-process restart are not resumed automatically; delete and resubmit them.
+The process pauses with the Mac and resumes after wake. Pending and interrupted
+jobs are recovered from SQLite and requeued automatically after a process restart.
+Equivalent active submissions are deduplicated; completed static media such as a
+YouTube video is reused, while RSS/show URLs can be refreshed for newer episodes.
 
 ### Linux (systemd)
 

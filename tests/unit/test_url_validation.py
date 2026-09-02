@@ -70,6 +70,20 @@ class TestPodcast:
     def test_mp3_url_with_query_params(self) -> None:
         assert detect_source("https://cdn.example.com/ep1.mp3?token=abc") == "podcast"
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/show/feed.xml",
+            "https://example.com/show.rss",
+            "https://feeds.simplecast.com/abc123",
+            "https://rss.example.com/show",
+            "https://example.com/podcast/feed",
+            "https://example.com/podcast?format=rss",
+        ],
+    )
+    def test_generic_rss_urls(self, url: str) -> None:
+        assert detect_source(url) == "podcast"
+
 
 class TestUnsupportedURLs:
     def test_random_website(self) -> None:

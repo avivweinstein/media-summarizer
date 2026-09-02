@@ -8,7 +8,7 @@ Playlist/bulk URLs are expanded into individual jobs.
 
 import asyncio
 import logging
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 import httpx
 import yt_dlp
@@ -32,6 +32,18 @@ _APPLE_HOSTNAMES = {"podcasts.apple.com"}
 
 MAX_RETRIES = 3
 _BACKOFF_SECONDS = [5, 10, 20]  # sleep before attempt 2, 3, 4 (never used for attempt 1)
+
+
+def _looks_like_rss(parsed: ParseResult) -> bool:
+    hostname = (parsed.hostname or "").lower()
+    path = parsed.path.lower().rstrip("/")
+    query = parse_qs(parsed.query)
+    return (
+        hostname.startswith(("feed.", "feeds.", "rss."))
+        or path.endswith((".rss", ".xml", ".atom"))
+        or path.endswith(("/feed", "/rss", "/podcast-feed"))
+        or query.get("format", [""])[0].lower() in {"rss", "xml", "atom"}
+    )
 
 
 def detect_source(url: str) -> str:
@@ -62,9 +74,12 @@ def detect_source(url: str) -> str:
     if hostname == "podcasts.apple.com" or parsed.path.lower().endswith(".mp3"):
         return "podcast"
 
+    if parsed.scheme in {"http", "https"} and hostname and _looks_like_rss(parsed):
+        return "podcast"
+
     raise UnsupportedURLError(
         "Unsupported source. Supported: YouTube (video or playlist), "
-        "Apple Podcasts, direct RSS/MP3."
+        "Apple Podcasts, RSS feeds, or direct MP3."
     )
 
 

@@ -5,6 +5,7 @@ All tests use a fresh temporary SQLite file — no shared state between tests.
 """
 
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -206,6 +207,65 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
     assert migrated.stage == JobStage.queued
     assert migrated.notion_error is None
     assert migrated.obsidian_note_path is None
+    assert migrated.dedupe_key is not None
+
+
+async def test_create_or_get_job_deduplicates_concurrent_static_urls(db_path: str) -> None:
+    results = await asyncio.gather(
+        job_queue.create_or_get_job(
+            "https://youtube.com/watch?v=abc&t=30", db_path=db_path
+        ),
+        job_queue.create_or_get_job("https://youtu.be/abc?si=share", db_path=db_path),
+    )
+
+    assert results[0][0].job_id == results[1][0].job_id
+    assert sorted(created for _, created in results) == [False, True]
+
+
+async def test_create_or_get_job_reuses_completed_static_media(db_path: str) -> None:
+    job, created = await job_queue.create_or_get_job(
+        "https://youtube.com/watch?v=abc", db_path=db_path
+    )
+    assert created
+    job.status = JobStatus.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    duplicate, duplicate_created = await job_queue.create_or_get_job(
+        "https://youtu.be/abc", db_path=db_path
+    )
+
+    assert not duplicate_created
+    assert duplicate.job_id == job.job_id
+
+
+async def test_create_or_get_job_refreshes_completed_feed(db_path: str) -> None:
+    url = "https://feeds.example.com/show"
+    job, _ = await job_queue.create_or_get_job(url, db_path=db_path)
+    job.status = JobStatus.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    refreshed, created = await job_queue.create_or_get_job(url, db_path=db_path)
+
+    assert created
+    assert refreshed.job_id != job.job_id
+
+
+async def test_recover_incomplete_jobs_resets_processing_and_orders_pending(
+    db_path: str,
+) -> None:
+    first = await job_queue.create_job("https://youtube.com/watch?v=first", db_path=db_path)
+    second = await job_queue.create_job("https://youtube.com/watch?v=second", db_path=db_path)
+    first.status = JobStatus.processing
+    first.stage = JobStage.summarizing
+    await job_queue.update_job(first, db_path=db_path)
+
+    recovered = await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+    assert recovered == [first.job_id, second.job_id]
+    reset = await job_queue.get_job(first.job_id, db_path=db_path)
+    assert reset is not None
+    assert reset.status == JobStatus.pending
+    assert reset.stage == JobStage.queued
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await job_queue.init_db()
     ensure_tmp_dir()
     await _cleanup_old_jobs()
+    recovered_job_ids = await job_queue.recover_incomplete_jobs()
     job_worker.start()
+    for job_id in recovered_job_ids:
+        await job_worker.enqueue(job_id)
+    if recovered_job_ids:
+        logger.info(
+            "job_id=- url=- source=- event=jobs_recovered count=%d",
+            len(recovered_job_ids),
+        )
     logger.info("job_id=- url=- source=- event=server_started")
     yield
     await job_worker.stop()
@@ -95,6 +103,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="Media Summarizer", lifespan=lifespan)
+
+
+async def _create_and_enqueue(url: str, webhook_url: str | None) -> Job:
+    job, created = await job_queue.create_or_get_job(url, webhook_url)
+    if created:
+        await job_worker.enqueue(job.job_id)
+    else:
+        logger.info(
+            "job_id=%s url=%.60s source=- event=duplicate_submission_reused",
+            job.job_id,
+            url,
+        )
+    return job
 
 
 def _job_to_response(job: Job) -> JobResponse:
@@ -145,14 +166,12 @@ async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
         # Create a job for each video
         first_job_id = ""
         for video_url in video_urls:
-            job = await job_queue.create_job(video_url, request.webhook_url)
+            job = await _create_and_enqueue(video_url, request.webhook_url)
             if not first_job_id:
                 first_job_id = job.job_id
-            await job_worker.enqueue(job.job_id)
         return SummarizeResponse(job_id=first_job_id)
 
-    job = await job_queue.create_job(url, request.webhook_url)
-    await job_worker.enqueue(job.job_id)
+    job = await _create_and_enqueue(url, request.webhook_url)
     return SummarizeResponse(job_id=job.job_id)
 
 
@@ -177,13 +196,13 @@ async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
                 errors.append(f"{url[:60]}: playlist expansion failed: {e}")
                 continue
             for video_url in video_urls:
-                job = await job_queue.create_job(video_url, request.webhook_url)
-                job_ids.append(job.job_id)
-                await job_worker.enqueue(job.job_id)
+                job = await _create_and_enqueue(video_url, request.webhook_url)
+                if job.job_id not in job_ids:
+                    job_ids.append(job.job_id)
         else:
-            job = await job_queue.create_job(url, request.webhook_url)
-            job_ids.append(job.job_id)
-            await job_worker.enqueue(job.job_id)
+            job = await _create_and_enqueue(url, request.webhook_url)
+            if job.job_id not in job_ids:
+                job_ids.append(job.job_id)
 
     if not job_ids and errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
