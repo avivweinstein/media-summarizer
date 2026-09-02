@@ -14,13 +14,14 @@ Routes:
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import logging.config
 import os
 import tomllib
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -40,7 +41,7 @@ from models import (
     SummarizeRequest,
     SummarizeResponse,
 )
-from pipeline import detect_source, expand_playlist
+from pipeline import _notify_webhook, detect_source, expand_playlist
 from transcriber import ensure_tmp_dir
 from worker import job_worker
 
@@ -51,6 +52,26 @@ _SSE_POLL_INTERVAL = 2.0
 
 # Auto-cleanup: delete completed/failed/cancelled jobs older than this many days
 _JOB_TTL_DAYS = 90
+_INSTANCE_LOCK_PATH = Path("/tmp/media-summarizer/service.lock")
+
+
+@contextmanager
+def _single_instance_lock(path: Path = _INSTANCE_LOCK_PATH) -> Iterator[None]:
+    """Prevent multiple processes from recovering and executing the same jobs."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.fchmod(fd, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                "Another media-summarizer process already owns the job queue."
+            ) from error
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _obsidian_destinations_writable(vault_path: Path, retain_transcript: bool) -> bool:
@@ -83,23 +104,24 @@ async def _cleanup_old_jobs() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    _configure_logging()
-    await job_queue.init_db()
-    ensure_tmp_dir()
-    await _cleanup_old_jobs()
-    recovered_job_ids = await job_queue.recover_incomplete_jobs()
-    job_worker.start()
-    for job_id in recovered_job_ids:
-        await job_worker.enqueue(job_id)
-    if recovered_job_ids:
-        logger.info(
-            "job_id=- url=- source=- event=jobs_recovered count=%d",
-            len(recovered_job_ids),
-        )
-    logger.info("job_id=- url=- source=- event=server_started")
-    yield
-    await job_worker.stop()
-    logger.info("job_id=- url=- source=- event=server_stopped")
+    with _single_instance_lock():
+        _configure_logging()
+        await job_queue.init_db()
+        ensure_tmp_dir()
+        await _cleanup_old_jobs()
+        recovered_job_ids = await job_queue.recover_incomplete_jobs()
+        job_worker.start()
+        for job_id in recovered_job_ids:
+            await job_worker.enqueue(job_id)
+        if recovered_job_ids:
+            logger.info(
+                "job_id=- url=- source=- event=jobs_recovered count=%d",
+                len(recovered_job_ids),
+            )
+        logger.info("job_id=- url=- source=- event=server_started")
+        yield
+        await job_worker.stop()
+        logger.info("job_id=- url=- source=- event=server_stopped")
 
 
 app = FastAPI(title="Media Summarizer", lifespan=lifespan)
@@ -115,6 +137,8 @@ async def _create_and_enqueue(url: str, webhook_url: str | None) -> Job:
             job.job_id,
             url,
         )
+        if job.status == JobStatus.done and webhook_url:
+            await _notify_webhook(job, urls=[webhook_url])
     return job
 
 

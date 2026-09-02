@@ -157,9 +157,12 @@ are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
 
 The process pauses with the Mac and resumes after wake. Pending and interrupted
-jobs are recovered from SQLite and requeued automatically after a process restart.
-Equivalent active submissions are deduplicated; completed static media such as a
-YouTube video is reused, while RSS/show URLs can be refreshed for newer episodes.
+jobs are recovered from SQLite at the last durable transcript/summary checkpoint;
+retry counts and provider-usage reservations also survive a crash. A process lock
+prevents two local instances from replaying the same queue. Equivalent active
+submissions are deduplicated; completed static media such as a YouTube video is
+reused, while RSS/show URLs can be refreshed for newer episodes. RSS responses and
+audio downloads are streamed with time and size bounds.
 
 ### Linux (systemd)
 

@@ -86,9 +86,8 @@ class TestPodcast:
 
 
 class TestUnsupportedURLs:
-    def test_random_website(self) -> None:
-        with pytest.raises(UnsupportedURLError):
-            detect_source("https://example.com/some-article")
+    def test_opaque_feed_candidate_is_accepted_for_bounded_sniffing(self) -> None:
+        assert detect_source("https://example.com/opaque-feed-id") == "podcast"
 
     def test_twitter(self) -> None:
         with pytest.raises(UnsupportedURLError):

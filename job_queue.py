@@ -5,6 +5,7 @@ Failed jobs are retried up to MAX_RETRIES times with exponential backoff.
 Jobs survive server restarts because they're persisted in SQLite.
 """
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -41,9 +42,11 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "obsidian_note_path": job.obsidian_note_path,
         "error": job.error,
         "webhook_url": job.webhook_url,
+        "webhook_urls": json.dumps(job.webhook_urls),
         "parent_job_id": job.parent_job_id,
         "dedupe_key": job.dedupe_key,
         "usage": job.usage.model_dump_json(),
+        "interrupted": int(job.interrupted),
     }
 
 
@@ -57,6 +60,11 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         summary = Summary.model_validate_json(data["summary"])
     # Handle DB rows created before the stage/parent_job_id columns existed
     raw_stage = data.get("stage") or "queued"
+    webhook_urls = (
+        json.loads(data["webhook_urls"])
+        if data.get("webhook_urls")
+        else ([data["webhook_url"]] if data.get("webhook_url") else [])
+    )
     return Job(
         job_id=data["job_id"],
         url=data["url"],
@@ -72,6 +80,7 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         obsidian_note_path=data.get("obsidian_note_path"),
         error=data["error"],
         webhook_url=data["webhook_url"],
+        webhook_urls=webhook_urls,
         parent_job_id=data.get("parent_job_id"),
         dedupe_key=data.get("dedupe_key"),
         usage=(
@@ -79,6 +88,7 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
             if data.get("usage")
             else UsageStats()
         ),
+        interrupted=bool(data.get("interrupted", 0)),
     )
 
 
@@ -101,9 +111,11 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 obsidian_note_path TEXT,
                 error       TEXT,
                 webhook_url TEXT,
+                webhook_urls TEXT,
                 parent_job_id TEXT,
                 dedupe_key TEXT,
-                usage TEXT
+                usage TEXT,
+                interrupted INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Migrate: add columns if they don't exist (for existing DBs)
@@ -113,6 +125,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
             await db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'")
         if "parent_job_id" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT")
+        if "webhook_urls" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN webhook_urls TEXT")
         if "notion_error" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN notion_error TEXT")
         if "obsidian_note_path" not in columns:
@@ -121,6 +135,10 @@ async def init_db(db_path: str = DB_PATH) -> None:
             await db.execute("ALTER TABLE jobs ADD COLUMN dedupe_key TEXT")
         if "usage" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN usage TEXT")
+        if "interrupted" not in columns:
+            await db.execute(
+                "ALTER TABLE jobs ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0"
+            )
         async with db.execute(
             "SELECT job_id, url FROM jobs WHERE dedupe_key IS NULL"
         ) as rows:
@@ -153,6 +171,7 @@ async def create_job(
         created_at=now,
         updated_at=now,
         webhook_url=webhook_url,
+        webhook_urls=[webhook_url] if webhook_url else [],
         parent_job_id=parent_job_id,
         dedupe_key=dedupe_key or submission_identity(url)[0],
     )
@@ -163,11 +182,13 @@ async def create_job(
             INSERT INTO jobs
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
-                 error, webhook_url, parent_job_id, dedupe_key, usage)
+                 error, webhook_url, webhook_urls, parent_job_id, dedupe_key, usage,
+                 interrupted)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
-                 :error, :webhook_url, :parent_job_id, :dedupe_key, :usage)
+                 :error, :webhook_url, :webhook_urls, :parent_job_id, :dedupe_key,
+                 :usage, :interrupted)
             """,
             data,
         )
@@ -202,8 +223,23 @@ async def create_or_get_job(
         ) as cursor:
             existing = await cursor.fetchone()
         if existing is not None:
+            existing_job = _deserialize_job(existing)
+            if webhook_url and webhook_url not in existing_job.webhook_urls:
+                existing_job.webhook_urls.append(webhook_url)
+                if existing_job.webhook_url is None:
+                    existing_job.webhook_url = webhook_url
+                await db.execute(
+                    """UPDATE jobs
+                       SET webhook_url = ?, webhook_urls = ?
+                       WHERE job_id = ?""",
+                    (
+                        existing_job.webhook_url,
+                        json.dumps(existing_job.webhook_urls),
+                        existing_job.job_id,
+                    ),
+                )
             await db.commit()
-            return _deserialize_job(existing), False
+            return existing_job, False
 
         now = _utcnow()
         job = Job(
@@ -214,6 +250,7 @@ async def create_or_get_job(
             created_at=now,
             updated_at=now,
             webhook_url=webhook_url,
+            webhook_urls=[webhook_url] if webhook_url else [],
             parent_job_id=parent_job_id,
             dedupe_key=dedupe_key,
         )
@@ -223,11 +260,13 @@ async def create_or_get_job(
             INSERT INTO jobs
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
                  result, summary, notion_page_id, notion_error, obsidian_note_path,
-                 error, webhook_url, parent_job_id, dedupe_key, usage)
+                 error, webhook_url, webhook_urls, parent_job_id, dedupe_key, usage,
+                 interrupted)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
                  :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
-                 :error, :webhook_url, :parent_job_id, :dedupe_key, :usage)
+                 :error, :webhook_url, :webhook_urls, :parent_job_id, :dedupe_key,
+                 :usage, :interrupted)
             """,
             data,
         )
@@ -259,14 +298,29 @@ async def list_jobs(limit: int = 50, db_path: str = DB_PATH) -> list[Job]:
 
 
 async def recover_incomplete_jobs(db_path: str = DB_PATH) -> list[str]:
-    """Reset interrupted jobs to pending and return all pending IDs in queue order."""
+    """Requeue interrupted jobs without discarding their stage or retry budget."""
     async with aiosqlite.connect(db_path) as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
             """UPDATE jobs
-               SET status = 'pending', stage = 'queued', updated_at = ?
+               SET status = CASE
+                       WHEN retry_count + 1 >= ? THEN 'failed'
+                       ELSE 'pending'
+                   END,
+                   stage = CASE
+                       WHEN retry_count + 1 >= ? THEN 'failed'
+                       ELSE stage
+                   END,
+                   retry_count = retry_count + 1,
+                   interrupted = 1,
+                   error = CASE
+                       WHEN retry_count + 1 >= ?
+                           THEN 'Job interrupted too many times during processing.'
+                       ELSE error
+                   END,
+                   updated_at = ?
                WHERE status = 'processing'""",
-            (_utcnow().isoformat(),),
+            (MAX_RETRIES, MAX_RETRIES, MAX_RETRIES, _utcnow().isoformat()),
         )
         async with db.execute(
             "SELECT job_id FROM jobs WHERE status = 'pending' ORDER BY created_at ASC"
@@ -274,6 +328,20 @@ async def recover_incomplete_jobs(db_path: str = DB_PATH) -> list[str]:
             job_ids = [str(row[0]) for row in await cursor.fetchall()]
         await db.commit()
     return job_ids
+
+
+async def update_usage(
+    job_id: str,
+    usage: UsageStats,
+    db_path: str = DB_PATH,
+) -> None:
+    """Persist provider usage without overwriting concurrent job state changes."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE jobs SET usage = ?, updated_at = ? WHERE job_id = ?",
+            (usage.model_dump_json(), _utcnow().isoformat(), job_id),
+        )
+        await db.commit()
 
 
 async def update_job(job: Job, db_path: str = DB_PATH) -> None:
@@ -294,6 +362,7 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
                 notion_error   = :notion_error,
                 obsidian_note_path = :obsidian_note_path,
                 usage          = :usage,
+                interrupted    = :interrupted,
                 error         = :error
             WHERE job_id = :job_id
             """,

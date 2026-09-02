@@ -7,6 +7,7 @@ Large files (>25 MB) are re-encoded to 32 kbps mono via ffmpeg before upload.
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from openai import (
@@ -109,6 +110,7 @@ async def transcribe(
     *,
     duration_seconds: float | None = None,
     usage: UsageStats | None = None,
+    persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
 ) -> str:
     """Send an MP3 file to Whisper and return the transcript text.
 
@@ -131,11 +133,22 @@ async def transcribe(
             )
         logger.info("%s event=transcribe_start path=%s size_mb=%.1f", log, mp3_path.name, file_size / 1e6)
 
-        audio_seconds = (
-            duration_seconds
-            if duration_seconds is not None and duration_seconds > 0
-            else await _probe_audio_duration(mp3_path)
-        )
+        audio_seconds = await _probe_audio_duration(mp3_path)
+        if audio_seconds <= 0:
+            raise TranscriptionError(
+                "Could not determine audio duration; refusing an unbounded Whisper request."
+            )
+        if (
+            duration_seconds is not None
+            and duration_seconds > 0
+            and abs(duration_seconds - audio_seconds) > 60
+        ):
+            logger.warning(
+                "%s event=duration_metadata_mismatch published=%s probed=%.1f",
+                log,
+                duration_seconds,
+                audio_seconds,
+            )
         if audio_seconds > settings.max_audio_duration_seconds:
             raise UsageLimitError(
                 f"Audio duration is {audio_seconds / 3600:.1f} hours, exceeding the "
@@ -168,7 +181,7 @@ async def transcribe(
         else:
             upload_path = mp3_path
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(api_key=settings.openai_api_key, max_retries=0)
 
         usage_tracker.openai_requests += 1
         usage_tracker.openai_audio_seconds += audio_seconds
@@ -176,6 +189,8 @@ async def transcribe(
             usage_tracker.estimated_cost_usd + estimated_cost,
             6,
         )
+        if persist_usage is not None:
+            await persist_usage(usage_tracker)
 
         with open(upload_path, "rb") as f:
             response = await client.audio.transcriptions.create(

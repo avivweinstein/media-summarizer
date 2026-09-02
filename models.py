@@ -68,9 +68,11 @@ class Job(BaseModel):
     obsidian_note_path: str | None = None
     error: str | None = None
     webhook_url: str | None = None
+    webhook_urls: list[str] = Field(default_factory=list)
     parent_job_id: str | None = None  # set when this job was spawned from a playlist/bulk
     dedupe_key: str | None = None
     usage: UsageStats = Field(default_factory=UsageStats)
+    interrupted: bool = False
 
 
 class SummarizeRequest(BaseModel):

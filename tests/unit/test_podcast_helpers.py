@@ -9,16 +9,91 @@ from unittest.mock import MagicMock
 import pytest
 
 from config import settings
-from exceptions import UsageLimitError
+from exceptions import UnsupportedURLError, UsageLimitError
 from sources.podcast import (
+    PodcastSource,
     _best_mp3_entry,
     _download_mp3,
     _episode_source_item_id,
+    _fetch_rss,
     _parse_apple_podcast_ids,
     _parse_duration,
     _struct_to_datetime,
     _thumbnail_from_entry,
+    _validate_public_http_url,
 )
+
+
+async def test_apple_episode_uses_exact_itunes_track_lookup(
+    mocker: MagicMock,
+) -> None:
+    episode_id = "1000694698631"
+    lookup = mocker.patch(
+        "sources.podcast._apple_episode_metadata",
+        return_value={
+            "trackId": int(episode_id),
+            "episodeUrl": "https://cdn.example.com/exact.mp3",
+            "trackName": "Exact Episode",
+            "collectionName": "Test Show",
+            "trackTimeMillis": 120_000,
+            "releaseDate": "2026-01-02T03:04:05Z",
+        },
+    )
+    download = mocker.patch("sources.podcast._download_mp3")
+    mocker.patch("sources.podcast.transcribe", return_value="Transcript")
+
+    result = await PodcastSource()._from_apple_podcasts(
+        f"https://podcasts.apple.com/us/podcast/show/id123?i={episode_id}",
+        "job",
+        None,
+        None,
+    )
+
+    lookup.assert_awaited_once_with(
+        f"https://podcasts.apple.com/us/podcast/show/id123?i={episode_id}",
+        episode_id,
+    )
+    assert download.call_args.args[0] == "https://cdn.example.com/exact.mp3"
+    assert result.title == "Exact Episode"
+    assert result.source_item_id == episode_id
+
+
+async def test_rss_fetch_stops_at_response_size_limit(mocker: MagicMock) -> None:
+    class FakeResponse:
+        headers: dict[str, str] = {}
+
+        async def __aenter__(self) -> "FakeResponse":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self, _size: int) -> AsyncIterator[bytes]:
+            yield b"123"
+            yield b"456"
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    mocker.patch("sources.podcast.httpx.AsyncClient", return_value=FakeClient())
+    mocker.patch(
+        "sources.podcast._validate_public_http_url",
+        return_value="93.184.216.34",
+    )
+    mocker.patch("sources.podcast._RSS_MAX_BYTES", 5)
+
+    with pytest.raises(UsageLimitError, match="response-size"):
+        await _fetch_rss("https://example.com/opaque-feed")
 
 
 async def test_download_stops_and_cleans_up_at_size_limit(
@@ -52,12 +127,50 @@ async def test_download_stops_and_cleans_up_at_size_limit(
 
     destination = tmp_path / "too-large.mp3"
     mocker.patch("sources.podcast.httpx.AsyncClient", return_value=FakeClient())
+    mocker.patch(
+        "sources.podcast._validate_public_http_url",
+        return_value="93.184.216.34",
+    )
     mocker.patch.object(settings, "max_audio_download_bytes", 5)
 
     with pytest.raises(UsageLimitError, match="download-size"):
         await _download_mp3("https://example.com/audio.mp3", destination)
 
     assert not destination.exists()
+
+
+async def test_private_media_url_is_rejected() -> None:
+    with pytest.raises(UnsupportedURLError, match="Private"):
+        await _validate_public_http_url("http://127.0.0.1/feed.xml")
+
+
+async def test_rss_redirect_to_private_address_is_rejected(
+    mocker: MagicMock,
+) -> None:
+    class RedirectResponse:
+        status_code = 302
+        headers = {"location": "http://127.0.0.1/private.xml"}
+
+        async def __aenter__(self) -> "RedirectResponse":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> RedirectResponse:
+            return RedirectResponse()
+
+    mocker.patch("sources.podcast.httpx.AsyncClient", return_value=FakeClient())
+
+    with pytest.raises(UnsupportedURLError, match="Private"):
+        await _fetch_rss("http://93.184.216.34/feed")
 
 
 def test_episode_source_item_id_prefers_guid() -> None:
@@ -229,14 +342,14 @@ class TestBestMp3Entry:
         assert mp3_url == "https://cdn.example.com/ep1.mp3"
         assert entry["title"] == "Ep 1"
 
-    def test_falls_back_to_latest_when_episode_id_not_found(self) -> None:
+    def test_exact_episode_id_must_match(self) -> None:
         entries = [
             _make_feed_entry("Ep 2", "https://cdn.example.com/ep2.mp3", guid="guid-999"),
             _make_feed_entry("Ep 1", "https://cdn.example.com/ep1.mp3", guid="guid-888"),
         ]
         feed = _make_feed(entries)
-        mp3_url, entry = _best_mp3_entry(feed, episode_id="nonexistent")
-        assert mp3_url == "https://cdn.example.com/ep2.mp3"
+        with pytest.raises(ValueError, match="Episode ID nonexistent"):
+            _best_mp3_entry(feed, episode_id="nonexistent")
 
     def test_skips_entries_without_audio_enclosure(self) -> None:
         entry_no_audio = {

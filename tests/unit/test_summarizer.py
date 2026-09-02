@@ -191,6 +191,63 @@ class TestSummarize:
         assert usage.anthropic_output_tokens == 50
         assert usage.estimated_cost_usd == pytest.approx(0.00105)
 
+    async def test_persists_reservation_before_anthropic_call(
+        self, mocker: MagicMock
+    ) -> None:
+        events: list[str] = []
+        mock_client = AsyncMock()
+
+        async def api_call(**_kwargs: object) -> object:
+            events.append("api")
+            return make_claude_response(VALID_JSON)
+
+        async def persist(_usage: UsageStats) -> None:
+            events.append("persist")
+
+        mock_client.messages.create.side_effect = api_call
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+
+        await summarize(make_result(), persist_usage=persist)
+
+        assert events[0:2] == ["persist", "api"]
+
+    async def test_chunk_failure_retries_only_the_failed_call(
+        self, mocker: MagicMock
+    ) -> None:
+        from anthropic import APIConnectionError
+
+        connection_error = APIConnectionError(
+            request=cast(
+                Any,
+                httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            )
+        )
+        response = make_claude_response(VALID_JSON)
+        mock_client = AsyncMock()
+        mock_client.messages.create.side_effect = [
+            response,
+            connection_error,
+            response,
+            response,
+            response,
+        ]
+        mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
+        mocker.patch("summarizer.asyncio.sleep")
+        mocker.patch.object(settings, "summary_chunk_chars", 10)
+        mocker.patch.object(settings, "max_transcript_chars", 100)
+        mocker.patch.object(settings, "max_anthropic_requests_per_job", 10)
+
+        await summarize(make_result(transcript="x" * 25))
+
+        assert mock_client.messages.create.call_count == 5
+        prompts = [
+            call.kwargs["messages"][0]["content"]
+            for call in mock_client.messages.create.call_args_list
+        ]
+        assert prompts[0].endswith("transcript chunk 1 of 3.")
+        assert prompts[1].endswith("transcript chunk 2 of 3.")
+        assert prompts[2].endswith("transcript chunk 2 of 3.")
+
     async def test_long_transcript_uses_chunk_summaries_and_synthesis(
         self, mocker: MagicMock
     ) -> None:
