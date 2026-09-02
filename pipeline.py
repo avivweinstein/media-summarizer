@@ -1,6 +1,6 @@
 """Pipeline orchestrator.
 
-Coordinates: detect source → source.fetch() → summarizer.summarize() → notion.save()
+Coordinates: detect source → fetch → summarize → configured output writers.
 Failed jobs are retried up to MAX_RETRIES times with exponential backoff.
 On completion (success or final failure), fires the per-job webhook if configured.
 Playlist/bulk URLs are expanded into individual jobs.
@@ -18,8 +18,10 @@ from config import settings
 from exceptions import UnsupportedURLError
 from models import Job, JobStage, JobStatus, TranscriptResult
 from notion_writer import save_to_notion
+from obsidian_writer import save_to_obsidian
 from sources.podcast import PodcastSource
 from sources.youtube import YouTubeSource
+from summarizer import MODEL as SUMMARY_MODEL
 from summarizer import summarize
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,7 @@ async def _notify_webhook(job: Job) -> None:
             "title": job.result.title if job.result else "",
             "tldr": job.summary.tldr if job.summary else "",
             "notion_url": notion_url,
+            "obsidian_note_path": job.obsidian_note_path,
         }
     else:
         payload = {
@@ -207,10 +210,42 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             if await _check_cancelled(job, db_path):
                 return
 
-            # --- Save to Notion stage ---
-            await _set_stage(job, JobStage.saving_notion, db_path)
-            page_id = await save_to_notion(result, summary, job_id=job.job_id)
-            job.notion_page_id = page_id
+            # --- Save outputs ---
+            output_saved = False
+            notion_failure: Exception | None = None
+            if settings.obsidian_vault_path:
+                await _set_stage(job, JobStage.saving_obsidian, db_path)
+                job.obsidian_note_path = await save_to_obsidian(
+                    result,
+                    summary,
+                    settings.obsidian_vault_path,
+                    retain_transcript=settings.obsidian_retain_transcript,
+                    summary_model=SUMMARY_MODEL,
+                    added_at=job.created_at,
+                )
+                output_saved = True
+
+            if settings.notion_enabled:
+                await _set_stage(job, JobStage.saving_notion, db_path)
+                try:
+                    job.notion_page_id = await save_to_notion(
+                        result, summary, job_id=job.job_id
+                    )
+                    job.notion_error = None
+                    output_saved = True
+                except Exception as notion_error:
+                    notion_failure = notion_error
+                    job.notion_error = str(notion_error)
+                    logger.warning(
+                        "%s event=notion_save_non_blocking_failure error=%r",
+                        log,
+                        job.notion_error,
+                    )
+
+            if not output_saved:
+                if notion_failure is not None:
+                    raise notion_failure
+                raise RuntimeError("No configured output destination succeeded.")
 
             job.status = JobStatus.done
             job.stage = JobStage.done

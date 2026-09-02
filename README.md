@@ -1,6 +1,6 @@
 # Media Summarizer
 
-A personal media intelligence pipeline. Send YouTube or podcast URLs via the web UI or HTTP API, and get structured AI summaries saved to Notion.
+A personal media intelligence pipeline. Send YouTube or podcast URLs via the web UI or HTTP API, and get structured AI summaries archived in Obsidian with optional Notion publishing.
 
 ## Features
 
@@ -8,7 +8,8 @@ A personal media intelligence pipeline. Send YouTube or podcast URLs via the web
 - **YouTube playlists** — auto-expands into individual video jobs
 - **Podcasts** — Apple Podcasts, RSS feeds, direct MP3 URLs
 - **AI summaries** — Claude generates TL;DR, key points, tags, and "worth rewatching" rating
-- **Notion integration** — each summary is saved as a page in your Notion database
+- **Obsidian archive** — durable local Markdown summaries with optional full transcripts
+- **Notion integration** — optionally publish each summary to a Notion database
 - **Web dashboard** — real-time job tracking with dark mode, SSE live updates
 - **Job management** — cancel, delete, and auto-cleanup of old jobs
 - **Concurrent processing** — async worker pool handles multiple jobs without blocking
@@ -53,11 +54,32 @@ Edit `.env` and fill in your API keys (see [Environment Variables](#environment-
 ### 4. Create venv and install dependencies
 
 ```bash
-uv venv
-uv pip install -e ".[dev]"
+uv sync --extra dev --locked
 ```
 
-### 5. Set up Notion
+### 5. Configure Obsidian
+
+Create or choose an Obsidian vault, then set its absolute path in `.env`:
+
+```dotenv
+OBSIDIAN_VAULT_PATH=/Users/you/Documents/Media-Library
+OBSIDIAN_RETAIN_TRANSCRIPT=true
+```
+
+The vault must already contain an `.obsidian` directory. Generated content is
+written only beneath `Generated/Summaries` and `Generated/Transcripts`; existing
+notes are never replaced.
+
+> **Data boundary:** the current pipeline sends transcripts to Anthropic for
+> summarization and may send downloaded audio to OpenAI for transcription. Use it
+> only for public or otherwise approved media. Do not submit confidential,
+> internal, restricted, or regulated material until an approved local-provider
+> mode is implemented. Notion is an additional external destination when enabled.
+
+### 6. Set up Notion (optional)
+
+Notion publishing is disabled by default. To publish a secondary copy, set
+`NOTION_ENABLED=true`, then:
 
 1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) and create a new **Internal Integration**.
 2. Copy the integration token into `NOTION_API_KEY` in your `.env`.
@@ -80,7 +102,7 @@ uv pip install -e ".[dev]"
 4. Click **Share** on your database and invite your integration.
 5. Copy the database ID from the URL (`https://notion.so/yourworkspace/<DATABASE_ID>?v=...`) into `NOTION_DATABASE_ID`.
 
-### 6. Start the server
+### 7. Start the server
 
 ```bash
 uv run uvicorn main:app --host 127.0.0.1 --port 8000
@@ -88,7 +110,7 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8000
 
 Open `http://localhost:8000` in your browser. You should see the dashboard.
 
-### 7. Verify everything works
+### 8. Verify everything works
 
 ```bash
 # Quick health check
@@ -100,7 +122,7 @@ curl "http://localhost:8000/health?deep=true"
 
 A healthy response looks like:
 ```json
-{"status": "ok", "db": "ok", "anthropic": "ok", "openai": "ok", "notion": "ok", "worker_queue_size": 0}
+{"status": "ok", "db": "ok", "anthropic": "ok", "openai": "ok", "obsidian": "ok", "notion": "ok", "worker_queue_size": 0}
 ```
 
 ---
@@ -115,14 +137,19 @@ and writes logs under `~/Library/Logs/media-summarizer/`.
 
 ```bash
 uv sync --extra dev
-uv run python scripts/install_macos_service.py install
+uv run python scripts/install_macos_service.py install \
+  --obsidian-vault "$HOME/Documents/Media-Library" \
+  --disable-notion
 
 # Inspect or remove the service
 uv run python scripts/install_macos_service.py status
 uv run python scripts/install_macos_service.py uninstall
 ```
 
-The installer requires `.env` and `.venv/bin/uvicorn` to exist. Its generated
+The installer requires `.env` and `.venv/bin/uvicorn` to exist. The Obsidian
+argument configures the vault without placing its path in `.env`.
+`--disable-notion` keeps the Mac service's output local even if `.env` enables
+Notion; omit it when you intentionally want both destinations. The generated
 launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
@@ -312,7 +339,10 @@ Source.fetch()
 summarize() via Claude API -> structured JSON (tldr, key_points, tags, worth_rewatching)
   |
   v
-save_to_notion() -> Notion database page with properties + body
+save_to_obsidian() -> local Markdown summary + optional transcript
+  |
+  v
+save_to_notion() -> optional Notion database page with properties + body
   |
   v
 Job marked done, webhook fired (if configured)
@@ -321,7 +351,7 @@ Job marked done, webhook fired (if configured)
 ### Pipeline Stages
 
 Jobs progress through stages visible in the UI:
-`queued` -> `detecting` -> `transcribing` -> `summarizing` -> `saving_notion` -> `done`
+`queued` -> `detecting` -> `transcribing` -> `summarizing` -> `saving_obsidian` -> optional `saving_notion` -> `done`
 
 ---
 
@@ -351,8 +381,11 @@ Copy `.env.example` to `.env` and fill in:
 |-----------------------------|----------|-------------------------------------------------|-----------------|
 | `ANTHROPIC_API_KEY`         | Yes      | Claude API key for summarization                | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
 | `OPENAI_API_KEY`            | Yes      | OpenAI key for Whisper transcription            | [platform.openai.com](https://platform.openai.com/api-keys) |
-| `NOTION_API_KEY`            | Yes      | Notion integration token                        | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
-| `NOTION_DATABASE_ID`        | Yes      | Target Notion database ID                       | From your database URL |
+| `OBSIDIAN_VAULT_PATH`       | No       | Local canonical archive; must contain `.obsidian` | Your vault folder |
+| `OBSIDIAN_RETAIN_TRANSCRIPT` | No      | Save full transcripts to Obsidian (default: true) | — |
+| `NOTION_ENABLED`            | No       | Enable optional Notion publishing (default: false) | — |
+| `NOTION_API_KEY`            | If enabled | Notion integration token                      | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
+| `NOTION_DATABASE_ID`        | If enabled | Target Notion database ID                     | From your database URL |
 | `YOUTUBE_API_KEY`           | No       | YouTube Data API key (optional metadata optimization) | [Google Cloud Console](https://console.cloud.google.com) |
 | `OPENCLAW_WEBHOOK_URL`      | No       | Webhook URL for notifications                   | Your webhook endpoint |
 | `PODCAST_INDEX_API_KEY`     | No       | Podcast Index API key (reserved for future)     | [podcastindex.org](https://podcastindex.org/developer) |
