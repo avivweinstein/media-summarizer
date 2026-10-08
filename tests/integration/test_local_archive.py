@@ -66,6 +66,8 @@ async def test_local_upload_archives_and_retrieves_without_cloud(
     assert completed is not None
     assert completed.status == JobStatus.done
     assert completed.processing_mode == "local"
+    assert completed.result is not None
+    assert completed.result.transcript == ""
     assert completed.usage.local_summary_requests == 1
     assert completed.obsidian_note_path
     assert (vault / completed.obsidian_note_path).is_file()

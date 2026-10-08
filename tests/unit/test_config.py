@@ -21,3 +21,6 @@ def test_webhooks_are_opt_in_by_default() -> None:
 def test_usage_limits_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         cast(Any, Settings)(_env_file=None, max_estimated_cost_usd=0)
+
+    with pytest.raises(ValidationError):
+        cast(Any, Settings)(_env_file=None, source_fetch_timeout_seconds=0)

@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     notion_enabled: bool = False
     obsidian_vault_path: str = ""
     obsidian_retain_transcript: bool = True
+    db_retain_transcript: bool = False
+    job_db_path: str = "~/Library/Application Support/media-summarizer/jobs.db"
+    backup_dir: str = "~/Library/Application Support/media-summarizer/backups"
     podcast_index_api_key: str = ""
     podcast_index_api_secret: str = ""
     youtube_api_key: str = ""
@@ -36,6 +39,7 @@ class Settings(BaseSettings):
     max_openai_requests_per_job: int = Field(default=3, gt=0)
     max_audio_duration_seconds: int = Field(default=14_400, gt=0)
     max_audio_download_bytes: int = Field(default=500_000_000, gt=0)
+    source_fetch_timeout_seconds: int = Field(default=120, gt=0)
     max_article_download_bytes: int = Field(default=5_000_000, gt=0)
     max_estimated_cost_usd: float = Field(default=2.0, gt=0)
     anthropic_input_cost_per_million_usd: float = Field(default=3.0, ge=0)
