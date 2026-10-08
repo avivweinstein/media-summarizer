@@ -3,7 +3,7 @@
 Supported URL types:
   - Direct MP3 URL (.mp3 extension)
   - RSS feed URL (parsed by feedparser)
-  - Apple Podcasts URL (resolved via iTunes Lookup API → RSS)
+  - Apple Podcasts URL (exact episode page, or show lookup → RSS)
 
 Spotify URLs are explicitly rejected with a helpful error message.
 
@@ -15,17 +15,24 @@ Flow for each type:
 """
 
 import asyncio
+import html
+import ipaddress
+import json
 import logging
+import re
+import socket
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import feedparser
 import httpx
 
-from exceptions import TranscriptionError
-from models import TranscriptResult
+from config import settings
+from exceptions import TranscriptionError, UnsupportedURLError, UsageLimitError
+from models import TranscriptResult, UsageStats
 from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe
 
@@ -34,6 +41,9 @@ logger = logging.getLogger(__name__)
 _ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
 _DOWNLOAD_TIMEOUT = 300  # seconds — large podcasts can be slow
 _DOWNLOAD_CHUNK = 64 * 1024  # 64 KB chunks
+_RSS_TIMEOUT = 30
+_RSS_MAX_BYTES = 5 * 1024 * 1024
+_MAX_REDIRECTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +123,8 @@ def _best_mp3_entry(
 ) -> tuple[str, feedparser.FeedParserDict]:
     """Find the best episode entry and its MP3 enclosure URL.
 
-    If episode_id is provided, tries to match against iTunes episode IDs in the
-    feed (some RSS feeds include itunes:episode or guid). Falls back to latest.
+    If episode_id is provided, it must match an episode GUID. Show-level URLs
+    without an episode ID select the latest episode.
     Returns (mp3_url, entry).
     """
     entries_with_mp3: list[tuple[str, feedparser.FeedParserDict]] = []
@@ -137,6 +147,7 @@ def _best_mp3_entry(
             guid = str(entry.get("id", ""))
             if episode_id in guid:
                 return mp3_url, entry
+        raise ValueError(f"Episode ID {episode_id} was not found in the podcast feed.")
 
     # Default: latest episode (first in feed — feeds are newest-first)
     return entries_with_mp3[0]
@@ -153,14 +164,125 @@ def _episode_source_item_id(entry: object, mp3_url: str) -> str:
 # Async helpers — network I/O
 # ---------------------------------------------------------------------------
 
+async def _validate_public_http_url(url: str) -> str:
+    """Return a validated public address to pin for the outbound connection."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise UnsupportedURLError("Media URLs must use HTTP or HTTPS.")
+    if parsed.username or parsed.password:
+        raise UnsupportedURLError("Media URLs cannot contain credentials.")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        answers = await asyncio.to_thread(
+            socket.getaddrinfo,
+            parsed.hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as error:
+        raise TranscriptionError(
+            f"Could not resolve media host {parsed.hostname}."
+        ) from error
+
+    addresses = {str(answer[4][0]) for answer in answers}
+    if not addresses or any(
+        not ipaddress.ip_address(address).is_global for address in addresses
+    ):
+        raise UnsupportedURLError(
+            "Private, loopback, link-local, and reserved media URLs are not allowed."
+        )
+    return min(
+        addresses,
+        key=lambda address: ipaddress.ip_address(address).version,
+    )
+
+
+async def _pinned_request_args(
+    url: str,
+) -> tuple[str, dict[str, str], dict[str, object]]:
+    """Build request arguments that connect to the validated address directly."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    address = await _validate_public_http_url(url)
+    bracketed_address = f"[{address}]" if ":" in address else address
+    default_port = 443 if parsed.scheme == "https" else 80
+    port = parsed.port or default_port
+    pinned_netloc = (
+        bracketed_address if port == default_port else f"{bracketed_address}:{port}"
+    )
+    host_header = hostname if port == default_port else f"{hostname}:{port}"
+    pinned_url = urlunparse(
+        (
+            parsed.scheme,
+            pinned_netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+    return pinned_url, {"Host": host_header}, {"sni_hostname": hostname}
+
+
+def _redirect_target(response: object, current_url: str) -> str | None:
+    status_code = getattr(response, "status_code", 200)
+    if not isinstance(status_code, int) or not 300 <= status_code < 400:
+        return None
+    headers = getattr(response, "headers", {})
+    location = headers.get("location", "")
+    if not location:
+        raise UnsupportedURLError("Media redirect did not include a destination.")
+    return urljoin(current_url, str(location))
+
+
 async def _fetch_rss(rss_url: str) -> feedparser.FeedParserDict:
-    """Fetch and parse an RSS feed. Runs feedparser in an executor (it's sync)."""
-    loop = asyncio.get_event_loop()
-    feed: feedparser.FeedParserDict = await loop.run_in_executor(
-        None, feedparser.parse, rss_url
+    """Fetch a bounded RSS response and parse it without feedparser network I/O."""
+    body = bytearray()
+    async with httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=_RSS_TIMEOUT,
+        trust_env=False,
+    ) as client:
+        current_url = rss_url
+        for _ in range(_MAX_REDIRECTS + 1):
+            request_url, headers, extensions = await _pinned_request_args(current_url)
+            async with client.stream(
+                "GET",
+                request_url,
+                headers=headers,
+                extensions=extensions,
+            ) as response:
+                redirect = _redirect_target(response, current_url)
+                if redirect is not None:
+                    current_url = redirect
+                    continue
+                response.raise_for_status()
+                raw_length = response.headers.get("content-length", "")
+                if raw_length.isdigit() and int(raw_length) > _RSS_MAX_BYTES:
+                    raise UsageLimitError(
+                        "RSS feed exceeds the configured response-size limit."
+                    )
+                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK):
+                    body.extend(chunk)
+                    if len(body) > _RSS_MAX_BYTES:
+                        raise UsageLimitError(
+                            "RSS feed exceeds the configured response-size limit."
+                        )
+                break
+        else:
+            raise UnsupportedURLError("RSS feed exceeded the redirect limit.")
+
+    feed: feedparser.FeedParserDict = await asyncio.to_thread(
+        feedparser.parse,
+        bytes(body),
     )
     if feed.get("bozo") and not feed.entries:
-        raise ValueError(f"Failed to parse RSS feed from {rss_url}: {feed.get('bozo_exception')}")
+        raise UnsupportedURLError(
+            f"URL is not a readable RSS feed: {feed.get('bozo_exception')}"
+        )
+    if not feed.entries:
+        raise UnsupportedURLError("URL is not a podcast RSS feed.")
     return feed
 
 
@@ -182,16 +304,156 @@ async def _itunes_feed_url(podcast_id: str) -> str:
     return feed_url
 
 
+async def _apple_episode_metadata(
+    episode_url: str,
+    episode_id: str,
+) -> dict[str, object]:
+    """Resolve an Apple episode page to its exact embedded audio and metadata."""
+    body = bytearray()
+    async with httpx.AsyncClient(
+        timeout=15,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        current_url = episode_url
+        for _ in range(_MAX_REDIRECTS + 1):
+            if urlparse(current_url).hostname != "podcasts.apple.com":
+                raise UnsupportedURLError(
+                    "Apple Podcasts redirected to an unexpected host."
+                )
+            request_url, headers, extensions = await _pinned_request_args(current_url)
+            async with client.stream(
+                "GET",
+                request_url,
+                headers=headers,
+                extensions=extensions,
+            ) as response:
+                redirect = _redirect_target(response, current_url)
+                if redirect is not None:
+                    current_url = redirect
+                    continue
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK):
+                    body.extend(chunk)
+                    if len(body) > _RSS_MAX_BYTES:
+                        raise UsageLimitError(
+                            "Apple Podcasts page exceeds the response-size limit."
+                        )
+                break
+        else:
+            raise UnsupportedURLError("Apple Podcasts exceeded the redirect limit.")
+
+    page = bytes(body).decode("utf-8", errors="replace")
+    content_id = re.search(
+        r'<meta\s+name="apple:content_id"\s+content="([^"]+)"',
+        page,
+    )
+    if content_id is None or content_id.group(1) != episode_id:
+        raise UnsupportedURLError(
+            f"Apple Podcasts did not resolve episode track ID {episode_id}."
+        )
+
+    metadata: dict[str, object] = {}
+    for raw_json in re.findall(
+        r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>',
+        page,
+        flags=re.DOTALL,
+    ):
+        try:
+            candidate = json.loads(html.unescape(raw_json))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("@type") == "PodcastEpisode":
+            metadata = candidate
+            break
+
+    audio_match = re.search(r'https?://[^"\'<>\\]+?\.mp3[^"\'<>\\]*', page)
+    if not metadata or audio_match is None:
+        raise UnsupportedURLError(
+            f"Apple Podcasts episode {episode_id} did not expose usable metadata and audio."
+        )
+
+    series = metadata.get("partOfSeries")
+    series_name = series.get("name", "") if isinstance(series, dict) else ""
+    duration_seconds = _parse_iso_duration(str(metadata.get("duration") or ""))
+    return {
+        "trackId": episode_id,
+        "episodeUrl": html.unescape(audio_match.group(0)),
+        "trackName": metadata.get("name", "Unknown Episode"),
+        "collectionName": series_name,
+        "trackTimeMillis": duration_seconds * 1000,
+        "releaseDate": metadata.get("datePublished"),
+        "artworkUrl600": metadata.get("thumbnailUrl"),
+    }
+
+
+def _parse_iso_duration(raw: str) -> int:
+    match = re.fullmatch(
+        r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+        raw,
+    )
+    if match is None:
+        return 0
+    hours, minutes, seconds = (int(value or 0) for value in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _parse_iso_datetime(raw: object) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
     """Stream-download an MP3 file to disk."""
     log = f"job_id={job_id} url={url[:60]!r} source=podcast"
     logger.info("%s event=mp3_download_start", log)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
-                    f.write(chunk)
+    downloaded = 0
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=_DOWNLOAD_TIMEOUT,
+            trust_env=False,
+        ) as client:
+            current_url = url
+            for _ in range(_MAX_REDIRECTS + 1):
+                request_url, headers, extensions = await _pinned_request_args(current_url)
+                async with client.stream(
+                    "GET",
+                    request_url,
+                    headers=headers,
+                    extensions=extensions,
+                ) as resp:
+                    redirect = _redirect_target(resp, current_url)
+                    if redirect is not None:
+                        current_url = redirect
+                        continue
+                    resp.raise_for_status()
+                    raw_content_length = resp.headers.get("content-length", "")
+                    content_length = (
+                        int(raw_content_length) if raw_content_length.isdigit() else 0
+                    )
+                    if content_length > settings.max_audio_download_bytes:
+                        raise UsageLimitError(
+                            "Podcast audio exceeds the configured download-size limit."
+                        )
+                    with open(dest, "wb") as f:
+                        async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
+                            downloaded += len(chunk)
+                            if downloaded > settings.max_audio_download_bytes:
+                                raise UsageLimitError(
+                                    "Podcast audio exceeds the configured download-size limit."
+                                )
+                            f.write(chunk)
+                    break
+            else:
+                raise UnsupportedURLError("Podcast audio exceeded the redirect limit.")
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     size_mb = dest.stat().st_size / 1e6
     logger.info("%s event=mp3_download_done size_mb=%.1f", log, size_mb)
 
@@ -203,35 +465,64 @@ async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
 class PodcastSource(BaseSource):
     """Resolves podcast URLs to MP3, transcribes via Whisper, returns TranscriptResult."""
 
-    async def fetch(self, url: str, job_id: str = "-") -> TranscriptResult:
+    async def fetch(
+        self,
+        url: str,
+        job_id: str = "-",
+        *,
+        usage: UsageStats | None = None,
+        persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+    ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
 
         try:
             if parsed.path.lower().endswith(".mp3"):
-                return await self._from_direct_mp3(url, job_id)
+                return await self._from_direct_mp3(
+                    url, job_id, usage, persist_usage
+                )
 
             if hostname == "podcasts.apple.com":
-                return await self._from_apple_podcasts(url, job_id)
+                return await self._from_apple_podcasts(
+                    url, job_id, usage, persist_usage
+                )
 
             # Assume it's an RSS feed URL
             logger.info("%s event=rss_fetch_start", log)
             feed = await _fetch_rss(url)
-            return await self._from_feed(feed, url, job_id, episode_id=None)
+            return await self._from_feed(
+                feed,
+                url,
+                job_id,
+                episode_id=None,
+                usage=usage,
+                persist_usage=persist_usage,
+            )
 
-        except TranscriptionError:
+        except (TranscriptionError, UnsupportedURLError, UsageLimitError):
             raise
         except Exception as e:
             raise TranscriptionError(
                 f"Couldn't process podcast URL: {e}"
             ) from e
 
-    async def _from_direct_mp3(self, url: str, job_id: str) -> TranscriptResult:
+    async def _from_direct_mp3(
+        self,
+        url: str,
+        job_id: str,
+        usage: UsageStats | None,
+        persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+    ) -> TranscriptResult:
         """Download a direct MP3 URL and transcribe it."""
         dest = tmp_path_for_job(job_id)
         await _download_mp3(url, dest, job_id)
-        transcript = await transcribe(dest, job_id)
+        transcript = await transcribe(
+            dest,
+            job_id,
+            usage=usage,
+            persist_usage=persist_usage,
+        )
 
         return TranscriptResult(
             title=Path(urlparse(url).path).stem or "Podcast Episode",
@@ -244,15 +535,59 @@ class PodcastSource(BaseSource):
             source_item_id=url,
         )
 
-    async def _from_apple_podcasts(self, url: str, job_id: str) -> TranscriptResult:
+    async def _from_apple_podcasts(
+        self,
+        url: str,
+        job_id: str,
+        usage: UsageStats | None,
+        persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+    ) -> TranscriptResult:
         """Resolve Apple Podcasts URL → iTunes → RSS → MP3 → transcribe."""
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         podcast_id, episode_id = _parse_apple_podcast_ids(url)
+        if episode_id:
+            logger.info("%s event=itunes_episode_lookup_start episode_id=%s", log, episode_id)
+            episode = await _apple_episode_metadata(url, episode_id)
+            audio_url = str(episode["episodeUrl"])
+            duration_seconds = int(str(episode.get("trackTimeMillis") or 0)) // 1000
+            dest = tmp_path_for_job(job_id)
+            await _download_mp3(audio_url, dest, job_id)
+            transcript = await transcribe(
+                dest,
+                job_id,
+                duration_seconds=duration_seconds,
+                usage=usage,
+                persist_usage=persist_usage,
+            )
+            return TranscriptResult(
+                title=str(episode.get("trackName") or "Unknown Episode"),
+                source="podcast",
+                url=url,
+                channel_or_show=str(episode.get("collectionName") or ""),
+                duration_seconds=duration_seconds,
+                thumbnail_url=(
+                    str(episode["artworkUrl600"])
+                    if episode.get("artworkUrl600")
+                    else None
+                ),
+                transcript=transcript,
+                published_at=_parse_iso_datetime(episode.get("releaseDate")),
+                transcription_model="openai/whisper-1",
+                source_item_id=episode_id,
+            )
+
         logger.info("%s event=itunes_lookup_start podcast_id=%s", log, podcast_id)
         feed_url = await _itunes_feed_url(podcast_id)
         logger.info("%s event=itunes_lookup_done feed_url=%s", log, feed_url)
         feed = await _fetch_rss(feed_url)
-        return await self._from_feed(feed, url, job_id, episode_id=episode_id)
+        return await self._from_feed(
+            feed,
+            url,
+            job_id,
+            episode_id=episode_id,
+            usage=usage,
+            persist_usage=persist_usage,
+        )
 
     async def _from_feed(
         self,
@@ -260,6 +595,8 @@ class PodcastSource(BaseSource):
         original_url: str,
         job_id: str,
         episode_id: str | None,
+        usage: UsageStats | None,
+        persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
     ) -> TranscriptResult:
         """Pick the best episode from a parsed RSS feed, download and transcribe."""
         log = f"job_id={job_id} url={original_url[:60]!r} source=podcast"
@@ -277,7 +614,13 @@ class PodcastSource(BaseSource):
 
         dest = tmp_path_for_job(job_id)
         await _download_mp3(mp3_url, dest, job_id)
-        transcript = await transcribe(dest, job_id)
+        transcript = await transcribe(
+            dest,
+            job_id,
+            duration_seconds=duration_seconds,
+            usage=usage,
+            persist_usage=persist_usage,
+        )
 
         return TranscriptResult(
             title=title,

@@ -15,8 +15,8 @@ import yt_dlp
 
 import job_queue
 from config import settings
-from exceptions import UnsupportedURLError
-from models import Job, JobStage, JobStatus, TranscriptResult
+from exceptions import UnsupportedURLError, UsageLimitError
+from models import Job, JobStage, JobStatus, TranscriptResult, UsageStats
 from notion_writer import save_to_notion
 from obsidian_writer import save_to_obsidian
 from sources.podcast import PodcastSource
@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 _YOUTUBE_HOSTNAMES = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
 _SPOTIFY_HOSTNAMES = {"open.spotify.com"}
 _APPLE_HOSTNAMES = {"podcasts.apple.com"}
+_UNSUPPORTED_MEDIA_HOSTNAMES = {
+    "soundcloud.com",
+    "twitter.com",
+    "x.com",
+}
 
 MAX_RETRIES = 3
 _BACKOFF_SECONDS = [5, 10, 20]  # sleep before attempt 2, 3, 4 (never used for attempt 1)
@@ -62,9 +67,19 @@ def detect_source(url: str) -> str:
     if hostname == "podcasts.apple.com" or parsed.path.lower().endswith(".mp3"):
         return "podcast"
 
+    if parsed.scheme in {"http", "https"} and hostname:
+        if hostname in _UNSUPPORTED_MEDIA_HOSTNAMES:
+            raise UnsupportedURLError(
+                "This media host is not currently supported. Try YouTube, Apple Podcasts, "
+                "a podcast RSS URL, or a direct MP3 URL."
+            )
+        # Opaque RSS URLs often have no feed-like hostname, extension, or path.
+        # PodcastSource performs the bounded fetch and verifies feed contents.
+        return "podcast"
+
     raise UnsupportedURLError(
         "Unsupported source. Supported: YouTube (video or playlist), "
-        "Apple Podcasts, direct RSS/MP3."
+        "Apple Podcasts, RSS feeds, or direct MP3."
     )
 
 
@@ -97,14 +112,28 @@ async def expand_playlist(url: str) -> list[str]:
     return await loop.run_in_executor(None, _extract_playlist_videos_sync, url)
 
 
-async def _notify_webhook(job: Job) -> None:
+async def _notify_webhook(
+    job: Job,
+    urls: list[str] | None = None,
+    db_path: str = job_queue.DB_PATH,
+) -> None:
     """POST job result or error to the job's webhook URL (fire-and-forget).
 
-    Uses the per-job webhook_url; falls back to settings.openclaw_webhook_url.
+    When explicitly enabled, uses the per-job webhook_url and falls back to
+    settings.openclaw_webhook_url.
     Swallows all exceptions — a webhook failure must never affect job state.
     """
-    url = job.webhook_url or settings.openclaw_webhook_url
-    if not url:
+    if not settings.webhooks_enabled:
+        return
+    if urls is None:
+        fresh = await job_queue.get_job(job.job_id, db_path=db_path)
+        if fresh is not None:
+            job = fresh
+    destinations = urls or job.webhook_urls
+    if not destinations:
+        fallback = job.webhook_url or settings.openclaw_webhook_url
+        destinations = [fallback] if fallback else []
+    if not destinations:
         return
 
     if job.status == JobStatus.done:
@@ -120,6 +149,7 @@ async def _notify_webhook(job: Job) -> None:
             "tldr": job.summary.tldr if job.summary else "",
             "notion_url": notion_url,
             "obsidian_note_path": job.obsidian_note_path,
+            "usage": job.usage.model_dump(),
         }
     else:
         payload = {
@@ -131,10 +161,26 @@ async def _notify_webhook(job: Job) -> None:
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload)
-        logger.info("job_id=%s event=webhook_sent status=%d", job.job_id, resp.status_code)
+            for url in dict.fromkeys(destinations):
+                try:
+                    resp = await client.post(url, json=payload)
+                    logger.info(
+                        "job_id=%s event=webhook_sent status=%d",
+                        job.job_id,
+                        resp.status_code,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "job_id=%s event=webhook_failed error=%r",
+                        job.job_id,
+                        str(e),
+                    )
     except Exception as e:
-        logger.warning("job_id=%s event=webhook_failed error=%r", job.job_id, str(e))
+        logger.warning(
+            "job_id=%s event=webhook_client_failed error=%r",
+            job.job_id,
+            str(e),
+        )
 
 
 async def _check_cancelled(job: Job, db_path: str) -> bool:
@@ -162,8 +208,13 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
     log = f"job_id={job.job_id} url={job.url[:60]!r} source=unknown"
     last_error = ""
+    interrupted_stage = job.stage if job.interrupted else None
+    job.interrupted = False
 
-    for attempt in range(MAX_RETRIES):
+    async def persist_usage(_usage: UsageStats) -> None:
+        await job_queue.update_usage(job.job_id, job.usage, db_path=db_path)
+
+    for attempt in range(job.retry_count, MAX_RETRIES):
         if await _check_cancelled(job, db_path):
             logger.info("job_id=%s event=job_cancelled", job.job_id)
             return
@@ -178,7 +229,10 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
 
         job.status = JobStatus.processing
         job.retry_count = attempt
-        await _set_stage(job, JobStage.detecting, db_path)
+        if job.result is None:
+            await _set_stage(job, JobStage.detecting, db_path)
+        else:
+            await job_queue.update_job(job, db_path=db_path)
 
         try:
             source_type = detect_source(job.url)
@@ -188,32 +242,57 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             if await _check_cancelled(job, db_path):
                 return
 
-            # --- Transcription stage ---
-            await _set_stage(job, JobStage.transcribing, db_path)
             result: TranscriptResult
-            if source_type == "youtube":
-                source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
-                result = await source.fetch(job.url, job_id=job.job_id)
+            if job.result is not None:
+                result = job.result
+                logger.info("%s event=transcript_reused_after_restart", log)
             else:
-                result = await PodcastSource().fetch(job.url, job_id=job.job_id)
+                # --- Transcription stage ---
+                await _set_stage(job, JobStage.transcribing, db_path)
+                if source_type == "youtube":
+                    source = YouTubeSource(youtube_api_key=settings.youtube_api_key)
+                    result = await source.fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                    )
+                else:
+                    result = await PodcastSource().fetch(
+                        job.url,
+                        job_id=job.job_id,
+                        usage=job.usage,
+                        persist_usage=persist_usage,
+                    )
 
-            job.result = result
+                job.result = result
+                await job_queue.update_job(job, db_path=db_path)
 
             if await _check_cancelled(job, db_path):
                 return
 
-            # --- Summarization stage ---
-            await _set_stage(job, JobStage.summarizing, db_path)
-            summary = await summarize(result, job_id=job.job_id)
-            job.summary = summary
+            if job.summary is not None:
+                summary = job.summary
+                logger.info("%s event=summary_reused_after_restart", log)
+            else:
+                # --- Summarization stage ---
+                await _set_stage(job, JobStage.summarizing, db_path)
+                summary = await summarize(
+                    result,
+                    job_id=job.job_id,
+                    usage=job.usage,
+                    persist_usage=persist_usage,
+                )
+                job.summary = summary
+                await job_queue.update_job(job, db_path=db_path)
 
             if await _check_cancelled(job, db_path):
                 return
 
             # --- Save outputs ---
-            output_saved = False
+            output_saved = bool(job.obsidian_note_path or job.notion_page_id)
             notion_failure: Exception | None = None
-            if settings.obsidian_vault_path:
+            if settings.obsidian_vault_path and not job.obsidian_note_path:
                 await _set_stage(job, JobStage.saving_obsidian, db_path)
                 job.obsidian_note_path = await save_to_obsidian(
                     result,
@@ -222,25 +301,36 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
                     retain_transcript=settings.obsidian_retain_transcript,
                     summary_model=SUMMARY_MODEL,
                     added_at=job.created_at,
+                    usage=job.usage,
                 )
                 output_saved = True
 
-            if settings.notion_enabled:
-                await _set_stage(job, JobStage.saving_notion, db_path)
-                try:
-                    job.notion_page_id = await save_to_notion(
-                        result, summary, job_id=job.job_id
+            if settings.notion_enabled and not job.notion_page_id:
+                if interrupted_stage == JobStage.saving_notion:
+                    job.notion_error = (
+                        "Notion save was interrupted and was not replayed to avoid "
+                        "creating a duplicate page."
                     )
-                    job.notion_error = None
-                    output_saved = True
-                except Exception as notion_error:
-                    notion_failure = notion_error
-                    job.notion_error = str(notion_error)
                     logger.warning(
-                        "%s event=notion_save_non_blocking_failure error=%r",
+                        "%s event=notion_save_skipped_after_interruption",
                         log,
-                        job.notion_error,
                     )
+                else:
+                    await _set_stage(job, JobStage.saving_notion, db_path)
+                    try:
+                        job.notion_page_id = await save_to_notion(
+                            result, summary, job_id=job.job_id
+                        )
+                        job.notion_error = None
+                        output_saved = True
+                    except Exception as notion_error:
+                        notion_failure = notion_error
+                        job.notion_error = str(notion_error)
+                        logger.warning(
+                            "%s event=notion_save_non_blocking_failure error=%r",
+                            log,
+                            job.notion_error,
+                        )
 
             if not output_saved:
                 if notion_failure is not None:
@@ -251,9 +341,13 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
             job.stage = JobStage.done
             logger.info("%s event=job_completed title=%r", log, result.title)
             await job_queue.update_job(job, db_path=db_path)
-            await _notify_webhook(job)
+            await _notify_webhook(job, db_path=db_path)
             return
 
+        except (UnsupportedURLError, UsageLimitError) as e:
+            last_error = str(e)
+            logger.error("%s event=job_non_retryable error=%r", log, last_error)
+            break
         except Exception as e:
             last_error = str(e)
             logger.error(
@@ -266,4 +360,4 @@ async def run_job(job_id: str, db_path: str = job_queue.DB_PATH) -> None:
     job.error = last_error
     logger.error("%s event=job_failed_final error=%r", log, last_error)
     await job_queue.update_job(job, db_path=db_path)
-    await _notify_webhook(job)
+    await _notify_webhook(job, db_path=db_path)

@@ -4,10 +4,65 @@ Pure-function tests — no network calls, no mocks needed.
 """
 
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from sources.youtube import _extract_video_id, _parse_upload_date
+from config import settings
+from exceptions import UsageLimitError
+from sources.youtube import (
+    YouTubeSource,
+    _download_audio_sync,
+    _extract_video_id,
+    _parse_upload_date,
+)
+
+
+async def test_duration_limit_blocks_before_youtube_download(
+    mocker: MagicMock,
+) -> None:
+    mocker.patch(
+        "sources.youtube._fetch_metadata_sync",
+        return_value={"title": "Long video", "duration": 120},
+    )
+    mocker.patch("sources.youtube._fetch_transcript_sync", return_value=None)
+    download = mocker.patch("sources.youtube._download_audio_sync")
+    mocker.patch.object(settings, "max_audio_duration_seconds", 60)
+
+    with pytest.raises(UsageLimitError, match="duration"):
+        await YouTubeSource().fetch("https://youtube.com/watch?v=long")
+
+    download.assert_not_called()
+
+
+def test_youtube_download_hook_stops_at_size_limit(
+    tmp_path: Path,
+    mocker: MagicMock,
+) -> None:
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            self.options = options
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def download(self, _urls: list[str]) -> int:
+            hooks = self.options["progress_hooks"]
+            assert isinstance(hooks, list)
+            hooks[0]({"downloaded_bytes": 6})
+            return 0
+
+    mocker.patch("sources.youtube.yt_dlp.YoutubeDL", FakeYoutubeDL)
+    destination = tmp_path / "job.mp3"
+
+    with pytest.raises(UsageLimitError, match="download-size"):
+        _download_audio_sync("https://youtube.com/watch?v=large", destination, 5)
+
+    assert not list(tmp_path.glob("job.*"))
 
 
 class TestExtractVideoId:

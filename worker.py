@@ -49,15 +49,13 @@ class JobWorker:
         )
 
     async def stop(self) -> None:
-        """Signal all workers to stop and wait for them to finish."""
+        """Cancel workers; durable incomplete jobs are recovered on next startup."""
         self._running = False
-        # Send sentinel values to unblock workers waiting on the queue
-        for _ in self._tasks:
-            await self._queue.put("")
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._queue = asyncio.Queue()
         logger.info("job_id=- url=- source=- event=worker_pool_stopped")
 
     async def enqueue(self, job_id: str) -> None:
@@ -72,10 +70,9 @@ class JobWorker:
     async def _worker(self, worker_id: int) -> None:
         """Worker loop: pull job IDs from the queue and process them."""
         while self._running:
+            job_id: str | None = None
             try:
                 job_id = await self._queue.get()
-                if not job_id:  # sentinel
-                    break
                 logger.info(
                     "job_id=%s url=- source=- event=worker_picked_up worker=%d",
                     job_id, worker_id,
@@ -89,7 +86,8 @@ class JobWorker:
                     worker_id, str(e),
                 )
             finally:
-                self._queue.task_done()
+                if job_id is not None:
+                    self._queue.task_done()
 
 
 # Singleton instance used by the app

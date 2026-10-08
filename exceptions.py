@@ -5,6 +5,10 @@ class MediaSummarizerError(Exception):
     """Base exception for all pipeline errors."""
 
 
+class UsageLimitError(MediaSummarizerError):
+    """A configured request, size, duration, or cost limit was reached."""
+
+
 class UnsupportedURLError(MediaSummarizerError):
     """URL pattern not recognised or explicitly unsupported (e.g. Spotify)."""
 

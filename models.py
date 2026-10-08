@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class JobStatus(StrEnum):
@@ -22,6 +22,15 @@ class JobStage(StrEnum):
     saving_notion = "saving_notion"
     done = "done"
     failed = "failed"
+
+
+class UsageStats(BaseModel):
+    anthropic_requests: int = 0
+    anthropic_input_tokens: int = 0
+    anthropic_output_tokens: int = 0
+    openai_requests: int = 0
+    openai_audio_seconds: float = 0
+    estimated_cost_usd: float = 0
 
 
 class TranscriptResult(BaseModel):
@@ -59,7 +68,11 @@ class Job(BaseModel):
     obsidian_note_path: str | None = None
     error: str | None = None
     webhook_url: str | None = None
+    webhook_urls: list[str] = Field(default_factory=list)
     parent_job_id: str | None = None  # set when this job was spawned from a playlist/bulk
+    dedupe_key: str | None = None
+    usage: UsageStats = Field(default_factory=UsageStats)
+    interrupted: bool = False
 
 
 class SummarizeRequest(BaseModel):
@@ -96,3 +109,4 @@ class JobResponse(BaseModel):
     obsidian_note_path: str | None = None
     error: str | None = None
     parent_job_id: str | None = None
+    usage: UsageStats = Field(default_factory=UsageStats)

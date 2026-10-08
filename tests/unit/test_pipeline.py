@@ -1,5 +1,8 @@
 """Tests for pipeline retry logic and webhook notifications."""
 
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -7,7 +10,8 @@ import pytest
 
 import job_queue
 from config import settings
-from models import JobStatus, Summary, TranscriptResult
+from exceptions import UsageLimitError
+from models import JobStage, JobStatus, Summary, TranscriptResult, UsageStats
 from pipeline import run_job
 
 
@@ -15,6 +19,7 @@ from pipeline import run_job
 def _configure_output_defaults(mocker: MagicMock) -> None:
     mocker.patch.object(settings, "notion_enabled", True)
     mocker.patch.object(settings, "obsidian_vault_path", "")
+    mocker.patch.object(settings, "webhooks_enabled", True)
 
 
 def _transcript() -> TranscriptResult:
@@ -72,6 +77,122 @@ def _mock_webhook(mocker: MagicMock) -> AsyncMock:
 
 
 class TestRetryLogic:
+    async def test_restart_reuses_persisted_transcript_and_summary(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        job.status = JobStatus.processing
+        job.stage = JobStage.saving_obsidian
+        job.result = _transcript()
+        job.summary = _summary()
+        await job_queue.update_job(job, db_path=db_path)
+        await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+        source = mocker.patch("pipeline.YouTubeSource")
+        summarize_mock = mocker.patch("pipeline.summarize")
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mocker.patch("pipeline._notify_webhook")
+        save = mocker.patch(
+            "pipeline.save_to_obsidian",
+            return_value="Generated/Summaries/youtube-test.md",
+        )
+        mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+        mocker.patch.object(settings, "notion_enabled", False)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        source.assert_not_called()
+        summarize_mock.assert_not_called()
+        save.assert_awaited_once()
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+        assert result.retry_count == 1
+
+    async def test_interrupted_notion_save_is_not_replayed(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        job.status = JobStatus.processing
+        job.stage = JobStage.saving_notion
+        job.result = _transcript()
+        job.summary = _summary()
+        job.obsidian_note_path = "Generated/Summaries/youtube-test.md"
+        await job_queue.update_job(job, db_path=db_path)
+        await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        notion = mocker.patch("pipeline.save_to_notion")
+        mocker.patch("pipeline._notify_webhook")
+        mocker.patch.object(settings, "obsidian_vault_path", "/vault")
+        mocker.patch.object(settings, "notion_enabled", True)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        notion.assert_not_called()
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.done
+        assert result.notion_error is not None
+
+    async def test_provider_usage_reservation_survives_worker_cancellation(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mock_source = AsyncMock()
+
+        async def reserve_then_cancel(
+            *_args: object, **kwargs: object
+        ) -> TranscriptResult:
+            usage = cast(UsageStats, kwargs["usage"])
+            usage.openai_requests += 1
+            persist = cast(
+                Callable[[UsageStats], Awaitable[None]],
+                kwargs["persist_usage"],
+            )
+            await persist(usage)
+            raise asyncio.CancelledError
+
+        mock_source.fetch.side_effect = reserve_then_cancel
+        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_job(job.job_id, db_path=db_path)
+
+        recovered = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert recovered is not None
+        assert recovered.usage.openai_requests == 1
+
+    async def test_usage_limit_failure_is_not_retried(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        _mock_happy_path(mocker)
+        summarize_mock = mocker.patch(
+            "pipeline.summarize",
+            side_effect=UsageLimitError("Configured limit reached"),
+        )
+        mocker.patch("pipeline._notify_webhook")
+        sleep_mock = mocker.patch("pipeline.asyncio.sleep")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.status == JobStatus.failed
+        assert result.retry_count == 0
+        summarize_mock.assert_awaited_once()
+        sleep_mock.assert_not_called()
+
     async def test_succeeds_on_first_attempt(
         self, db_path: str, mocker: MagicMock
     ) -> None:
@@ -180,6 +301,55 @@ class TestRetryLogic:
 
 
 class TestOutputRouting:
+    async def test_usage_is_accumulated_and_persisted(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123", db_path=db_path
+        )
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mock_source = AsyncMock()
+
+        async def fetch_with_usage(*_args: object, **kwargs: object) -> TranscriptResult:
+            usage = cast(UsageStats, kwargs["usage"])
+            usage.openai_requests += 1
+            usage.openai_audio_seconds += 60
+            usage.estimated_cost_usd += 0.006
+            return _transcript()
+
+        async def summarize_with_usage(*_args: object, **kwargs: object) -> Summary:
+            usage = cast(UsageStats, kwargs["usage"])
+            usage.anthropic_requests += 1
+            usage.anthropic_input_tokens += 100
+            usage.estimated_cost_usd += 0.001
+            return _summary()
+
+        mock_source.fetch.side_effect = fetch_with_usage
+        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
+        mocker.patch("pipeline.summarize", side_effect=summarize_with_usage)
+        obsidian = mocker.patch(
+            "pipeline.save_to_obsidian",
+            return_value="Generated/Summaries/youtube-test.md",
+        )
+        mocker.patch("pipeline._notify_webhook")
+        mock_settings = mocker.patch("pipeline.settings")
+        mock_settings.youtube_api_key = ""
+        mock_settings.obsidian_vault_path = "/vault"
+        mock_settings.obsidian_retain_transcript = True
+        mock_settings.notion_enabled = False
+
+        await run_job(job.job_id, db_path=db_path)
+
+        result = await job_queue.get_job(job.job_id, db_path=db_path)
+        assert result is not None
+        assert result.usage.openai_requests == 1
+        assert result.usage.anthropic_requests == 1
+        assert result.usage.anthropic_input_tokens == 100
+        assert result.usage.estimated_cost_usd == pytest.approx(0.007)
+        assert obsidian.call_args.kwargs["usage"].estimated_cost_usd == pytest.approx(
+            0.007
+        )
+
     async def test_obsidian_can_be_the_only_output(
         self, db_path: str, mocker: MagicMock
     ) -> None:
@@ -272,6 +442,22 @@ class TestOutputRouting:
 
 
 class TestWebhookNotifications:
+    async def test_webhook_disabled_skips_configured_url(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/cb",
+            db_path=db_path,
+        )
+        _mock_happy_path(mocker)
+        mocker.patch.object(settings, "webhooks_enabled", False)
+        http_patch = mocker.patch("pipeline.httpx.AsyncClient")
+
+        await run_job(job.job_id, db_path=db_path)
+
+        http_patch.assert_not_called()
+
     async def test_webhook_fired_on_success(
         self, db_path: str, mocker: MagicMock
     ) -> None:
@@ -308,6 +494,39 @@ class TestWebhookNotifications:
 
         payload: dict[str, object] = mock_client.post.call_args.kwargs["json"]
         assert payload["notion_url"] == "https://www.notion.so/pageabc123"
+
+    async def test_all_webhook_subscribers_are_notified(
+        self, db_path: str, mocker: MagicMock
+    ) -> None:
+        job = await job_queue.create_job(
+            "https://youtube.com/watch?v=abc123",
+            webhook_url="https://hooks.example.com/first",
+            db_path=db_path,
+        )
+        mocker.patch("pipeline.detect_source", return_value="youtube")
+        mock_source = AsyncMock()
+
+        async def fetch_and_subscribe(*_args: object, **_kwargs: object) -> TranscriptResult:
+            await job_queue.create_or_get_job(
+                "https://youtu.be/abc123",
+                webhook_url="https://hooks.example.com/second",
+                db_path=db_path,
+            )
+            return _transcript()
+
+        mock_source.fetch.side_effect = fetch_and_subscribe
+        mocker.patch("pipeline.YouTubeSource", return_value=mock_source)
+        mocker.patch("pipeline.summarize", return_value=_summary())
+        mocker.patch("pipeline.save_to_notion", return_value="page-abc-123")
+        mock_client = _mock_webhook(mocker)
+
+        await run_job(job.job_id, db_path=db_path)
+
+        assert mock_client.post.call_count == 2
+        assert [call.args[0] for call in mock_client.post.call_args_list] == [
+            "https://hooks.example.com/first",
+            "https://hooks.example.com/second",
+        ]
 
     async def test_webhook_fired_on_final_failure(
         self, db_path: str, mocker: MagicMock

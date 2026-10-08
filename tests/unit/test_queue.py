@@ -5,12 +5,13 @@ All tests use a fresh temporary SQLite file — no shared state between tests.
 """
 
 
+import asyncio
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import job_queue
-from models import JobStage, JobStatus, TranscriptResult
+from models import JobStage, JobStatus, TranscriptResult, UsageStats
 
 
 async def test_create_job_has_correct_defaults(db_path: str) -> None:
@@ -32,6 +33,7 @@ async def test_create_job_stores_webhook_url(db_path: str) -> None:
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.webhook_url == "http://hook.example.com"
+    assert fetched.webhook_urls == ["http://hook.example.com"]
 
 
 async def test_get_job_returns_none_for_missing_id(db_path: str) -> None:
@@ -165,12 +167,37 @@ async def test_output_metadata_persists(db_path: str) -> None:
     job.status = JobStatus.done
     job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
     job.notion_error = "Notion unavailable"
+    job.usage = UsageStats(
+        anthropic_requests=2,
+        anthropic_input_tokens=1234,
+        estimated_cost_usd=0.05,
+    )
     await job_queue.update_job(job, db_path=db_path)
 
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.obsidian_note_path == "Generated/Summaries/youtube-abc.md"
     assert fetched.notion_error == "Notion unavailable"
+    assert fetched.usage.anthropic_requests == 2
+    assert fetched.usage.anthropic_input_tokens == 1234
+    assert fetched.usage.estimated_cost_usd == 0.05
+
+
+async def test_update_usage_does_not_overwrite_cancelled_status(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.cancelled
+    await job_queue.update_job(job, db_path=db_path)
+
+    await job_queue.update_usage(
+        job.job_id,
+        UsageStats(anthropic_requests=1, estimated_cost_usd=0.01),
+        db_path=db_path,
+    )
+
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.status == JobStatus.cancelled
+    assert fetched.usage.anthropic_requests == 1
 
 
 async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
@@ -206,6 +233,106 @@ async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
     assert migrated.stage == JobStage.queued
     assert migrated.notion_error is None
     assert migrated.obsidian_note_path is None
+    assert migrated.dedupe_key is not None
+    assert migrated.usage == UsageStats()
+
+
+async def test_create_or_get_job_deduplicates_concurrent_static_urls(db_path: str) -> None:
+    results = await asyncio.gather(
+        job_queue.create_or_get_job(
+            "https://youtube.com/watch?v=abc&t=30", db_path=db_path
+        ),
+        job_queue.create_or_get_job("https://youtu.be/abc?si=share", db_path=db_path),
+    )
+
+    assert results[0][0].job_id == results[1][0].job_id
+    assert sorted(created for _, created in results) == [False, True]
+
+
+async def test_create_or_get_job_reuses_completed_static_media(db_path: str) -> None:
+    job, created = await job_queue.create_or_get_job(
+        "https://youtube.com/watch?v=abc", db_path=db_path
+    )
+    assert created
+    job.status = JobStatus.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    duplicate, duplicate_created = await job_queue.create_or_get_job(
+        "https://youtu.be/abc", db_path=db_path
+    )
+
+    assert not duplicate_created
+    assert duplicate.job_id == job.job_id
+
+
+async def test_create_or_get_job_refreshes_completed_feed(db_path: str) -> None:
+    url = "https://feeds.example.com/show"
+    job, _ = await job_queue.create_or_get_job(url, db_path=db_path)
+    job.status = JobStatus.done
+    await job_queue.update_job(job, db_path=db_path)
+
+    refreshed, created = await job_queue.create_or_get_job(url, db_path=db_path)
+
+    assert created
+    assert refreshed.job_id != job.job_id
+
+
+async def test_different_webhook_subscribes_to_existing_job(db_path: str) -> None:
+    first, _ = await job_queue.create_or_get_job(
+        "https://youtube.com/watch?v=abc",
+        webhook_url="https://hooks.example.com/first",
+        db_path=db_path,
+    )
+
+    second, created = await job_queue.create_or_get_job(
+        "https://youtu.be/abc",
+        webhook_url="https://hooks.example.com/second",
+        db_path=db_path,
+    )
+
+    assert not created
+    assert second.job_id == first.job_id
+    assert second.webhook_urls == [
+        "https://hooks.example.com/first",
+        "https://hooks.example.com/second",
+    ]
+
+
+async def test_recover_incomplete_jobs_preserves_progress_and_orders_pending(
+    db_path: str,
+) -> None:
+    first = await job_queue.create_job("https://youtube.com/watch?v=first", db_path=db_path)
+    second = await job_queue.create_job("https://youtube.com/watch?v=second", db_path=db_path)
+    first.status = JobStatus.processing
+    first.stage = JobStage.summarizing
+    await job_queue.update_job(first, db_path=db_path)
+
+    recovered = await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+    assert recovered == [first.job_id, second.job_id]
+    reset = await job_queue.get_job(first.job_id, db_path=db_path)
+    assert reset is not None
+    assert reset.status == JobStatus.pending
+    assert reset.stage == JobStage.summarizing
+    assert reset.retry_count == 1
+    assert reset.interrupted
+
+
+async def test_recovery_fails_job_after_interruption_budget_is_exhausted(
+    db_path: str,
+) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.processing
+    job.retry_count = job_queue.MAX_RETRIES - 1
+    await job_queue.update_job(job, db_path=db_path)
+
+    recovered = await job_queue.recover_incomplete_jobs(db_path=db_path)
+
+    assert job.job_id not in recovered
+    failed = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert failed is not None
+    assert failed.status == JobStatus.failed
+    assert failed.retry_count == job_queue.MAX_RETRIES
 
 
 # ---------------------------------------------------------------------------
