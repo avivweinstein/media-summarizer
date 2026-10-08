@@ -21,7 +21,7 @@ from openai import (
 
 from config import settings
 from exceptions import TranscriptionError, UsageLimitError
-from models import UsageStats
+from models import TranscriptionOutput, TranscriptSegment, UsageStats
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +111,8 @@ async def transcribe(
     duration_seconds: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-) -> str:
-    """Send an MP3 file to Whisper and return the transcript text.
+) -> TranscriptionOutput:
+    """Send an MP3 file to Whisper and return text with segment timestamps.
 
     Always deletes the file on exit, regardless of success or failure.
     Raises TranscriptionError on any API or file failure.
@@ -196,14 +196,29 @@ async def transcribe(
             response = await client.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
-                response_format="text",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
             )
 
-        # response_format="text" returns a str directly
-        transcript = response if isinstance(response, str) else str(response)
+        raw_text = response if isinstance(response, str) else getattr(response, "text", "")
+        transcript = str(raw_text)
+        raw_segments = [] if isinstance(response, str) else getattr(response, "segments", [])
+        segments = [
+            TranscriptSegment(
+                start_seconds=float(
+                    item.get("start", 0) if isinstance(item, dict) else item.start
+                ),
+                end_seconds=float(
+                    item.get("end", 0) if isinstance(item, dict) else item.end
+                ),
+                text=str(item.get("text", "") if isinstance(item, dict) else item.text),
+            )
+            for item in (raw_segments or [])
+            if (item.get("text", "") if isinstance(item, dict) else item.text).strip()
+        ]
 
         logger.info("%s event=transcribe_done chars=%d", log, len(transcript))
-        return transcript
+        return TranscriptionOutput(text=transcript, segments=segments)
 
     except TranscriptionError:
         raise

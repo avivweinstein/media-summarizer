@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
@@ -31,6 +32,7 @@ from sse_starlette.sse import EventSourceResponse
 import job_queue
 from config import settings
 from exceptions import UnsupportedURLError
+from library import ask_library, search_library
 from models import (
     BulkSummarizeRequest,
     BulkSummarizeResponse,
@@ -38,6 +40,9 @@ from models import (
     JobResponse,
     JobStage,
     JobStatus,
+    LibraryAnswer,
+    LibraryAskRequest,
+    LibrarySearchHit,
     SummarizeRequest,
     SummarizeResponse,
 )
@@ -166,6 +171,7 @@ def _job_to_response(job: Job) -> JobResponse:
 # Submit endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.post("/summarize", response_model=SummarizeResponse, status_code=202)
 async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
     """Validate URL, enqueue job, return job_id immediately.
@@ -239,6 +245,7 @@ async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
 # Job management endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/job/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str) -> JobResponse:
     """Return the current state of a job."""
@@ -300,6 +307,7 @@ async def delete_cancelled_jobs() -> dict[str, int]:
 # SSE: real-time job updates
 # ---------------------------------------------------------------------------
 
+
 @app.get("/jobs/stream")
 async def jobs_stream() -> EventSourceResponse:
     """Server-Sent Events stream of job list updates.
@@ -328,9 +336,42 @@ async def jobs_stream() -> EventSourceResponse:
     return EventSourceResponse(event_generator())
 
 
+@app.get("/library/search", response_model=list[LibrarySearchHit])
+async def library_search(
+    q: str = Query(min_length=2, max_length=500),
+    limit: int = Query(default=10, ge=1, le=20),
+) -> list[LibrarySearchHit]:
+    """Search generated Obsidian summaries and transcripts locally."""
+    if not settings.obsidian_vault_path:
+        raise HTTPException(status_code=503, detail="Obsidian vault is not configured.")
+    try:
+        return await search_library(settings.obsidian_vault_path, q, limit)
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/library/ask", response_model=LibraryAnswer)
+async def library_ask(request: LibraryAskRequest) -> LibraryAnswer:
+    """Answer from local library excerpts; never sends library text to cloud AI."""
+    if not settings.obsidian_vault_path:
+        raise HTTPException(status_code=503, detail="Obsidian vault is not configured.")
+    try:
+        return await ask_library(
+            settings.obsidian_vault_path,
+            request.question,
+            limit=request.limit,
+            provider=settings.library_qa_provider,
+            ollama_model=settings.ollama_model,
+            ollama_base_url=settings.ollama_base_url,
+        )
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health(deep: bool = Query(False)) -> dict[str, object]:
@@ -353,6 +394,7 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     if settings.anthropic_api_key:
         try:
             from anthropic import AsyncAnthropic
+
             anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
             await anthropic_client.messages.create(
                 model="claude-haiku-4-5-20251001",
@@ -371,6 +413,7 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     if settings.openai_api_key:
         try:
             from openai import AsyncOpenAI
+
             openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
             await openai_client.models.list()
             checks["openai"] = "ok"
@@ -404,6 +447,7 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     elif settings.notion_api_key:
         try:
             from notion_client import AsyncClient
+
             notion_client = AsyncClient(auth=settings.notion_api_key)
             await notion_client.databases.retrieve(database_id=settings.notion_database_id)
             checks["notion"] = "ok"
@@ -430,6 +474,7 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:

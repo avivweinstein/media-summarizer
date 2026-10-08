@@ -21,7 +21,7 @@ from youtube_transcript_api._errors import (
 
 from config import settings
 from exceptions import MetadataError, UsageLimitError
-from models import TranscriptResult, UsageStats
+from models import TranscriptionOutput, TranscriptResult, TranscriptSegment, UsageStats
 from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe
 
@@ -43,8 +43,8 @@ def _extract_video_id(url: str) -> str:
     return ids[0]
 
 
-def _fetch_transcript_sync(video_id: str) -> str | None:
-    """Fetch transcript text. Returns None if no transcript is available.
+def _fetch_transcript_sync(video_id: str) -> TranscriptionOutput | None:
+    """Fetch transcript text and timestamps, or None when unavailable.
 
     Tries native English transcript first, falls back to any language.
     Returns None (instead of raising) so the caller can fall back to Whisper.
@@ -76,7 +76,19 @@ def _fetch_transcript_sync(video_id: str) -> str | None:
     except Exception:
         return None
 
-    return " ".join(snippet.text for snippet in fetched)
+    segments = [
+        TranscriptSegment(
+            start_seconds=snippet.start,
+            end_seconds=snippet.start + snippet.duration,
+            text=snippet.text,
+        )
+        for snippet in fetched
+        if snippet.text.strip()
+    ]
+    return TranscriptionOutput(
+        text=" ".join(segment.text for segment in segments),
+        segments=segments,
+    )
 
 
 def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, object]:
@@ -112,12 +124,11 @@ def _parse_upload_date(raw: str | None) -> datetime | None:
 
 def _download_audio_sync(url: str, dest: Path, max_bytes: int) -> None:
     """Download audio from a YouTube video via yt-dlp as MP3."""
+
     def enforce_size(progress: dict[str, object]) -> None:
         downloaded = progress.get("downloaded_bytes", 0)
         if isinstance(downloaded, (int, float)) and downloaded > max_bytes:
-            raise UsageLimitError(
-                "YouTube audio exceeds the configured download-size limit."
-            )
+            raise UsageLimitError("YouTube audio exceeds the configured download-size limit.")
 
     opts: dict[str, object] = {
         "quiet": True,
@@ -178,22 +189,22 @@ class YouTubeSource(BaseSource):
         video_id = _extract_video_id(url)
 
         logger.info("%s event=metadata_fetch_start", log)
-        meta = await loop.run_in_executor(
-            None, _fetch_metadata_sync, url, self.youtube_api_key
-        )
+        meta = await loop.run_in_executor(None, _fetch_metadata_sync, url, self.youtube_api_key)
         logger.info("%s event=metadata_fetch_done title=%r", log, meta.get("title"))
         duration_seconds = int(str(meta.get("duration") or 0))
         usage_tracker = usage or UsageStats()
 
         # Try native transcript first
         logger.info("%s event=transcript_fetch_start", log)
-        transcript = await loop.run_in_executor(
-            None, _fetch_transcript_sync, video_id
-        )
+        transcription = await loop.run_in_executor(None, _fetch_transcript_sync, video_id)
 
-        if transcript:
+        if transcription and transcription.text:
             transcription_model = "youtube/captions"
-            logger.info("%s event=transcript_fetch_done chars=%d method=native", log, len(transcript))
+            logger.info(
+                "%s event=transcript_fetch_done chars=%d method=native",
+                log,
+                len(transcription.text),
+            )
         else:
             # Fall back to Whisper: download audio, transcribe
             logger.info("%s event=transcript_native_unavailable fallback=whisper", log)
@@ -213,9 +224,10 @@ class YouTubeSource(BaseSource):
             )
             logger.info(
                 "%s event=audio_download_done size_mb=%.1f",
-                log, dest.stat().st_size / 1e6 if dest.exists() else 0,
+                log,
+                dest.stat().st_size / 1e6 if dest.exists() else 0,
             )
-            transcript = await transcribe(
+            transcription = await transcribe(
                 dest,
                 job_id,
                 duration_seconds=duration_seconds,
@@ -223,7 +235,11 @@ class YouTubeSource(BaseSource):
                 persist_usage=persist_usage,
             )
             transcription_model = "openai/whisper-1"
-            logger.info("%s event=transcript_fetch_done chars=%d method=whisper", log, len(transcript))
+            logger.info(
+                "%s event=transcript_fetch_done chars=%d method=whisper",
+                log,
+                len(transcription.text),
+            )
 
         raw_thumb = meta.get("thumbnail")
         thumbnail_url = str(raw_thumb) if raw_thumb else None
@@ -237,7 +253,8 @@ class YouTubeSource(BaseSource):
             channel_or_show=str(meta.get("channel") or meta.get("uploader") or ""),
             duration_seconds=duration_seconds,
             thumbnail_url=thumbnail_url,
-            transcript=transcript,
+            transcript=transcription.text,
+            segments=transcription.segments,
             published_at=_parse_upload_date(upload_date),
             transcription_model=transcription_model,
             source_item_id=video_id,

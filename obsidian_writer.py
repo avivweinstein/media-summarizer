@@ -8,7 +8,7 @@ import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from exceptions import ObsidianError
 from models import Summary, TranscriptResult, UsageStats
@@ -45,6 +45,22 @@ def source_id(result: TranscriptResult) -> str:
 
 def _yaml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _format_timestamp(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _moment_link(result: TranscriptResult, seconds: int) -> str | None:
+    if result.source != "youtube":
+        return None
+    parsed = urlparse(result.url)
+    query = [(key, value) for key, value in parse_qsl(parsed.query) if key != "t"]
+    query.append(("t", f"{seconds}s"))
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def _atomic_write_once(path: Path, content: str) -> None:
@@ -84,6 +100,14 @@ def _find_existing(directory: Path, media_id: str) -> Path | None:
 
 
 def _render_transcript(result: TranscriptResult, media_id: str) -> str:
+    transcript_lines = (
+        [
+            f"**{_format_timestamp(segment.start_seconds)}** {segment.text.strip()}"
+            for segment in result.segments
+        ]
+        if result.segments
+        else [result.transcript.strip()]
+    )
     lines = [
         "---",
         "type: media-transcript",
@@ -97,7 +121,7 @@ def _render_transcript(result: TranscriptResult, media_id: str) -> str:
         "",
         f"# Transcript: {result.title}",
         "",
-        result.transcript.strip(),
+        *transcript_lines,
         "",
     ]
     return "\n".join(lines)
@@ -122,6 +146,15 @@ def _render_summary(
     ]
     if not summary.key_points:
         key_point_lines = ["key_points: []"]
+    key_moment_lines = [
+        "key_moments:",
+        *[
+            f"  - {_yaml_string(f'{_format_timestamp(moment.timestamp_seconds)} {moment.point}')}"
+            for moment in summary.key_moments
+        ],
+    ]
+    if not summary.key_moments:
+        key_moment_lines = ["key_moments: []"]
     lines = [
         "---",
         "type: media-summary",
@@ -136,6 +169,7 @@ def _render_summary(
         f"duration_seconds: {result.duration_seconds}",
         *tag_lines,
         *key_point_lines,
+        *key_moment_lines,
         f"worth_rewatching: {'true' if summary.worth_rewatching else 'false'}",
         f"summary_model: {_yaml_string(summary_model)}",
         f"transcription_model: {_yaml_string(result.transcription_model or 'unknown')}",
@@ -164,6 +198,13 @@ def _render_summary(
         "",
         *[f"- {point.strip()}" for point in summary.key_points],
     ]
+    if summary.key_moments:
+        lines += ["", "## Key Moments", ""]
+        for moment in summary.key_moments:
+            timestamp = _format_timestamp(moment.timestamp_seconds)
+            link = _moment_link(result, moment.timestamp_seconds)
+            label = f"[{timestamp}]({link})" if link else f"**{timestamp}**"
+            lines.append(f"- {label} — {moment.point.strip()}")
     if transcript_path:
         vault_relative = TRANSCRIPT_DIR / transcript_path.name
         lines += ["", "## Transcript", "", f"![[{vault_relative.as_posix()}|Full transcript]]"]

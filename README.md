@@ -15,6 +15,7 @@ A personal media intelligence pipeline. Send YouTube or podcast URLs via the web
 - **Concurrent processing** — async worker pool handles multiple jobs without blocking
 - **Crash recovery and dedupe** — interrupted jobs resume after restart; equivalent submissions reuse existing work
 - **Bounded API usage** — long transcripts are chunked with per-job request, size, duration, and estimated-cost limits
+- **Local library retrieval** — search generated notes and ask citation-backed questions without sending vault content to cloud AI
 
 ## Requirements
 
@@ -163,6 +164,15 @@ prevents two local instances from replaying the same queue. Equivalent active
 submissions are deduplicated; completed static media such as a YouTube video is
 reused, while RSS/show URLs can be refreshed for newer episodes. RSS responses and
 audio downloads are streamed with time and size bounds.
+
+### Search and ask the local library
+
+`GET /library/search?q=your+query` searches only generated summaries and
+transcripts. `POST /library/ask` answers with note and line citations. The default
+`extractive` provider needs no model; set `LIBRARY_QA_PROVIDER=ollama` to synthesize
+answers with a local Ollama model. `OLLAMA_BASE_URL` is restricted to a loopback
+HTTP address. Personal notes under `My-Notes` are never searched or sent to a
+model.
 
 ### Linux (systemd)
 

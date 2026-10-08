@@ -517,7 +517,7 @@ class PodcastSource(BaseSource):
         """Download a direct MP3 URL and transcribe it."""
         dest = tmp_path_for_job(job_id)
         await _download_mp3(url, dest, job_id)
-        transcript = await transcribe(
+        transcription = await transcribe(
             dest,
             job_id,
             usage=usage,
@@ -530,7 +530,8 @@ class PodcastSource(BaseSource):
             url=url,
             channel_or_show="",
             duration_seconds=0,
-            transcript=transcript,
+            transcript=transcription.text,
+            segments=transcription.segments,
             transcription_model="openai/whisper-1",
             source_item_id=url,
         )
@@ -552,7 +553,7 @@ class PodcastSource(BaseSource):
             duration_seconds = int(str(episode.get("trackTimeMillis") or 0)) // 1000
             dest = tmp_path_for_job(job_id)
             await _download_mp3(audio_url, dest, job_id)
-            transcript = await transcribe(
+            transcription = await transcribe(
                 dest,
                 job_id,
                 duration_seconds=duration_seconds,
@@ -570,7 +571,8 @@ class PodcastSource(BaseSource):
                     if episode.get("artworkUrl600")
                     else None
                 ),
-                transcript=transcript,
+                transcript=transcription.text,
+                segments=transcription.segments,
                 published_at=_parse_iso_datetime(episode.get("releaseDate")),
                 transcription_model="openai/whisper-1",
                 source_item_id=episode_id,
@@ -614,7 +616,7 @@ class PodcastSource(BaseSource):
 
         dest = tmp_path_for_job(job_id)
         await _download_mp3(mp3_url, dest, job_id)
-        transcript = await transcribe(
+        transcription = await transcribe(
             dest,
             job_id,
             duration_seconds=duration_seconds,
@@ -629,7 +631,8 @@ class PodcastSource(BaseSource):
             channel_or_show=show_name,
             duration_seconds=duration_seconds,
             thumbnail_url=thumbnail_url,
-            transcript=transcript,
+            transcript=transcription.text,
+            segments=transcription.segments,
             published_at=published_at,
             transcription_model="openai/whisper-1",
             source_item_id=source_item_id,

@@ -14,6 +14,7 @@ class JobStatus(StrEnum):
 
 class JobStage(StrEnum):
     """Fine-grained pipeline stage, shown in UI during processing."""
+
     queued = "queued"
     detecting = "detecting"
     transcribing = "transcribing"
@@ -33,6 +34,17 @@ class UsageStats(BaseModel):
     estimated_cost_usd: float = 0
 
 
+class TranscriptSegment(BaseModel):
+    start_seconds: float
+    end_seconds: float
+    text: str
+
+
+class TranscriptionOutput(BaseModel):
+    text: str
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+
+
 class TranscriptResult(BaseModel):
     title: str
     source: str  # "youtube" | "podcast"
@@ -41,14 +53,21 @@ class TranscriptResult(BaseModel):
     duration_seconds: int
     thumbnail_url: str | None = None
     transcript: str
+    segments: list[TranscriptSegment] = Field(default_factory=list)
     published_at: datetime | None = None
     transcription_model: str | None = None
     source_item_id: str | None = None
 
 
+class KeyMoment(BaseModel):
+    timestamp_seconds: int
+    point: str
+
+
 class Summary(BaseModel):
     tldr: str
     key_points: list[str]
+    key_moments: list[KeyMoment] = Field(default_factory=list)
     tags: list[str]
     worth_rewatching: bool
 
@@ -86,12 +105,43 @@ class SummarizeResponse(BaseModel):
 
 class BulkSummarizeRequest(BaseModel):
     """Submit multiple URLs or a playlist URL."""
+
     urls: list[str]
     webhook_url: str | None = None
 
 
 class BulkSummarizeResponse(BaseModel):
     job_ids: list[str]
+
+
+class LibrarySearchHit(BaseModel):
+    note_path: str
+    title: str
+    source_url: str | None = None
+    media_id: str | None = None
+    line_number: int
+    excerpt: str
+    score: int
+
+
+class LibraryCitation(BaseModel):
+    index: int
+    note_path: str
+    title: str
+    source_url: str | None = None
+    line_number: int
+    excerpt: str
+
+
+class LibraryAskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=500)
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class LibraryAnswer(BaseModel):
+    answer: str
+    citations: list[LibraryCitation]
+    provider: str
 
 
 class JobResponse(BaseModel):

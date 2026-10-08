@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     youtube_api_key: str = ""
     openclaw_webhook_url: str = ""
     webhooks_enabled: bool = False
+    library_qa_provider: str = "extractive"
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "llama3.2:3b"
     port: int = 8000
     summary_chunk_chars: int = Field(default=60_000, gt=0)
     max_transcript_chars: int = Field(default=600_000, gt=0)
