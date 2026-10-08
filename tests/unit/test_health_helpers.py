@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +17,7 @@ from main import (
 )
 from models import Job, JobStatus
 from nvidia_inference import NvidiaInferenceError
+from sources.upload import UPLOAD_EXTENSIONS
 
 
 def test_single_instance_lock_rejects_second_owner(tmp_path: Path) -> None:
@@ -52,6 +54,31 @@ async def test_dashboard_labels_nvidia_boundary_and_removes_approval(
     assert 'id="url-approved"' not in body
     assert 'id="upload-approved"' not in body
     assert "__URL_APPROVAL_CONTROL__" not in body
+
+
+@pytest.mark.parametrize("mode", ["nvidia_internal", "local", "cloud_public"])
+async def test_dashboard_explains_supported_inputs(mocker: MagicMock, mode: str) -> None:
+    mocker.patch.object(settings, "processing_mode", mode)
+    body = bytes((await dashboard()).body).decode()
+    for text in (
+        "Supported inputs", "YouTube", "X/Twitter", "Vimeo", "Apple Podcasts",
+        "podcast RSS", "web articles", "article RSS", "direct audio/video",
+        "Spotify links are not supported.", "direct MP3 link", "latest item",
+        "without login", "PDF and Word uploads are not supported.",
+    ):
+        assert text in body
+
+    class InputParser(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attributes = dict(attrs)
+            if tag == "input" and attributes.get("id") == "file-input":
+                assert set((attributes.get("accept") or "").split(",")) == UPLOAD_EXTENSIONS
+                assert attributes.get("aria-describedby") == "supported-uploads"
+
+    InputParser().feed(body)
+    for extension in UPLOAD_EXTENSIONS:
+        assert extension in body.split('id="supported-uploads">')[1].split("</p>")[0]
+    assert 'aria-describedby="supported-links spotify-help"' in body
 
 
 async def test_completed_duplicate_notifies_requesting_webhook(

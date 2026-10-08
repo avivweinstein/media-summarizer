@@ -138,6 +138,13 @@
     .data-boundary {
       margin-top: 0.6rem; font-size: 0.75rem; color: var(--text-secondary);
     }
+    .input-guide {
+      margin-top: 1rem; padding-top: 0.7rem;
+      border-top: 1px solid var(--card-border);
+      font-size: 0.8rem; line-height: 1.5; color: var(--text-secondary);
+    }
+    .input-guide h2 { margin: 0; font-size: 0.9rem; color: var(--text); }
+    .input-guide p { margin: 0.4rem 0; }
 
     /* Job cards */
     .job {
@@ -285,16 +292,23 @@
 <main>
   <div class="submit-form">
     <form id="submit-form" onsubmit="submitUrl(event)">
-      <input type="text" id="url-input" placeholder="Paste a video, podcast, article, or RSS URL..." autocomplete="off" />
+      <input type="text" id="url-input" placeholder="Paste a video, podcast, article, or RSS URL..." autocomplete="off" aria-describedby="supported-links spotify-help" />
       <button type="submit" class="submit-btn" id="submit-btn">Summarize</button>
     </form>
     __URL_APPROVAL_CONTROL__
     <form class="upload-form" id="upload-form" onsubmit="submitUpload(event)">
-      <input type="file" id="file-input" accept=".txt,.md,.mp3,.m4a,.wav,.mp4,.mov,.webm" />
+      <input type="file" id="file-input" accept=".txt,.md,.mp3,.m4a,.wav,.mp4,.mov,.webm" aria-describedby="supported-uploads" />
       __UPLOAD_APPROVAL_CONTROL__
       <button type="submit" class="submit-btn" id="upload-btn">Upload</button>
     </form>
     <div class="submit-error" id="submit-error"></div>
+    <section class="input-guide" aria-labelledby="input-guide-title">
+      <h2 id="input-guide-title">Supported inputs</h2>
+      <p id="supported-links"><strong>Links:</strong> YouTube videos and playlists, public X/Twitter posts with one video, Vimeo, Apple Podcasts, podcast RSS feeds, web articles, article RSS feeds, and direct audio/video file links.</p>
+      <p id="supported-uploads"><strong>Uploads:</strong> Text (.txt), Markdown (.md), audio (.mp3, .m4a, .wav), and video (.mp4, .mov, .webm).</p>
+      <p id="spotify-help"><strong>Spotify links are not supported.</strong> Use the same podcast's Apple Podcasts link, RSS feed, direct MP3 link, or upload an audio file you already have.</p>
+      <p>RSS feeds and podcast show links select the latest item. Use an Apple Podcasts episode link or direct file link to choose a specific episode. Links must be accessible without login; paywalled, private, and age-gated media are not supported. PDF and Word uploads are not supported.</p>
+    </section>
     <p class="data-boundary">__DATA_BOUNDARY_MESSAGE__</p>
   </div>
   <div id="jobs-container"></div>
