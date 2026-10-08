@@ -92,6 +92,18 @@ class TestAdditionalSources:
     def test_direct_video_url(self) -> None:
         assert detect_source("https://cdn.example.com/talk.mp4?token=abc") == "media"
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://x.com/example/status/1234567890",
+            "https://twitter.com/example/status/1234567890/video/1",
+            "https://mobile.twitter.com/i/status/1234567890",
+            "https://m.x.com/statuses/1234567890",
+        ],
+    )
+    def test_twitter_post_url(self, url: str) -> None:
+        assert detect_source(url) == "media"
+
     def test_article_url(self) -> None:
         assert detect_source("https://example.com/research/new-chip") == "article"
 
@@ -100,9 +112,9 @@ class TestUnsupportedURLs:
     def test_opaque_feed_candidate_is_accepted_for_bounded_sniffing(self) -> None:
         assert detect_source("https://example.com/opaque-feed-id") == "article"
 
-    def test_twitter(self) -> None:
-        with pytest.raises(UnsupportedURLError):
-            detect_source("https://twitter.com/user/status/12345")
+    def test_twitter_profile(self) -> None:
+        with pytest.raises(UnsupportedURLError, match="individual X/Twitter post"):
+            detect_source("https://x.com/example")
 
     def test_empty_string(self) -> None:
         with pytest.raises(UnsupportedURLError):

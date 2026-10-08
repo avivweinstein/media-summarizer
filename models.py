@@ -48,7 +48,7 @@ class TranscriptionOutput(BaseModel):
 
 class TranscriptResult(BaseModel):
     title: str
-    source: str  # "youtube" | "podcast"
+    source: str  # e.g. "youtube" | "podcast" | "twitter" | "article"
     url: str
     channel_or_show: str
     duration_seconds: int

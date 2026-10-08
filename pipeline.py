@@ -26,6 +26,7 @@ from sources.podcast import PodcastSource
 from sources.upload import UploadSource, cleanup_upload
 from sources.youtube import YouTubeSource
 from summarizer import summarize, summary_model_name
+from url_identity import twitter_status_parts
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,17 @@ _YOUTUBE_HOSTNAMES = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.c
 _SPOTIFY_HOSTNAMES = {"open.spotify.com"}
 _APPLE_HOSTNAMES = {"podcasts.apple.com"}
 _MEDIA_HOSTNAMES = {"vimeo.com", "player.vimeo.com"}
+_TWITTER_HOSTNAMES = {
+    "m.twitter.com",
+    "m.x.com",
+    "mobile.twitter.com",
+    "mobile.x.com",
+    "twitter.com",
+    "x.com",
+}
 _MEDIA_EXTENSIONS = {".m4a", ".mov", ".mp4", ".wav", ".webm"}
 _UNSUPPORTED_MEDIA_HOSTNAMES = {
     "soundcloud.com",
-    "twitter.com",
-    "x.com",
 }
 
 MAX_RETRIES = 3
@@ -71,6 +78,11 @@ def detect_source(url: str) -> str:
             "Apple Podcasts, or direct episode URL instead."
         )
 
+    if hostname in _TWITTER_HOSTNAMES:
+        if twitter_status_parts(url):
+            return "media"
+        raise UnsupportedURLError("Only individual X/Twitter post URLs are supported.")
+
     lower_path = parsed.path.lower()
     if hostname in _MEDIA_HOSTNAMES or any(lower_path.endswith(ext) for ext in _MEDIA_EXTENSIONS):
         return "media"
@@ -87,8 +99,8 @@ def detect_source(url: str) -> str:
         return "article"
 
     raise UnsupportedURLError(
-        "Unsupported source. Supported: YouTube (video or playlist), "
-        "Apple Podcasts, RSS feeds, or direct MP3."
+        "Unsupported source. Supported: YouTube, X/Twitter videos, Vimeo, "
+        "Apple Podcasts, RSS feeds, articles, or direct media."
     )
 
 

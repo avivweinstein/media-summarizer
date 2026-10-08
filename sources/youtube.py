@@ -39,6 +39,23 @@ class _TimeoutSession(requests.Session):
         return super().request(method, url, *args, **kwargs)
 
 
+class _HostRestrictedYoutubeDL(yt_dlp.YoutubeDL):  # type: ignore[misc]
+    def __init__(self, options: dict[str, object], allowed_hosts: frozenset[str]) -> None:
+        self._allowed_hosts = allowed_hosts
+        super().__init__(options)
+
+    def urlopen(self, request: Any) -> Any:
+        raw_url = request if isinstance(request, str) else getattr(request, "url", None)
+        if not isinstance(raw_url, str):
+            raise MetadataError("Media extractor attempted an invalid network request.")
+        parsed = urlparse(raw_url)
+        if parsed.scheme != "https" or parsed.hostname not in self._allowed_hosts:
+            raise MetadataError(
+                f"Media extractor attempted to contact an untrusted host: {parsed.hostname or '-'}"
+            )
+        return super().urlopen(request)
+
+
 def _extract_video_id(url: str) -> str:
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
@@ -105,7 +122,9 @@ def _fetch_transcript_sync(video_id: str) -> TranscriptionOutput | None:
     )
 
 
-def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, object]:
+def _fetch_metadata_sync(
+    url: str, youtube_api_key: str = "", no_playlist: bool = False
+) -> dict[str, object]:
     """Fetch video metadata via yt-dlp without downloading any media."""
     opts: dict[str, object] = {
         "quiet": True,
@@ -116,6 +135,8 @@ def _fetch_metadata_sync(url: str, youtube_api_key: str = "") -> dict[str, objec
     }
     if youtube_api_key:
         opts["youtube_api_key"] = youtube_api_key
+    if no_playlist:
+        opts["noplaylist"] = True
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:
@@ -143,15 +164,18 @@ def _download_audio_sync(
     dest: Path,
     max_bytes: int,
     cancel_event: threading.Event | None = None,
+    no_playlist: bool = False,
+    media_info: dict[str, object] | None = None,
+    allowed_hosts: frozenset[str] | None = None,
 ) -> None:
-    """Download audio from a YouTube video via yt-dlp as MP3."""
+    """Download audio from one hosted video via yt-dlp as MP3."""
 
     def enforce_size(progress: dict[str, object]) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Media download cancelled.")
         downloaded = progress.get("downloaded_bytes", 0)
         if isinstance(downloaded, (int, float)) and downloaded > max_bytes:
-            raise UsageLimitError("YouTube audio exceeds the configured download-size limit.")
+            raise UsageLimitError("Media audio exceeds the configured download-size limit.")
 
     opts: dict[str, object] = {
         "quiet": True,
@@ -170,9 +194,20 @@ def _download_audio_sync(
             }
         ],
     }
+    if no_playlist:
+        opts["noplaylist"] = True
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            result = ydl.download([url])
+        downloader = (
+            _HostRestrictedYoutubeDL(opts, allowed_hosts)
+            if allowed_hosts is not None
+            else yt_dlp.YoutubeDL(opts)
+        )
+        with downloader as ydl:
+            if media_info is not None:
+                ydl.process_info(dict(media_info))
+                result = 0
+            else:
+                result = ydl.download([url])
         if result != 0:
             raise MetadataError("yt-dlp could not download the media audio.")
         # yt-dlp may produce dest.mp3 — rename to the exact path we want
@@ -188,7 +223,7 @@ def _download_audio_sync(
             partial.unlink(missing_ok=True)
         if "download-size limit" in str(error):
             raise UsageLimitError(
-                "YouTube audio exceeds the configured download-size limit."
+                "Media audio exceeds the configured download-size limit."
             ) from error
         raise
     except Exception:

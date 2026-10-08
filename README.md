@@ -6,6 +6,7 @@ A personal media intelligence pipeline. Submit videos, podcasts, articles, newsl
 
 - **YouTube videos** — native transcript or automatic Whisper fallback when no transcript is available
 - **YouTube playlists** — auto-expands into individual video jobs
+- **X/Twitter videos** — public post videos through yt-dlp, with Whisper transcription
 - **Podcasts** — Apple Podcasts, RSS feeds, direct MP3 URLs
 - **More sources** — Vimeo, direct audio/video, web articles, newsletters, and local uploads
 - **AI summaries** — Claude generates TL;DR, key points, tags, and "worth rewatching" rating
@@ -88,6 +89,10 @@ transcript and summary stay on the Mac. Deep health verifies the local providers
 Spotify links remain unsupported
 because Spotify does not provide a reliable canonical RSS mapping; submit the
 show RSS or another exact episode URL instead.
+Public X/Twitter post URLs are supported without accessing browser cookies.
+Private, deleted, age-gated, or login-required posts are rejected.
+Posts containing multiple videos are rejected rather than selecting one
+ambiguously; single-video `/video/N` URL variants are normalized automatically.
 
 ### 6. Set up Notion (optional)
 
@@ -335,7 +340,7 @@ If you don't want Tailscale, you can bind to `0.0.0.0` to listen on all network 
 
 | Method   | Path               | Description                                           |
 |----------|--------------------|-------------------------------------------------------|
-| `POST`   | `/summarize`       | Submit a video, podcast, article, RSS, or playlist URL -> `{ job_id }` |
+| `POST`   | `/summarize`       | Submit a video, X post, podcast, article, RSS, or playlist URL -> `{ job_id }` |
 | `POST`   | `/summarize/upload` | Upload txt, Markdown, audio, or video -> `{ job_id }` |
 | `POST`   | `/summarize/bulk`  | Submit multiple URLs -> `{ job_ids }` |
 | `GET`    | `/job/{job_id}`    | Check job status, result, and summary                 |
@@ -361,6 +366,11 @@ curl -X POST http://localhost:8000/summarize \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.youtube.com/playlist?list=PLxxx"}'
 
+# Submit a public X/Twitter video post
+curl -X POST http://localhost:8000/summarize \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://x.com/example/status/1234567890", "external_processing_approved": true}'
+
 # Submit multiple URLs at once
 curl -X POST http://localhost:8000/summarize/bulk \
   -H "Content-Type: application/json" \
@@ -384,7 +394,7 @@ curl "http://localhost:8000/health?deep=true"
 URL submitted via API or web UI
   |
   v
-detect_source() -> "youtube" | "youtube_playlist" | "podcast"
+detect_source() -> "youtube" | "youtube_playlist" | "podcast" | "media" | "article"
   |                     |
   |              expand_playlist() -> fan out into individual jobs
   v
@@ -393,6 +403,7 @@ Async Worker Pool (concurrency=2)
   v
 Source.fetch()
   - YouTube: native transcript -> Whisper fallback if unavailable
+  - X/Twitter and Vimeo: yt-dlp audio extraction -> Whisper transcription
   - Podcast: Apple/RSS -> MP3 download -> Whisper transcription
   |
   v

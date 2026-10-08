@@ -41,3 +41,19 @@ def test_vimeo_variants_share_a_static_identity() -> None:
 
 def test_direct_video_is_static() -> None:
     assert submission_identity("https://cdn.example.com/talk.webm?token=abc")[1] is True
+
+
+def test_twitter_variants_share_a_static_identity() -> None:
+    x_url = submission_identity("https://x.com/example/status/1234567890?s=20")
+    twitter_url = submission_identity("https://twitter.com/other/status/1234567890")
+
+    assert x_url == ("twitter:1234567890", True)
+    assert twitter_url == x_url
+
+
+def test_twitter_media_suffixes_share_the_post_identity() -> None:
+    first = submission_identity("https://x.com/example/status/1234567890/video/1")
+    second = submission_identity("https://x.com/example/status/1234567890/video/2")
+
+    assert first == ("twitter:1234567890", True)
+    assert second == first
