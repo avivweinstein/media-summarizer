@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from scripts.install_macos_service import (
     BACKUP_LABEL,
     LABEL,
@@ -8,6 +10,7 @@ from scripts.install_macos_service import (
     _wait_until_unloaded,
     build_backup_plist,
     build_plist,
+    install,
     uninstall,
 )
 
@@ -95,6 +98,56 @@ def test_wait_until_healthy_retries_until_service_is_ready(mocker: MagicMock) ->
     _wait_until_healthy("127.0.0.1", 8000)
 
     assert request.call_count == 2
+
+
+def test_wait_until_healthy_allows_slow_startup(mocker: MagicMock) -> None:
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    request = mocker.patch(
+        "scripts.install_macos_service.urlopen",
+        side_effect=[OSError("not ready"), response],
+    )
+    mocker.patch("scripts.install_macos_service.time.monotonic", side_effect=[0, 0, 90])
+    mocker.patch("scripts.install_macos_service.time.sleep")
+
+    _wait_until_healthy("127.0.0.1", 8000)
+
+    assert request.call_count == 2
+
+
+def test_wait_until_healthy_still_times_out_with_log_hint(mocker: MagicMock) -> None:
+    mocker.patch("scripts.install_macos_service.urlopen", side_effect=OSError("not ready"))
+    mocker.patch("scripts.install_macos_service.time.monotonic", side_effect=[0, 0, 121])
+    mocker.patch("scripts.install_macos_service.time.sleep")
+
+    with pytest.raises(SystemExit, match="120 seconds.*stderr.log"):
+        _wait_until_healthy("127.0.0.1", 8000)
+
+
+@pytest.mark.parametrize("with_vault", [True, False])
+def test_install_waits_for_health_without_killing_started_jobs(
+    mocker: MagicMock, tmp_path: Path, with_vault: bool
+) -> None:
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/uvicorn").touch()
+    (tmp_path / ".env").touch()
+    vault = tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    mocker.patch("scripts.install_macos_service.PLIST_PATH", tmp_path / "service.plist")
+    backup_plist = tmp_path / "backup.plist"
+    mocker.patch("scripts.install_macos_service.BACKUP_PLIST_PATH", backup_plist)
+    mocker.patch("scripts.install_macos_service.LOG_DIR", tmp_path / "logs")
+    mocker.patch("scripts.install_macos_service._wait_until_unloaded")
+    run = mocker.patch("scripts.install_macos_service.subprocess.run")
+    wait = mocker.patch("scripts.install_macos_service._wait_until_healthy")
+
+    install(tmp_path, "127.0.0.1", 8000, vault if with_vault else None)
+
+    wait.assert_called_once_with("127.0.0.1", 8000)
+    assert backup_plist.exists() == with_vault
+    kickstarts = [c.args[0] for c in run.call_args_list if "kickstart" in c.args[0]]
+    assert len(kickstarts) == (2 if with_vault else 1)
+    assert all("-k" not in command for command in kickstarts)
 
 
 def test_uninstall_waits_for_service_before_removing_plist(

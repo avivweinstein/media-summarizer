@@ -102,7 +102,7 @@ def _wait_until_unloaded(timeout_seconds: float = 5.0, *, label: str = LABEL) ->
     raise SystemExit(f"Timed out waiting for {_target(label)} to unload.")
 
 
-def _wait_until_healthy(host: str, port: int, timeout_seconds: float = 20.0) -> None:
+def _wait_until_healthy(host: str, port: int, timeout_seconds: float = 120.0) -> None:
     probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -113,7 +113,11 @@ def _wait_until_healthy(host: str, port: int, timeout_seconds: float = 20.0) -> 
         except OSError:
             pass
         time.sleep(0.1)
-    raise SystemExit("Timed out waiting for the media summarizer to initialize.")
+    raise SystemExit(
+        f"Timed out after {timeout_seconds:g} seconds waiting for the media summarizer "
+        f"to initialize. The service remains loaded; check {LOG_DIR / 'stderr.log'} "
+        f"and {LOG_DIR / 'stdout.log'} before retrying."
+    )
 
 
 def _write_plist(path: Path, payload: dict[str, Any]) -> None:
@@ -167,9 +171,10 @@ def install(
     domain = f"gui/{os.getuid()}"
     subprocess.run(["launchctl", "bootstrap", domain, str(PLIST_PATH)], check=True)
     subprocess.run(["launchctl", "enable", _target()], check=True)
-    subprocess.run(["launchctl", "kickstart", "-k", _target()], check=True)
+    # RunAtLoad may have already started it; do not kill that initializing process.
+    subprocess.run(["launchctl", "kickstart", _target()], check=True)
+    _wait_until_healthy(host, port)
     if obsidian_vault_path is not None:
-        _wait_until_healthy(host, port)
         backup_payload = build_backup_plist(project_dir, obsidian_vault_path)
         _write_plist(BACKUP_PLIST_PATH, backup_payload)
         subprocess.run(
@@ -184,7 +189,7 @@ def install(
         )
         subprocess.run(["launchctl", "enable", _target(BACKUP_LABEL)], check=True)
         subprocess.run(
-            ["launchctl", "kickstart", "-k", _target(BACKUP_LABEL)], check=True
+            ["launchctl", "kickstart", _target(BACKUP_LABEL)], check=True
         )
     else:
         subprocess.run(

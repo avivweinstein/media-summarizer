@@ -186,6 +186,9 @@ uv run python scripts/install_macos_service.py uninstall
 The installer pins `PROCESSING_MODE=nvidia_internal` and disables Notion and
 webhooks regardless of `.env`. It requires `.env` and `.venv/bin/uvicorn` to exist. The Obsidian
 argument configures the vault without placing its path in `.env`.
+The installer waits up to two minutes for the service health endpoint before
+configuring backups. It does not restart a process already started by launchd.
+If startup times out, the service stays loaded; the error points to its logs.
 The generated launchd configuration uses an owner-only umask so newly created runtime files
 are not readable by other local users, and includes standard Homebrew paths so
 `ffmpeg` remains available outside an interactive shell.
