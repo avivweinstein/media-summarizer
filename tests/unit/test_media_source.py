@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from exceptions import MetadataError, UnsupportedURLError
+from exceptions import MetadataError, UnsupportedURLError, UsageLimitError
 from models import TranscriptionOutput, TranscriptSegment
 from sources.media import (
     MediaSource,
@@ -69,7 +69,13 @@ async def test_direct_media_uses_pinned_streaming_download(mocker: MagicMock) ->
     assert result.title == "talk.mp4"
 
 
-async def test_twitter_video_uses_single_item_hosted_media_path(mocker: MagicMock) -> None:
+@pytest.mark.parametrize(
+    ("duration", "expected_seconds"),
+    [(30, 30), (217.28, 218), ("217.28", 218), (None, 0)],
+)
+async def test_twitter_video_uses_single_item_hosted_media_path(
+    mocker: MagicMock, duration: object, expected_seconds: int
+) -> None:
     url = "https://x.com/example/status/1234567890/video/2"
     validate = mocker.patch(
         "sources.media._validate_public_http_url", new=AsyncMock(return_value="1.1.1.1")
@@ -77,7 +83,7 @@ async def test_twitter_video_uses_single_item_hosted_media_path(mocker: MagicMoc
     metadata_result = {
         "id": "1234567890",
         "title": "Example post",
-        "duration": 30,
+        "duration": duration,
         "uploader": "Example User",
         "timestamp": 1_700_000_000,
         "formats": [{"url": "https://video.twimg.com/example.m3u8"}],
@@ -89,7 +95,7 @@ async def test_twitter_video_uses_single_item_hosted_media_path(mocker: MagicMoc
         },
     )
     download = mocker.patch("sources.media._download_audio_sync")
-    mocker.patch(
+    transcribe = mocker.patch(
         "sources.media.transcribe",
         new=AsyncMock(return_value=TranscriptionOutput(text="X video transcript.")),
     )
@@ -101,10 +107,30 @@ async def test_twitter_video_uses_single_item_hosted_media_path(mocker: MagicMoc
     assert download.call_args.args[4] is True
     assert download.call_args.args[5] == metadata_result
     assert result.source == "twitter"
+    assert result.duration_seconds == expected_seconds
+    assert transcribe.call_args.kwargs["duration_seconds"] == expected_seconds
     assert result.source_item_id == "1234567890"
     assert result.channel_or_show == "Example User"
     assert result.published_at is not None
     assert result.published_at.isoformat() == "2023-11-14T22:13:20+00:00"
+
+
+@pytest.mark.parametrize("url", ["https://vimeo.com/123", "https://x.com/example/status/123"])
+async def test_fractional_duration_above_limit_is_rejected_before_download(
+    mocker: MagicMock, url: str
+) -> None:
+    mocker.patch("sources.media._validate_public_http_url", new=AsyncMock(return_value="1.1.1.1"))
+    mocker.patch("sources.media.settings.max_audio_duration_seconds", 217)
+    for name in ("_fetch_metadata_sync", "_fetch_twitter_metadata_sync"):
+        mocker.patch(f"sources.media.{name}", return_value={"duration": 217.28})
+    download = mocker.patch("sources.media._download_audio_sync")
+    transcribe = mocker.patch("sources.media.transcribe", new=AsyncMock())
+
+    with pytest.raises(UsageLimitError, match="duration limit"):
+        await MediaSource().fetch(url, job_id="job")
+
+    download.assert_not_called()
+    transcribe.assert_not_awaited()
 
 
 async def test_twitter_video_reports_unavailable_or_gated_post(mocker: MagicMock) -> None:
