@@ -1,4 +1,4 @@
-"""OpenAI Whisper API wrapper.
+"""Bounded local or cloud speech transcription.
 
 Downloads MP3 to /tmp/media-summarizer/{job_id}.mp3, transcribes, deletes.
 Temp file is always deleted — even if transcription fails.
@@ -8,7 +8,9 @@ Large files (>25 MB) are re-encoded to 32 kbps mono via ffmpeg before upload.
 import asyncio
 import json
 import logging
+import os
 import shutil
+import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -67,9 +69,30 @@ async def _communicate_with_timeout(
         ) from error
 
 
+def _ensure_private_tmp_dir() -> None:
+    """Create and validate an owner-only, non-symlink temporary directory."""
+    TMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(TMP_DIR, flags)
+    except OSError as error:
+        raise TranscriptionError(
+            "The media temporary path must be a private directory, not a symlink."
+        ) from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise TranscriptionError(
+                "The media temporary directory must be owned by the current user."
+            )
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 def ensure_tmp_dir() -> None:
-    """Create the temp dir and delete any leftover MP3s from crashed jobs."""
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    """Secure the temp dir and delete leftover media from crashed jobs."""
+    _ensure_private_tmp_dir()
     removed = 0
     temporary_suffixes = {".json", ".m4a", ".mov", ".mp3", ".mp4", ".wav", ".webm"}
     for file in TMP_DIR.iterdir():
@@ -81,7 +104,7 @@ def ensure_tmp_dir() -> None:
 
 
 def tmp_path_for_job(job_id: str) -> Path:
-    TMP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_private_tmp_dir()
     return TMP_DIR / f"{job_id}.mp3"
 
 
@@ -155,18 +178,25 @@ async def _probe_audio_duration(path: Path) -> float:
 
 
 def transcription_model_name(processing_mode: str) -> str:
-    if processing_mode == "local":
+    if processing_mode in {"local", "nvidia_internal"}:
         return "local/whisper.cpp"
     return "openai/whisper-1"
 
 
-async def _transcribe_local(path: Path, job_id: str) -> TranscriptionOutput:
+def local_whisper_configuration() -> tuple[str, Path]:
+    """Return the local Whisper executable and model or fail closed."""
     executable = shutil.which(settings.local_whisper_executable)
     model = Path(settings.local_whisper_model).expanduser()
     if executable is None or not model.is_file():
         raise TranscriptionError(
-            "Local mode requires LOCAL_WHISPER_EXECUTABLE and a valid LOCAL_WHISPER_MODEL."
+            "Local transcription requires LOCAL_WHISPER_EXECUTABLE and a valid "
+            "LOCAL_WHISPER_MODEL."
         )
+    return executable, model
+
+
+async def _transcribe_local(path: Path, job_id: str) -> TranscriptionOutput:
+    executable, model = local_whisper_configuration()
     wav_path = TMP_DIR / f"{job_id}-local.wav"
     output_prefix = TMP_DIR / f"{job_id}-local"
     json_path = output_prefix.with_suffix(".json")
@@ -245,7 +275,7 @@ async def transcribe(
     duration_seconds: float | None = None,
     usage: UsageStats | None = None,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
 ) -> TranscriptionOutput:
     """Send an MP3 file to Whisper and return text with segment timestamps.
 
@@ -291,7 +321,7 @@ async def transcribe(
                 f"Audio duration is {audio_seconds / 3600:.1f} hours, exceeding the "
                 f"configured {settings.max_audio_duration_seconds / 3600:.1f}-hour limit."
             )
-        if processing_mode == "local":
+        if processing_mode in {"local", "nvidia_internal"}:
             result = await _transcribe_local(mp3_path, job_id)
             logger.info("%s event=transcribe_done chars=%d provider=local", log, len(result.text))
             return result

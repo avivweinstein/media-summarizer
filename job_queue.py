@@ -191,7 +191,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 usage TEXT,
                 interrupted INTEGER NOT NULL DEFAULT 0,
                 interruption_count INTEGER NOT NULL DEFAULT 0,
-                processing_mode TEXT NOT NULL DEFAULT 'cloud_public',
+                processing_mode TEXT NOT NULL DEFAULT 'nvidia_internal',
                 external_processing_approved INTEGER NOT NULL DEFAULT 0
             )
         """)
@@ -282,7 +282,7 @@ async def create_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     dedupe_key: str | None = None,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
     external_processing_approved: bool = True,
     db_path: str = DB_PATH,
 ) -> Job:
@@ -331,7 +331,7 @@ async def create_or_get_job(
     webhook_url: str | None = None,
     parent_job_id: str | None = None,
     *,
-    processing_mode: str = "cloud_public",
+    processing_mode: str = "nvidia_internal",
     external_processing_approved: bool = False,
     db_path: str = DB_PATH,
 ) -> tuple[Job, bool]:

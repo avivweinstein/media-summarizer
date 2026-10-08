@@ -1,6 +1,6 @@
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException, UploadFile
@@ -20,6 +20,24 @@ async def test_cloud_upload_requires_explicit_approval(
     with pytest.raises(HTTPException, match="explicit confirmation"):
         await submit_upload(upload, False, None)
 
+    assert not list(tmp_path.iterdir())
+
+
+async def test_internal_upload_fails_before_persisting_when_provider_is_unready(
+    tmp_path: Path, mocker: MagicMock
+) -> None:
+    mocker.patch.object(settings, "processing_mode", "nvidia_internal")
+    mocker.patch.object(settings, "upload_dir", str(tmp_path))
+    mocker.patch(
+        "main._require_processing_ready",
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="unavailable")),
+    )
+    upload = UploadFile(filename="notes.txt", file=BytesIO(b"internal notes"))
+
+    with pytest.raises(HTTPException) as caught:
+        await submit_upload(upload, False, None)
+
+    assert caught.value.status_code == 503
     assert not list(tmp_path.iterdir())
 
 

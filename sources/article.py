@@ -194,7 +194,7 @@ class ArticleSource:
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         final_url, content_type, body = await _fetch_page(url)
         if content_type.startswith(("audio/", "video/")):

@@ -243,7 +243,7 @@ class YouTubeSource(BaseSource):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
-        processing_mode: str = "cloud_public",
+        processing_mode: str = "nvidia_internal",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=youtube"
         video_id = _extract_video_id(url)

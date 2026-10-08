@@ -18,6 +18,13 @@ def test_webhooks_are_opt_in_by_default() -> None:
     assert settings.webhooks_enabled is False
 
 
+def test_nvidia_internal_is_default_processing_boundary() -> None:
+    settings = cast(Any, Settings)(_env_file=None)
+
+    assert settings.processing_mode == "nvidia_internal"
+    assert settings.nvidia_inference_base_url == "https://inference-api.nvidia.com"
+
+
 def test_usage_limits_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         cast(Any, Settings)(_env_file=None, max_estimated_cost_usd=0)

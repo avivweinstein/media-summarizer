@@ -29,6 +29,9 @@ def build_plist(
     uvicorn = project_dir / ".venv" / "bin" / "uvicorn"
     environment = {
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PROCESSING_MODE": "nvidia_internal",
+        "NOTION_ENABLED": "false",
+        "WEBHOOKS_ENABLED": "false",
     }
     if obsidian_vault_path is not None:
         environment["OBSIDIAN_VAULT_PATH"] = str(obsidian_vault_path)

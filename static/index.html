@@ -288,10 +288,10 @@
       <input type="text" id="url-input" placeholder="Paste a video, podcast, article, or RSS URL..." autocomplete="off" />
       <button type="submit" class="submit-btn" id="submit-btn">Summarize</button>
     </form>
-    <label class="approval-label"><input type="checkbox" id="url-approved" /> Public or approved for external AI (not needed in local mode)</label>
+    __URL_APPROVAL_CONTROL__
     <form class="upload-form" id="upload-form" onsubmit="submitUpload(event)">
       <input type="file" id="file-input" accept=".txt,.md,.mp3,.m4a,.wav,.mp4,.mov,.webm" />
-      <label class="approval-label"><input type="checkbox" id="upload-approved" /> Public or approved</label>
+      __UPLOAD_APPROVAL_CONTROL__
       <button type="submit" class="submit-btn" id="upload-btn">Upload</button>
     </form>
     <div class="submit-error" id="submit-error"></div>
@@ -340,7 +340,7 @@
   }
   function usageLine(job) {
     if (!job.usage) return '';
-    return `<div class="retry-note">API usage: ${job.usage.anthropic_requests || 0} Anthropic, ${job.usage.openai_requests || 0} OpenAI, ${job.usage.local_summary_requests || 0} local summary request(s), estimated $${Number(job.usage.estimated_cost_usd || 0).toFixed(4)}</div>`;
+    return `<div class="retry-note">API usage: ${job.usage.anthropic_requests || 0} __SUMMARY_PROVIDER_LABEL__, ${job.usage.openai_requests || 0} OpenAI, ${job.usage.local_summary_requests || 0} local summary request(s), estimated $${Number(job.usage.estimated_cost_usd || 0).toFixed(4)}</div>`;
   }
 
   const STAGE_LABELS = {
@@ -427,7 +427,7 @@
       const resp = await fetch('/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, external_processing_approved: approved.checked }),
+        body: JSON.stringify({ url, external_processing_approved: approved?.checked || false }),
       });
       if (!resp.ok) {
         const data = await resp.json();
@@ -436,7 +436,7 @@
       const data = await resp.json();
       lastSubmittedJobId = data.job_id;
       input.value = '';
-      approved.checked = false;
+      if (approved) approved.checked = false;
     } catch (e) {
       errorEl.textContent = e.message;
       errorEl.style.display = 'block';
@@ -455,7 +455,7 @@
     if (!input.files.length) return;
     const form = new FormData();
     form.append('file', input.files[0]);
-    form.append('external_processing_approved', approved.checked ? 'true' : 'false');
+    form.append('external_processing_approved', approved?.checked ? 'true' : 'false');
     btn.disabled = true;
     btn.textContent = 'Uploading...';
     errorEl.style.display = 'none';
@@ -468,7 +468,7 @@
       const data = await resp.json();
       lastSubmittedJobId = data.job_id;
       input.value = '';
-      approved.checked = false;
+      if (approved) approved.checked = false;
     } catch (e) {
       errorEl.textContent = e.message;
       errorEl.style.display = 'block';
