@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 
 import job_queue
-from models import JobStage, JobStatus, Summary, TranscriptResult
+from models import JobStatus, Summary, TranscriptResult
 from pipeline import run_job
 
 

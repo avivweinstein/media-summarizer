@@ -5,6 +5,7 @@ summarize():     mocks the AsyncAnthropic client — no real API calls.
 """
 
 import json
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -57,7 +58,7 @@ def make_api_status_error(
     """Construct an anthropic APIStatusError subclass with a real httpx.Response."""
     mock_request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     mock_response = httpx.Response(status_code, request=mock_request)
-    return cls(message=message, response=mock_response, body=None)
+    return cls(message=message, response=cast(Any, mock_response), body=None)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +223,7 @@ class TestSummarize:
         from anthropic import APIConnectionError
         mock_client = AsyncMock()
         mock_client.messages.create.side_effect = APIConnectionError(
-            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+            request=cast(Any, httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
         )
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
 

@@ -18,7 +18,7 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
-from exceptions import MetadataError, NoTranscriptError
+from exceptions import MetadataError
 from models import TranscriptResult
 from sources.base import BaseSource
 from transcriber import tmp_path_for_job, transcribe
