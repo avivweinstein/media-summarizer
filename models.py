@@ -18,6 +18,7 @@ class JobStage(StrEnum):
     detecting = "detecting"
     transcribing = "transcribing"
     summarizing = "summarizing"
+    saving_obsidian = "saving_obsidian"
     saving_notion = "saving_notion"
     done = "done"
     failed = "failed"
@@ -32,6 +33,8 @@ class TranscriptResult(BaseModel):
     thumbnail_url: str | None = None
     transcript: str
     published_at: datetime | None = None
+    transcription_model: str | None = None
+    source_item_id: str | None = None
 
 
 class Summary(BaseModel):
@@ -52,6 +55,8 @@ class Job(BaseModel):
     result: TranscriptResult | None = None
     summary: Summary | None = None
     notion_page_id: str | None = None
+    notion_error: str | None = None
+    obsidian_note_path: str | None = None
     error: str | None = None
     webhook_url: str | None = None
     parent_job_id: str | None = None  # set when this job was spawned from a playlist/bulk
@@ -87,5 +92,7 @@ class JobResponse(BaseModel):
     result: TranscriptResult | None = None
     summary: Summary | None = None
     notion_page_id: str | None = None
+    notion_error: str | None = None
+    obsidian_note_path: str | None = None
     error: str | None = None
     parent_job_id: str | None = None

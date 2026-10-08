@@ -7,11 +7,26 @@ import pytest
 
 from sources.podcast import (
     _best_mp3_entry,
+    _episode_source_item_id,
     _parse_apple_podcast_ids,
     _parse_duration,
     _struct_to_datetime,
     _thumbnail_from_entry,
 )
+
+
+def test_episode_source_item_id_prefers_guid() -> None:
+    entry = {"id": "episode-guid"}
+
+    assert _episode_source_item_id(entry, "https://cdn.example.com/audio.mp3") == (
+        "episode-guid"
+    )
+
+
+def test_episode_source_item_id_falls_back_to_enclosure() -> None:
+    assert _episode_source_item_id({}, "https://cdn.example.com/audio.mp3") == (
+        "https://cdn.example.com/audio.mp3"
+    )
 
 
 class TestParseApplePodcastIds:

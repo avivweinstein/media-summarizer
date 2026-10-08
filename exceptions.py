@@ -25,5 +25,9 @@ class NotionError(MediaSummarizerError):
     """Notion API call failed."""
 
 
+class ObsidianError(MediaSummarizerError):
+    """Obsidian vault validation or note writing failed."""
+
+
 class TranscriptionError(MediaSummarizerError):
     """Whisper transcription failed."""

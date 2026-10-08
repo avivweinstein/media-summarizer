@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     notion_api_key: str = ""
     notion_database_id: str = ""
+    notion_enabled: bool = False
+    obsidian_vault_path: str = ""
+    obsidian_retain_transcript: bool = True
     podcast_index_api_key: str = ""
     podcast_index_api_secret: str = ""
     youtube_api_key: str = ""

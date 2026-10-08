@@ -5,7 +5,9 @@ All tests use a fresh temporary SQLite file — no shared state between tests.
 """
 
 
-from datetime import UTC
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
 
 import job_queue
 from models import JobStage, JobStatus, TranscriptResult
@@ -72,6 +74,7 @@ async def test_update_job_processing_to_done_with_result(db_path: str) -> None:
         duration_seconds=300,
         transcript="This is the transcript.",
         published_at=datetime(2024, 1, 15, tzinfo=UTC),
+        source_item_id="abc",
     )
     await job_queue.update_job(job, db_path=db_path)
 
@@ -83,6 +86,7 @@ async def test_update_job_processing_to_done_with_result(db_path: str) -> None:
     assert fetched.result.channel_or_show == "Test Channel"
     assert fetched.result.duration_seconds == 300
     assert fetched.result.transcript == "This is the transcript."
+    assert fetched.result.source_item_id == "abc"
 
 
 async def test_update_job_to_failed_stores_error(db_path: str) -> None:
@@ -154,6 +158,54 @@ async def test_notion_page_id_persists(db_path: str) -> None:
     fetched = await job_queue.get_job(job.job_id, db_path=db_path)
     assert fetched is not None
     assert fetched.notion_page_id == "abc-123-notion-page"
+
+
+async def test_output_metadata_persists(db_path: str) -> None:
+    job = await job_queue.create_job("https://youtube.com/watch?v=abc", db_path=db_path)
+    job.status = JobStatus.done
+    job.obsidian_note_path = "Generated/Summaries/youtube-abc.md"
+    job.notion_error = "Notion unavailable"
+    await job_queue.update_job(job, db_path=db_path)
+
+    fetched = await job_queue.get_job(job.job_id, db_path=db_path)
+    assert fetched is not None
+    assert fetched.obsidian_note_path == "Generated/Summaries/youtube-abc.md"
+    assert fetched.notion_error == "Notion unavailable"
+
+
+async def test_init_db_migrates_existing_jobs_table(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC).isoformat()
+    with sqlite3.connect(path) as db:
+        db.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                result TEXT,
+                summary TEXT,
+                notion_page_id TEXT,
+                error TEXT,
+                webhook_url TEXT
+            )
+        """)
+        db.execute(
+            """INSERT INTO jobs
+               (job_id, url, status, created_at, updated_at, retry_count)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("legacy-job", "https://youtu.be/abc", "pending", timestamp, timestamp, 0),
+        )
+
+    await job_queue.init_db(str(path))
+
+    migrated = await job_queue.get_job("legacy-job", db_path=str(path))
+    assert migrated is not None
+    assert migrated.stage == JobStage.queued
+    assert migrated.notion_error is None
+    assert migrated.obsidian_note_path is None
 
 
 # ---------------------------------------------------------------------------

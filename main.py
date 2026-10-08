@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import logging.config
+import os
 import tomllib
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -50,6 +51,20 @@ _SSE_POLL_INTERVAL = 2.0
 
 # Auto-cleanup: delete completed/failed/cancelled jobs older than this many days
 _JOB_TTL_DAYS = 90
+
+
+def _obsidian_destinations_writable(vault_path: Path, retain_transcript: bool) -> bool:
+    destinations = [vault_path / "Generated" / "Summaries"]
+    if retain_transcript:
+        destinations.append(vault_path / "Generated" / "Transcripts")
+
+    for destination in destinations:
+        existing = destination
+        while not existing.exists() and existing != vault_path:
+            existing = existing.parent
+        if not existing.is_dir() or not os.access(existing, os.W_OK | os.X_OK):
+            return False
+    return True
 
 
 def _configure_logging() -> None:
@@ -94,6 +109,8 @@ def _job_to_response(job: Job) -> JobResponse:
         result=job.result,
         summary=job.summary,
         notion_page_id=job.notion_page_id,
+        notion_error=job.notion_error,
+        obsidian_note_path=job.obsidian_note_path,
         error=job.error,
         parent_job_id=job.parent_job_id,
     )
@@ -320,8 +337,27 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["openai"] = "not configured"
         errors.append("openai")
 
+    # Obsidian vault check
+    if settings.obsidian_vault_path:
+        vault_path = Path(settings.obsidian_vault_path).expanduser()
+        if vault_path.is_dir() and (vault_path / ".obsidian").is_dir():
+            writable = _obsidian_destinations_writable(
+                vault_path,
+                settings.obsidian_retain_transcript,
+            )
+            checks["obsidian"] = "ok" if writable else "not writable"
+            if checks["obsidian"] != "ok":
+                errors.append("obsidian")
+        else:
+            checks["obsidian"] = "invalid vault"
+            errors.append("obsidian")
+    else:
+        checks["obsidian"] = "not configured"
+
     # Notion API key check
-    if settings.notion_api_key:
+    if not settings.notion_enabled:
+        checks["notion"] = "disabled"
+    elif settings.notion_api_key:
         try:
             from notion_client import AsyncClient
             notion_client = AsyncClient(auth=settings.notion_api_key)
@@ -333,6 +369,10 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
     else:
         checks["notion"] = "not configured"
         errors.append("notion")
+
+    if not settings.obsidian_vault_path and not settings.notion_enabled:
+        checks["storage"] = "no destination configured"
+        errors.append("storage")
 
     # Worker status
     checks["worker_queue_size"] = job_worker.queue_size

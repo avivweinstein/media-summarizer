@@ -25,6 +25,30 @@ def test_build_plist_uses_localhost_and_project_environment() -> None:
     assert plist["Umask"] == 0o077
 
 
+def test_build_plist_sets_obsidian_vault_environment() -> None:
+    plist = build_plist(
+        Path("/Users/test/media-summarizer"),
+        "127.0.0.1",
+        8000,
+        Path("/Users/test/Documents/Media-Library"),
+    )
+
+    assert plist["EnvironmentVariables"]["OBSIDIAN_VAULT_PATH"] == (
+        "/Users/test/Documents/Media-Library"
+    )
+
+
+def test_build_plist_can_disable_notion() -> None:
+    plist = build_plist(
+        Path("/Users/test/media-summarizer"),
+        "127.0.0.1",
+        8000,
+        disable_notion=True,
+    )
+
+    assert plist["EnvironmentVariables"]["NOTION_ENABLED"] == "false"
+
+
 def test_wait_until_unloaded_retries_until_launchd_forgets_service(mocker: MagicMock) -> None:
     run = mocker.patch("scripts.install_macos_service.subprocess.run")
     run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]

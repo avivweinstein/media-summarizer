@@ -36,6 +36,8 @@ def _serialize_job(job: Job) -> dict[str, Any]:
         "result": job.result.model_dump_json() if job.result else None,
         "summary": job.summary.model_dump_json() if job.summary else None,
         "notion_page_id": job.notion_page_id,
+        "notion_error": job.notion_error,
+        "obsidian_note_path": job.obsidian_note_path,
         "error": job.error,
         "webhook_url": job.webhook_url,
         "parent_job_id": job.parent_job_id,
@@ -63,6 +65,8 @@ def _deserialize_job(row: aiosqlite.Row) -> Job:
         result=result,
         summary=summary,
         notion_page_id=data["notion_page_id"],
+        notion_error=data.get("notion_error"),
+        obsidian_note_path=data.get("obsidian_note_path"),
         error=data["error"],
         webhook_url=data["webhook_url"],
         parent_job_id=data.get("parent_job_id"),
@@ -84,6 +88,8 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 result      TEXT,
                 summary     TEXT,
                 notion_page_id TEXT,
+                notion_error TEXT,
+                obsidian_note_path TEXT,
                 error       TEXT,
                 webhook_url TEXT,
                 parent_job_id TEXT
@@ -96,6 +102,10 @@ async def init_db(db_path: str = DB_PATH) -> None:
             await db.execute("ALTER TABLE jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'queued'")
         if "parent_job_id" not in columns:
             await db.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT")
+        if "notion_error" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN notion_error TEXT")
+        if "obsidian_note_path" not in columns:
+            await db.execute("ALTER TABLE jobs ADD COLUMN obsidian_note_path TEXT")
         await db.commit()
 
 
@@ -123,10 +133,12 @@ async def create_job(
             """
             INSERT INTO jobs
                 (job_id, url, status, stage, created_at, updated_at, retry_count,
-                 result, summary, notion_page_id, error, webhook_url, parent_job_id)
+                 result, summary, notion_page_id, notion_error, obsidian_note_path,
+                 error, webhook_url, parent_job_id)
             VALUES
                 (:job_id, :url, :status, :stage, :created_at, :updated_at, :retry_count,
-                 :result, :summary, :notion_page_id, :error, :webhook_url, :parent_job_id)
+                 :result, :summary, :notion_page_id, :notion_error, :obsidian_note_path,
+                 :error, :webhook_url, :parent_job_id)
             """,
             data,
         )
@@ -172,6 +184,8 @@ async def update_job(job: Job, db_path: str = DB_PATH) -> None:
                 result        = :result,
                 summary       = :summary,
                 notion_page_id = :notion_page_id,
+                notion_error   = :notion_error,
+                obsidian_note_path = :obsidian_note_path,
                 error         = :error
             WHERE job_id = :job_id
             """,

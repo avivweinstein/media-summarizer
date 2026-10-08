@@ -142,6 +142,13 @@ def _best_mp3_entry(
     return entries_with_mp3[0]
 
 
+def _episode_source_item_id(entry: object, mp3_url: str) -> str:
+    """Return the feed's stable episode identifier, falling back to its enclosure."""
+    if isinstance(entry, dict):
+        return str(entry.get("id") or mp3_url)
+    return str(getattr(entry, "id", "") or mp3_url)
+
+
 # ---------------------------------------------------------------------------
 # Async helpers — network I/O
 # ---------------------------------------------------------------------------
@@ -233,6 +240,8 @@ class PodcastSource(BaseSource):
             channel_or_show="",
             duration_seconds=0,
             transcript=transcript,
+            transcription_model="openai/whisper-1",
+            source_item_id=url,
         )
 
     async def _from_apple_podcasts(self, url: str, job_id: str) -> TranscriptResult:
@@ -256,6 +265,7 @@ class PodcastSource(BaseSource):
         log = f"job_id={job_id} url={original_url[:60]!r} source=podcast"
 
         mp3_url, entry = _best_mp3_entry(feed, episode_id)
+        source_item_id = _episode_source_item_id(entry, mp3_url)
 
         title = str(entry.get("title") or "Unknown Episode")
         show_name = str(feed.feed.get("title") or "")
@@ -278,4 +288,6 @@ class PodcastSource(BaseSource):
             thumbnail_url=thumbnail_url,
             transcript=transcript,
             published_at=published_at,
+            transcription_model="openai/whisper-1",
+            source_item_id=source_item_id,
         )

@@ -131,6 +131,9 @@
       margin-top: 0.5rem; font-size: 0.8rem; color: var(--error);
       display: none;
     }
+    .data-boundary {
+      margin-top: 0.6rem; font-size: 0.75rem; color: var(--text-secondary);
+    }
 
     /* Job cards */
     .job {
@@ -281,6 +284,7 @@
       <button type="submit" class="submit-btn" id="submit-btn">Summarize</button>
     </form>
     <div class="submit-error" id="submit-error"></div>
+    <p class="data-boundary">Public or approved media only. Transcripts are sent to external AI providers.</p>
   </div>
   <div id="jobs-container"></div>
   <div id="empty" style="display:none">
@@ -329,6 +333,7 @@
     detecting: 'Detecting source...',
     transcribing: 'Transcribing...',
     summarizing: 'Summarizing with Claude...',
+    saving_obsidian: 'Saving to Obsidian...',
     saving_notion: 'Saving to Notion...',
     done: 'Complete',
     failed: 'Failed',
@@ -453,6 +458,8 @@
         <div class="tldr">${esc(s.tldr)}</div>
         ${points ? `<div class="section-label">Key Points</div><ul class="key-points">${points}</ul>` : ''}
         ${tags ? `<div class="tags">${tags}</div>` : ''}
+        ${job.obsidian_note_path ? `<div class="retry-note">Saved to Obsidian: ${esc(job.obsidian_note_path)}</div>` : ''}
+        ${job.notion_error ? `<div class="error-text">Notion sync failed: ${esc(job.notion_error)}</div>` : ''}
         <div class="footer-row">
           ${notionUrl ? `<a class="notion-btn" href="${notionUrl}" target="_blank" rel="noopener">Open in Notion</a>` : ''}
           <button class="copy-btn" onclick="copyTldr(event, ${JSON.stringify(s.tldr).replace(/"/g, '&quot;')})">Copy TL;DR</button>
