@@ -1,5 +1,6 @@
 """Generic hosted media source, including Vimeo and X/Twitter."""
 
+import math
 import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -168,7 +169,8 @@ class MediaSource:
                 raise
             finally:
                 raw_destination.unlink(missing_ok=True)
-        duration_seconds = int(str(metadata.get("duration") or 0))
+        # Round up so fractional seconds cannot slip under the duration limit.
+        duration_seconds = math.ceil(float(str(metadata.get("duration") or 0)))
         if duration_seconds > settings.max_audio_duration_seconds:
             raise UsageLimitError("Media exceeds the configured duration limit.")
         if is_hosted_media:
