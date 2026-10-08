@@ -31,6 +31,7 @@ class UsageStats(BaseModel):
     anthropic_output_tokens: int = 0
     openai_requests: int = 0
     openai_audio_seconds: float = 0
+    local_summary_requests: int = 0
     estimated_cost_usd: float = 0
 
 
@@ -92,11 +93,14 @@ class Job(BaseModel):
     dedupe_key: str | None = None
     usage: UsageStats = Field(default_factory=UsageStats)
     interrupted: bool = False
+    processing_mode: str = "cloud_public"
+    external_processing_approved: bool = False
 
 
 class SummarizeRequest(BaseModel):
     url: str
     webhook_url: str | None = None
+    external_processing_approved: bool = False
 
 
 class SummarizeResponse(BaseModel):
@@ -108,6 +112,7 @@ class BulkSummarizeRequest(BaseModel):
 
     urls: list[str]
     webhook_url: str | None = None
+    external_processing_approved: bool = False
 
 
 class BulkSummarizeResponse(BaseModel):
@@ -160,3 +165,4 @@ class JobResponse(BaseModel):
     error: str | None = None
     parent_job_id: str | None = None
     usage: UsageStats = Field(default_factory=UsageStats)
+    processing_mode: str = "cloud_public"

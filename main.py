@@ -19,13 +19,16 @@ import json
 import logging
 import logging.config
 import os
+import shutil
 import tomllib
+import uuid
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -38,7 +41,6 @@ from models import (
     BulkSummarizeResponse,
     Job,
     JobResponse,
-    JobStage,
     JobStatus,
     LibraryAnswer,
     LibraryAskRequest,
@@ -47,6 +49,7 @@ from models import (
     SummarizeResponse,
 )
 from pipeline import _notify_webhook, detect_source, expand_playlist
+from sources.upload import UPLOAD_EXTENSIONS, cleanup_upload, reconcile_uploads, upload_path
 from transcriber import ensure_tmp_dir
 from worker import job_worker
 
@@ -114,6 +117,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await job_queue.init_db()
         ensure_tmp_dir()
         await _cleanup_old_jobs()
+        removed_uploads = reconcile_uploads(await job_queue.list_active_upload_urls())
+        if removed_uploads:
+            logger.warning(
+                "job_id=- url=- source=upload event=startup_cleanup removed_files=%d",
+                removed_uploads,
+            )
         recovered_job_ids = await job_queue.recover_incomplete_jobs()
         job_worker.start()
         for job_id in recovered_job_ids:
@@ -132,8 +141,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Media Summarizer", lifespan=lifespan)
 
 
-async def _create_and_enqueue(url: str, webhook_url: str | None) -> Job:
-    job, created = await job_queue.create_or_get_job(url, webhook_url)
+async def _create_and_enqueue(
+    url: str,
+    webhook_url: str | None,
+    *,
+    processing_mode: str | None = None,
+    external_processing_approved: bool = False,
+) -> Job:
+    mode = processing_mode or settings.processing_mode
+    job, created = await job_queue.create_or_get_job(
+        url,
+        webhook_url,
+        processing_mode=mode,
+        external_processing_approved=external_processing_approved,
+    )
     if created:
         await job_worker.enqueue(job.job_id)
     else:
@@ -145,6 +166,44 @@ async def _create_and_enqueue(url: str, webhook_url: str | None) -> Job:
         if job.status == JobStatus.done and webhook_url:
             await _notify_webhook(job, urls=[webhook_url])
     return job
+
+
+async def _persist_upload(file: UploadFile) -> str:
+    filename = Path(file.filename or "").name
+    suffix = Path(filename).suffix.casefold()
+    if suffix not in UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Supported uploads: txt, md, mp3, m4a, wav, mp4, mov, and webm.",
+        )
+    upload_id = str(uuid.uuid4())
+    url = f"upload://{upload_id}/{quote(filename)}"
+    destination = upload_path(url)
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.parent.chmod(0o700)
+    max_bytes = (
+        settings.max_article_download_bytes
+        if suffix in {".md", ".txt"}
+        else settings.max_audio_download_bytes
+    )
+    written = 0
+    try:
+        with open(destination, "xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            while chunk := await file.read(64 * 1024):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Upload exceeds the configured size limit.",
+                    )
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    return url
 
 
 def _job_to_response(job: Job) -> JobResponse:
@@ -164,7 +223,19 @@ def _job_to_response(job: Job) -> JobResponse:
         error=job.error,
         parent_job_id=job.parent_job_id,
         usage=job.usage,
+        processing_mode=job.processing_mode,
     )
+
+
+def _require_processing_approval(approved: bool) -> None:
+    if settings.processing_mode == "cloud_public" and not approved:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cloud mode requires explicit confirmation that the content is public or "
+                "approved for external AI processing."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +250,7 @@ async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
     Accepts single video/podcast URLs and playlist URLs. Playlists are expanded
     into individual jobs; the first job_id is returned.
     """
+    _require_processing_approval(request.external_processing_approved)
     url = request.url.strip()
     try:
         source_type = detect_source(url)
@@ -197,18 +269,51 @@ async def submit_url(request: SummarizeRequest) -> SummarizeResponse:
         # Create a job for each video
         first_job_id = ""
         for video_url in video_urls:
-            job = await _create_and_enqueue(video_url, request.webhook_url)
+            job = await _create_and_enqueue(
+                video_url,
+                request.webhook_url,
+                processing_mode=settings.processing_mode,
+                external_processing_approved=request.external_processing_approved,
+            )
             if not first_job_id:
                 first_job_id = job.job_id
         return SummarizeResponse(job_id=first_job_id)
 
-    job = await _create_and_enqueue(url, request.webhook_url)
+    job = await _create_and_enqueue(
+        url,
+        request.webhook_url,
+        processing_mode=settings.processing_mode,
+        external_processing_approved=request.external_processing_approved,
+    )
+    return SummarizeResponse(job_id=job.job_id)
+
+
+@app.post("/summarize/upload", response_model=SummarizeResponse, status_code=202)
+async def submit_upload(
+    file: UploadFile = File(...),
+    external_processing_approved: bool = Form(False),
+    webhook_url: str | None = Form(None),
+) -> SummarizeResponse:
+    """Persist and enqueue an upload after an explicit data-boundary acknowledgement."""
+    _require_processing_approval(external_processing_approved)
+    url = await _persist_upload(file)
+    try:
+        job = await _create_and_enqueue(
+            url,
+            webhook_url,
+            processing_mode=settings.processing_mode,
+            external_processing_approved=external_processing_approved,
+        )
+    except Exception:
+        cleanup_upload(url)
+        raise
     return SummarizeResponse(job_id=job.job_id)
 
 
 @app.post("/summarize/bulk", response_model=BulkSummarizeResponse, status_code=202)
 async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
     """Submit multiple URLs at once. Each gets its own job."""
+    _require_processing_approval(request.external_processing_approved)
     job_ids: list[str] = []
     errors: list[str] = []
 
@@ -227,11 +332,21 @@ async def submit_bulk(request: BulkSummarizeRequest) -> BulkSummarizeResponse:
                 errors.append(f"{url[:60]}: playlist expansion failed: {e}")
                 continue
             for video_url in video_urls:
-                job = await _create_and_enqueue(video_url, request.webhook_url)
+                job = await _create_and_enqueue(
+                    video_url,
+                    request.webhook_url,
+                    processing_mode=settings.processing_mode,
+                    external_processing_approved=request.external_processing_approved,
+                )
                 if job.job_id not in job_ids:
                     job_ids.append(job.job_id)
         else:
-            job = await _create_and_enqueue(url, request.webhook_url)
+            job = await _create_and_enqueue(
+                url,
+                request.webhook_url,
+                processing_mode=settings.processing_mode,
+                external_processing_approved=request.external_processing_approved,
+            )
             if job.job_id not in job_ids:
                 job_ids.append(job.job_id)
 
@@ -268,14 +383,14 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     job = await job_queue.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found.")
-    if job.status in (JobStatus.done, JobStatus.failed, JobStatus.cancelled):
+    if not await job_queue.mark_job_cancelled(job_id):
+        current = await job_queue.get_job(job_id)
+        status = current.status.value if current else "deleted"
         raise HTTPException(
             status_code=409,
-            detail=f"Job is already {job.status.value} and cannot be cancelled.",
+            detail=f"Job is already {status} and cannot be cancelled.",
         )
-    job.status = JobStatus.cancelled
-    job.stage = JobStage.failed
-    await job_queue.update_job(job)
+    cleanup_upload(job.url)
     logger.info("job_id=%s url=%.60s source=- event=job_cancelled_by_user", job.job_id, job.url)
     return {"status": "cancelled"}
 
@@ -283,9 +398,12 @@ async def cancel_job(job_id: str) -> dict[str, str]:
 @app.delete("/job/{job_id}")
 async def delete_job(job_id: str) -> dict[str, str]:
     """Delete a single job by ID."""
+    job = await job_queue.get_job(job_id)
     deleted = await job_queue.delete_job(job_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found.")
+    if job is not None:
+        cleanup_upload(job.url)
     return {"status": "deleted"}
 
 
@@ -390,8 +508,44 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["db"] = f"error: {e}"
         errors.append("db")
 
-    # Anthropic API key check
-    if settings.anthropic_api_key:
+    # AI provider checks
+    if settings.processing_mode == "local":
+        checks["anthropic"] = "disabled (local mode)"
+        checks["openai"] = "disabled (local mode)"
+        try:
+            parsed_ollama = urlparse(settings.ollama_base_url)
+            if parsed_ollama.scheme != "http" or parsed_ollama.hostname not in {
+                "127.0.0.1",
+                "::1",
+                "localhost",
+            }:
+                raise ValueError("Ollama must use a loopback HTTP endpoint.")
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+                response = await client.get(f"{settings.ollama_base_url.rstrip('/')}/api/tags")
+                response.raise_for_status()
+                payload = response.json()
+                models = payload.get("models", []) if isinstance(payload, dict) else []
+                installed = {
+                    str(item.get("name") or item.get("model"))
+                    for item in models
+                    if isinstance(item, dict)
+                }
+                if settings.ollama_model not in installed:
+                    raise ValueError(
+                        f"Configured Ollama model {settings.ollama_model!r} is not installed."
+                    )
+            checks["ollama"] = "ok"
+        except Exception as e:
+            checks["ollama"] = f"error: {e}"
+            errors.append("ollama")
+        local_whisper = shutil.which(settings.local_whisper_executable)
+        local_model = Path(settings.local_whisper_model).expanduser()
+        if local_whisper and local_model.is_file():
+            checks["local_whisper"] = "ok"
+        else:
+            checks["local_whisper"] = "not configured"
+            errors.append("local_whisper")
+    elif settings.anthropic_api_key:
         try:
             from anthropic import AsyncAnthropic
 
@@ -410,7 +564,9 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         errors.append("anthropic")
 
     # OpenAI API key check (just validates the key, no actual transcription)
-    if settings.openai_api_key:
+    if settings.processing_mode == "local":
+        pass
+    elif settings.openai_api_key:
         try:
             from openai import AsyncOpenAI
 
@@ -442,7 +598,9 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["obsidian"] = "not configured"
 
     # Notion API key check
-    if not settings.notion_enabled:
+    if settings.processing_mode == "local":
+        checks["notion"] = "disabled (local mode)"
+    elif not settings.notion_enabled:
         checks["notion"] = "disabled"
     elif settings.notion_api_key:
         try:
@@ -458,7 +616,9 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
         checks["notion"] = "not configured"
         errors.append("notion")
 
-    if not settings.obsidian_vault_path and not settings.notion_enabled:
+    if not settings.obsidian_vault_path and (
+        settings.processing_mode == "local" or not settings.notion_enabled
+    ):
         checks["storage"] = "no destination configured"
         errors.append("storage")
 
@@ -480,4 +640,18 @@ async def health(deep: bool = Query(False)) -> dict[str, object]:
 async def dashboard() -> HTMLResponse:
     """Serve the job status dashboard."""
     html = (Path(__file__).parent / "static" / "index.html").read_text()
+    if settings.processing_mode == "local":
+        mode_label = "Local-only mode"
+        boundary_message = (
+            "Local-only mode: transcripts stay on this Mac; Anthropic, OpenAI, "
+            "Notion, and webhooks are disabled."
+        )
+    else:
+        mode_label = "Cloud-public mode"
+        boundary_message = (
+            "Cloud-public mode: submit only public content or material explicitly "
+            "approved for external AI processing."
+        )
+    html = html.replace("__PROCESSING_MODE_LABEL__", mode_label)
+    html = html.replace("__DATA_BOUNDARY_MESSAGE__", boundary_message)
     return HTMLResponse(content=html)

@@ -15,6 +15,7 @@ class BaseSource(ABC):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         """Fetch transcript and metadata for the given URL."""
         ...

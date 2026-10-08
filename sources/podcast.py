@@ -34,7 +34,7 @@ from config import settings
 from exceptions import TranscriptionError, UnsupportedURLError, UsageLimitError
 from models import TranscriptResult, UsageStats
 from sources.base import BaseSource
-from transcriber import tmp_path_for_job, transcribe
+from transcriber import tmp_path_for_job, transcribe, transcription_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ _MAX_REDIRECTS = 5
 # ---------------------------------------------------------------------------
 # Pure helpers — URL parsing, duration, metadata extraction
 # ---------------------------------------------------------------------------
+
 
 def _parse_apple_podcast_ids(url: str) -> tuple[str, str | None]:
     """Return (podcast_id, episode_id_or_None) from an Apple Podcasts URL.
@@ -164,6 +165,7 @@ def _episode_source_item_id(entry: object, mp3_url: str) -> str:
 # Async helpers — network I/O
 # ---------------------------------------------------------------------------
 
+
 async def _validate_public_http_url(url: str) -> str:
     """Return a validated public address to pin for the outbound connection."""
     parsed = urlparse(url)
@@ -181,14 +183,10 @@ async def _validate_public_http_url(url: str) -> str:
             type=socket.SOCK_STREAM,
         )
     except socket.gaierror as error:
-        raise TranscriptionError(
-            f"Could not resolve media host {parsed.hostname}."
-        ) from error
+        raise TranscriptionError(f"Could not resolve media host {parsed.hostname}.") from error
 
     addresses = {str(answer[4][0]) for answer in answers}
-    if not addresses or any(
-        not ipaddress.ip_address(address).is_global for address in addresses
-    ):
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise UnsupportedURLError(
             "Private, loopback, link-local, and reserved media URLs are not allowed."
         )
@@ -208,9 +206,7 @@ async def _pinned_request_args(
     bracketed_address = f"[{address}]" if ":" in address else address
     default_port = 443 if parsed.scheme == "https" else 80
     port = parsed.port or default_port
-    pinned_netloc = (
-        bracketed_address if port == default_port else f"{bracketed_address}:{port}"
-    )
+    pinned_netloc = bracketed_address if port == default_port else f"{bracketed_address}:{port}"
     host_header = hostname if port == default_port else f"{hostname}:{port}"
     pinned_url = urlunparse(
         (
@@ -260,9 +256,7 @@ async def _fetch_rss(rss_url: str) -> feedparser.FeedParserDict:
                 response.raise_for_status()
                 raw_length = response.headers.get("content-length", "")
                 if raw_length.isdigit() and int(raw_length) > _RSS_MAX_BYTES:
-                    raise UsageLimitError(
-                        "RSS feed exceeds the configured response-size limit."
-                    )
+                    raise UsageLimitError("RSS feed exceeds the configured response-size limit.")
                 async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK):
                     body.extend(chunk)
                     if len(body) > _RSS_MAX_BYTES:
@@ -278,9 +272,7 @@ async def _fetch_rss(rss_url: str) -> feedparser.FeedParserDict:
         bytes(body),
     )
     if feed.get("bozo") and not feed.entries:
-        raise UnsupportedURLError(
-            f"URL is not a readable RSS feed: {feed.get('bozo_exception')}"
-        )
+        raise UnsupportedURLError(f"URL is not a readable RSS feed: {feed.get('bozo_exception')}")
     if not feed.entries:
         raise UnsupportedURLError("URL is not a podcast RSS feed.")
     return feed
@@ -318,9 +310,7 @@ async def _apple_episode_metadata(
         current_url = episode_url
         for _ in range(_MAX_REDIRECTS + 1):
             if urlparse(current_url).hostname != "podcasts.apple.com":
-                raise UnsupportedURLError(
-                    "Apple Podcasts redirected to an unexpected host."
-                )
+                raise UnsupportedURLError("Apple Podcasts redirected to an unexpected host.")
             request_url, headers, extensions = await _pinned_request_args(current_url)
             async with client.stream(
                 "GET",
@@ -349,9 +339,7 @@ async def _apple_episode_metadata(
         page,
     )
     if content_id is None or content_id.group(1) != episode_id:
-        raise UnsupportedURLError(
-            f"Apple Podcasts did not resolve episode track ID {episode_id}."
-        )
+        raise UnsupportedURLError(f"Apple Podcasts did not resolve episode track ID {episode_id}.")
 
     metadata: dict[str, object] = {}
     for raw_json in re.findall(
@@ -433,9 +421,7 @@ async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
                         continue
                     resp.raise_for_status()
                     raw_content_length = resp.headers.get("content-length", "")
-                    content_length = (
-                        int(raw_content_length) if raw_content_length.isdigit() else 0
-                    )
+                    content_length = int(raw_content_length) if raw_content_length.isdigit() else 0
                     if content_length > settings.max_audio_download_bytes:
                         raise UsageLimitError(
                             "Podcast audio exceeds the configured download-size limit."
@@ -462,6 +448,7 @@ async def _download_mp3(url: str, dest: Path, job_id: str = "-") -> None:
 # PodcastSource
 # ---------------------------------------------------------------------------
 
+
 class PodcastSource(BaseSource):
     """Resolves podcast URLs to MP3, transcribes via Whisper, returns TranscriptResult."""
 
@@ -472,6 +459,7 @@ class PodcastSource(BaseSource):
         *,
         usage: UsageStats | None = None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None = None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
         parsed = urlparse(url)
@@ -480,12 +468,12 @@ class PodcastSource(BaseSource):
         try:
             if parsed.path.lower().endswith(".mp3"):
                 return await self._from_direct_mp3(
-                    url, job_id, usage, persist_usage
+                    url, job_id, usage, persist_usage, processing_mode
                 )
 
             if hostname == "podcasts.apple.com":
                 return await self._from_apple_podcasts(
-                    url, job_id, usage, persist_usage
+                    url, job_id, usage, persist_usage, processing_mode
                 )
 
             # Assume it's an RSS feed URL
@@ -498,14 +486,13 @@ class PodcastSource(BaseSource):
                 episode_id=None,
                 usage=usage,
                 persist_usage=persist_usage,
+                processing_mode=processing_mode,
             )
 
         except (TranscriptionError, UnsupportedURLError, UsageLimitError):
             raise
         except Exception as e:
-            raise TranscriptionError(
-                f"Couldn't process podcast URL: {e}"
-            ) from e
+            raise TranscriptionError(f"Couldn't process podcast URL: {e}") from e
 
     async def _from_direct_mp3(
         self,
@@ -513,6 +500,7 @@ class PodcastSource(BaseSource):
         job_id: str,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         """Download a direct MP3 URL and transcribe it."""
         dest = tmp_path_for_job(job_id)
@@ -522,6 +510,7 @@ class PodcastSource(BaseSource):
             job_id,
             usage=usage,
             persist_usage=persist_usage,
+            processing_mode=processing_mode,
         )
 
         return TranscriptResult(
@@ -532,7 +521,7 @@ class PodcastSource(BaseSource):
             duration_seconds=0,
             transcript=transcription.text,
             segments=transcription.segments,
-            transcription_model="openai/whisper-1",
+            transcription_model=transcription_model_name(processing_mode),
             source_item_id=url,
         )
 
@@ -542,6 +531,7 @@ class PodcastSource(BaseSource):
         job_id: str,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         """Resolve Apple Podcasts URL → iTunes → RSS → MP3 → transcribe."""
         log = f"job_id={job_id} url={url[:60]!r} source=podcast"
@@ -559,6 +549,7 @@ class PodcastSource(BaseSource):
                 duration_seconds=duration_seconds,
                 usage=usage,
                 persist_usage=persist_usage,
+                processing_mode=processing_mode,
             )
             return TranscriptResult(
                 title=str(episode.get("trackName") or "Unknown Episode"),
@@ -567,14 +558,12 @@ class PodcastSource(BaseSource):
                 channel_or_show=str(episode.get("collectionName") or ""),
                 duration_seconds=duration_seconds,
                 thumbnail_url=(
-                    str(episode["artworkUrl600"])
-                    if episode.get("artworkUrl600")
-                    else None
+                    str(episode["artworkUrl600"]) if episode.get("artworkUrl600") else None
                 ),
                 transcript=transcription.text,
                 segments=transcription.segments,
                 published_at=_parse_iso_datetime(episode.get("releaseDate")),
-                transcription_model="openai/whisper-1",
+                transcription_model=transcription_model_name(processing_mode),
                 source_item_id=episode_id,
             )
 
@@ -589,6 +578,7 @@ class PodcastSource(BaseSource):
             episode_id=episode_id,
             usage=usage,
             persist_usage=persist_usage,
+            processing_mode=processing_mode,
         )
 
     async def _from_feed(
@@ -599,6 +589,7 @@ class PodcastSource(BaseSource):
         episode_id: str | None,
         usage: UsageStats | None,
         persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+        processing_mode: str = "cloud_public",
     ) -> TranscriptResult:
         """Pick the best episode from a parsed RSS feed, download and transcribe."""
         log = f"job_id={job_id} url={original_url[:60]!r} source=podcast"
@@ -622,6 +613,7 @@ class PodcastSource(BaseSource):
             duration_seconds=duration_seconds,
             usage=usage,
             persist_usage=persist_usage,
+            processing_mode=processing_mode,
         )
 
         return TranscriptResult(
@@ -634,6 +626,6 @@ class PodcastSource(BaseSource):
             transcript=transcription.text,
             segments=transcription.segments,
             published_at=published_at,
-            transcription_model="openai/whisper-1",
+            transcription_model=transcription_model_name(processing_mode),
             source_item_id=source_item_id,
         )

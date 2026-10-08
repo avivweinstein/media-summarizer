@@ -90,6 +90,7 @@
     }
     header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; }
     .header-right { display: flex; align-items: center; gap: 1rem; }
+    .mode-badge { font-size: 0.75rem; font-weight: 600; }
     #refresh-status { font-size: 0.75rem; color: var(--text-muted); }
 
     /* Theme toggle */
@@ -110,6 +111,9 @@
       border: 1px solid var(--card-border);
     }
     .submit-form form { display: flex; gap: 0.6rem; }
+    .upload-form { margin-top: 0.7rem; align-items: center; }
+    .upload-form input[type="file"] { flex: 1; color: var(--text-secondary); }
+    .approval-label { font-size: 0.75rem; color: var(--text-secondary); }
     .submit-form input[type="text"] {
       flex: 1; padding: 0.6rem 0.8rem; border-radius: 6px;
       border: 1px solid var(--input-border);
@@ -270,6 +274,7 @@
 <header>
   <h1>Media Summarizer</h1>
   <div class="header-right">
+    <span class="mode-badge">__PROCESSING_MODE_LABEL__</span>
     <span id="refresh-status">Connecting...</span>
     <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">
       <span id="theme-icon">&#9790;</span>
@@ -280,11 +285,17 @@
 <main>
   <div class="submit-form">
     <form id="submit-form" onsubmit="submitUrl(event)">
-      <input type="text" id="url-input" placeholder="Paste a YouTube, podcast, or playlist URL..." autocomplete="off" />
+      <input type="text" id="url-input" placeholder="Paste a video, podcast, article, or RSS URL..." autocomplete="off" />
       <button type="submit" class="submit-btn" id="submit-btn">Summarize</button>
     </form>
+    <label class="approval-label"><input type="checkbox" id="url-approved" /> Public or approved for external AI (not needed in local mode)</label>
+    <form class="upload-form" id="upload-form" onsubmit="submitUpload(event)">
+      <input type="file" id="file-input" accept=".txt,.md,.mp3,.m4a,.wav,.mp4,.mov,.webm" />
+      <label class="approval-label"><input type="checkbox" id="upload-approved" /> Public or approved</label>
+      <button type="submit" class="submit-btn" id="upload-btn">Upload</button>
+    </form>
     <div class="submit-error" id="submit-error"></div>
-    <p class="data-boundary">Public or approved media only. Transcripts are sent to external AI providers.</p>
+    <p class="data-boundary">__DATA_BOUNDARY_MESSAGE__</p>
   </div>
   <div id="jobs-container"></div>
   <div id="empty" style="display:none">
@@ -329,14 +340,14 @@
   }
   function usageLine(job) {
     if (!job.usage) return '';
-    return `<div class="retry-note">API usage: ${job.usage.anthropic_requests || 0} Anthropic request(s), ${job.usage.openai_requests || 0} OpenAI request(s), estimated $${Number(job.usage.estimated_cost_usd || 0).toFixed(4)}</div>`;
+    return `<div class="retry-note">API usage: ${job.usage.anthropic_requests || 0} Anthropic, ${job.usage.openai_requests || 0} OpenAI, ${job.usage.local_summary_requests || 0} local summary request(s), estimated $${Number(job.usage.estimated_cost_usd || 0).toFixed(4)}</div>`;
   }
 
   const STAGE_LABELS = {
     queued: 'Queued',
     detecting: 'Detecting source...',
     transcribing: 'Transcribing...',
-    summarizing: 'Summarizing with Claude...',
+    summarizing: 'Summarizing...',
     saving_obsidian: 'Saving to Obsidian...',
     saving_notion: 'Saving to Notion...',
     done: 'Complete',
@@ -405,6 +416,7 @@
     const btn = document.getElementById('submit-btn');
     const errorEl = document.getElementById('submit-error');
     const url = input.value.trim();
+    const approved = document.getElementById('url-approved');
     if (!url) return;
 
     btn.disabled = true;
@@ -415,7 +427,7 @@
       const resp = await fetch('/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, external_processing_approved: approved.checked }),
       });
       if (!resp.ok) {
         const data = await resp.json();
@@ -424,12 +436,45 @@
       const data = await resp.json();
       lastSubmittedJobId = data.job_id;
       input.value = '';
+      approved.checked = false;
     } catch (e) {
       errorEl.textContent = e.message;
       errorEl.style.display = 'block';
     } finally {
       btn.disabled = false;
       btn.textContent = 'Summarize';
+    }
+  }
+
+  async function submitUpload(event) {
+    event.preventDefault();
+    const input = document.getElementById('file-input');
+    const approved = document.getElementById('upload-approved');
+    const btn = document.getElementById('upload-btn');
+    const errorEl = document.getElementById('submit-error');
+    if (!input.files.length) return;
+    const form = new FormData();
+    form.append('file', input.files[0]);
+    form.append('external_processing_approved', approved.checked ? 'true' : 'false');
+    btn.disabled = true;
+    btn.textContent = 'Uploading...';
+    errorEl.style.display = 'none';
+    try {
+      const resp = await fetch('/summarize/upload', { method: 'POST', body: form });
+      if (!resp.ok) {
+        const data = await resp.json();
+        throw new Error(data.detail || 'Upload failed');
+      }
+      const data = await resp.json();
+      lastSubmittedJobId = data.job_id;
+      input.value = '';
+      approved.checked = false;
+    } catch (e) {
+      errorEl.textContent = e.message;
+      errorEl.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Upload';
     }
   }
 
@@ -444,6 +489,9 @@
     const meta = metaParts.join(' \u00b7 ');
     const retryNote = job.retry_count > 0
       ? `<div class="retry-note">Attempt ${job.retry_count + 1} of 3</div>` : '';
+    const urlRow = job.url.startsWith('upload://')
+      ? `<div class="url-row">${esc(job.url)}</div>`
+      : `<div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>`;
 
     // Stage indicator for processing jobs
     const stageLabel = (job.status === 'processing' || job.status === 'pending')
@@ -458,7 +506,7 @@
       const worthBadge = s.worth_rewatching ? '<span class="worth-badge" title="Dense with actionable insights, reference material, or expert-level depth that rewards re-watching">\u2605 Worth rewatching</span>' : '';
 
       detailHtml = `
-        <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
+        ${urlRow}
         <div class="tldr">${esc(s.tldr)}</div>
         ${points ? `<div class="section-label">Key Points</div><ul class="key-points">${points}</ul>` : ''}
         ${tags ? `<div class="tags">${tags}</div>` : ''}
@@ -474,7 +522,7 @@
       `;
     } else if (job.status === 'failed') {
       detailHtml = `
-        <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
+        ${urlRow}
         <div class="error-text">${esc(job.error || 'Unknown error')}</div>
         ${usageLine(job)}
         <div class="footer-row" style="margin-top:0.6rem">
@@ -483,7 +531,7 @@
       `;
     } else if (job.status === 'cancelled') {
       detailHtml = `
-        <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
+        ${urlRow}
         <div class="retry-note">Cancelled by user</div>
         <div class="footer-row" style="margin-top:0.6rem">
           <button class="action-btn" onclick="deleteJob(event, '${job.job_id}')">Delete</button>
@@ -491,7 +539,7 @@
       `;
     } else {
       detailHtml = `
-        <div class="url-row"><a class="url-link" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.url)}</a></div>
+        ${urlRow}
         <div class="retry-note">Processing\u2026</div>
         <div class="footer-row" style="margin-top:0.6rem">
           <button class="action-btn cancel-btn" onclick="cancelJob(event, '${job.job_id}')">Cancel</button>

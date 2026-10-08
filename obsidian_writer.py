@@ -179,6 +179,7 @@ def _render_summary(
         f"anthropic_output_tokens: {usage.anthropic_output_tokens}",
         f"openai_requests: {usage.openai_requests}",
         f"openai_audio_seconds: {round(usage.openai_audio_seconds, 3)}",
+        f"local_summary_requests: {usage.local_summary_requests}",
         f"estimated_cost_usd: {round(usage.estimated_cost_usd, 6)}",
     ]
     if result.thumbnail_url:
