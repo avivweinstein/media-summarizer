@@ -65,8 +65,8 @@ def validate_nvidia_configuration() -> None:
         raise ValueError("NVIDIA_INFERENCE_MODEL is not configured.")
 
 
-async def nvidia_model_catalog() -> set[str]:
-    """Fetch the accessible Inference Hub model IDs without following redirects."""
+async def _nvidia_model_metadata() -> list[dict[str, object]]:
+    """Fetch Inference Hub model metadata without following redirects."""
     validate_nvidia_configuration()
     async with nvidia_http_client(timeout=10) as client:
         response = await client.get(
@@ -77,11 +77,26 @@ async def nvidia_model_catalog() -> set[str]:
         payload = response.json()
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise ValueError("NVIDIA Inference Hub returned an invalid model catalog.")
+    return [item for item in payload["data"] if isinstance(item, dict)]
+
+
+async def nvidia_model_catalog() -> set[str]:
+    """Fetch the accessible Inference Hub model IDs."""
     return {
-        str(item["id"])
-        for item in payload["data"]
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        str(item["id"]) for item in await _nvidia_model_metadata()
+        if isinstance(item.get("id"), str)
     }
+
+
+async def nvidia_model_output_limit() -> int:
+    """Use the configured model's advertised maximum; never guess a fallback."""
+    for item in await _nvidia_model_metadata():
+        if item.get("id") == settings.nvidia_inference_model:
+            limit = item.get("max_output_tokens")
+            if type(limit) is int and limit > 0:
+                return limit
+            raise ValueError("The configured NVIDIA model has no valid output-token maximum.")
+    raise ValueError("The configured NVIDIA Inference Hub model is unavailable.")
 
 
 async def verify_nvidia_model_access() -> None:

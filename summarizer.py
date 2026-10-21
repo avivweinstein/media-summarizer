@@ -18,13 +18,14 @@ from anthropic import (
     BadRequestError,
     RateLimitError,
 )
-from anthropic.types import TextBlock
+from anthropic.types import Message, TextBlock
 
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
 from models import KeyMoment, Summary, TranscriptResult, UsageStats
 from nvidia_inference import (
     nvidia_http_client,
+    nvidia_model_output_limit,
     validate_nvidia_configuration,
     validated_nvidia_base_url,
 )
@@ -202,9 +203,10 @@ async def _call_claude(
     usage: UsageStats,
     cost_budget_usd: float,
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
+    model_output_limit: int | None = None,
 ) -> Summary:
     estimated_input_tokens = max(1, (len(system) + len(prompt)) // 4)
-    output_budget = MAX_OUTPUT_TOKENS
+    output_budget = model_output_limit or MAX_OUTPUT_TOKENS
     for api_attempt in range(len(_API_BACKOFF_SECONDS) + 1):
         projected_cost = _anthropic_cost(estimated_input_tokens, output_budget)
         if usage.anthropic_requests >= settings.max_anthropic_requests_per_job:
@@ -223,12 +225,22 @@ async def _call_claude(
             await persist_usage(usage)
 
         try:
-            message = await client.messages.create(
-                model=model,
-                max_tokens=output_budget,
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if model_output_limit is not None:
+                # Model-sized budgets can exceed the SDK's non-streaming allowance.
+                async with client.messages.stream(
+                    model=model,
+                    max_tokens=output_budget,
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                ) as stream:
+                    message: Message = await stream.get_final_message()
+            else:
+                message = await client.messages.create(
+                    model=model,
+                    max_tokens=output_budget,
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                )
         except BadRequestError as e:
             msg = str(e).lower()
             if any(word in msg for word in ("credit", "billing", "balance", "quota")):
@@ -236,7 +248,7 @@ async def _call_claude(
                     f"{provider_name} credit, quota, or billing allowance is exhausted."
                 ) from e
             raise SummarizationError(f"{provider_name} rejected the request.") from e
-        except (RateLimitError, APIConnectionError) as e:
+        except (RateLimitError, APIConnectionError, httpx.TransportError) as e:
             if api_attempt >= len(_API_BACKOFF_SECONDS):
                 if isinstance(e, RateLimitError):
                     raise SummarizationError(
@@ -253,6 +265,11 @@ async def _call_claude(
                 f"{provider_name} returned HTTP {e.status_code}."
             ) from e
 
+        # A disconnected stream can still return a parseable accumulated snapshot.
+        # Without terminal usage, retain the reservation as for a failed API call.
+        if model_output_limit is not None and message.stop_reason is None:
+            raise SummarizationError(f"{provider_name} summary stream ended before completion.")
+
         input_tokens = _usage_int(getattr(message.usage, "input_tokens", 0))
         output_tokens = _usage_int(getattr(message.usage, "output_tokens", 0))
         usage.anthropic_input_tokens += input_tokens
@@ -268,6 +285,11 @@ async def _call_claude(
 
         # Never parse or publish an incomplete response, even if its JSON happens to parse.
         if message.stop_reason == "max_tokens":
+            if model_output_limit is not None:
+                raise UsageLimitError(
+                    f"{provider_name} summary was truncated at the model's "
+                    f"{output_budget}-token output maximum."
+                )
             if output_budget >= MAX_RETRY_OUTPUT_TOKENS or api_attempt == len(_API_BACKOFF_SECONDS):
                 raise UsageLimitError(
                     f"{provider_name} summary was truncated at the {output_budget}-token "
@@ -406,6 +428,7 @@ async def summarize(
     local_mode = processing_mode == "local"
     nvidia_internal_mode = processing_mode == "nvidia_internal"
     internal_http_client: httpx.AsyncClient | None = None
+    model_output_limit: int | None = None
     if local_mode:
         if (
             usage_tracker.local_summary_requests + request_count
@@ -432,6 +455,12 @@ async def summarize(
                 validate_nvidia_configuration()
             except ValueError as error:
                 raise SummarizationError(str(error)) from error
+            try:
+                model_output_limit = await nvidia_model_output_limit()
+            except (httpx.HTTPError, ValueError) as error:
+                raise SummarizationError(
+                    "Could not read the configured NVIDIA model's output-token maximum."
+                ) from error
             internal_http_client = nvidia_http_client(timeout=600)
             client = AsyncAnthropic(
                 api_key=settings.nvidia_inference_api_key,
@@ -468,6 +497,7 @@ async def summarize(
             usage=usage_tracker,
             cost_budget_usd=budget,
             persist_usage=persist_usage,
+            model_output_limit=model_output_limit,
         )
 
     try:
