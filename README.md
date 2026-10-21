@@ -520,6 +520,12 @@ Copy `.env.example` to `.env` and fill in:
 Request, token, transcript-size, media-duration, and estimated-cost bounds remain
 enforced in NVIDIA-internal mode. The configurable cost rates are conservative
 accounting controls; they are not a statement of internal chargeback pricing.
+NVIDIA and public Anthropic summaries start with a 4,096-token output budget.
+If the provider reports truncation, only that summary call is retried with an
+8,192-token budget, within the existing API-attempt, per-job request, and cost
+limits. A response still truncated at the ceiling fails clearly without restarting
+the whole pipeline. These bounds limit response length, latency, and worst-case
+cost; they do not request a longer summary or charge for unused output tokens.
 
 ---
 

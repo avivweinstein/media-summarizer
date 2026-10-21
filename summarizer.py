@@ -32,7 +32,8 @@ from nvidia_inference import (
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-20250514"
-MAX_OUTPUT_TOKENS = 1024
+MAX_OUTPUT_TOKENS = 4096
+MAX_RETRY_OUTPUT_TOKENS = 8192
 _API_BACKOFF_SECONDS = (1, 2)
 
 
@@ -203,8 +204,9 @@ async def _call_claude(
     persist_usage: Callable[[UsageStats], Awaitable[None]] | None,
 ) -> Summary:
     estimated_input_tokens = max(1, (len(system) + len(prompt)) // 4)
-    projected_cost = _anthropic_cost(estimated_input_tokens, MAX_OUTPUT_TOKENS)
+    output_budget = MAX_OUTPUT_TOKENS
     for api_attempt in range(len(_API_BACKOFF_SECONDS) + 1):
+        projected_cost = _anthropic_cost(estimated_input_tokens, output_budget)
         if usage.anthropic_requests >= settings.max_anthropic_requests_per_job:
             raise UsageLimitError("Configured Anthropic per-job request limit reached.")
         if usage.estimated_cost_usd + projected_cost > cost_budget_usd:
@@ -223,7 +225,7 @@ async def _call_claude(
         try:
             message = await client.messages.create(
                 model=model,
-                max_tokens=MAX_OUTPUT_TOKENS,
+                max_tokens=output_budget,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -251,12 +253,6 @@ async def _call_claude(
                 f"{provider_name} returned HTTP {e.status_code}."
             ) from e
 
-        response_text = "".join(
-            block.text for block in message.content if isinstance(block, TextBlock)
-        ).strip()
-        if not response_text:
-            raise SummarizationError(f"{provider_name} returned no summary text.")
-
         input_tokens = _usage_int(getattr(message.usage, "input_tokens", 0))
         output_tokens = _usage_int(getattr(message.usage, "output_tokens", 0))
         usage.anthropic_input_tokens += input_tokens
@@ -269,6 +265,26 @@ async def _call_claude(
             )
         if persist_usage is not None:
             await persist_usage(usage)
+
+        # Never parse or publish an incomplete response, even if its JSON happens to parse.
+        if message.stop_reason == "max_tokens":
+            if output_budget >= MAX_RETRY_OUTPUT_TOKENS or api_attempt == len(_API_BACKOFF_SECONDS):
+                raise UsageLimitError(
+                    f"{provider_name} summary was truncated at the {output_budget}-token "
+                    "output limit; the bounded retry allowance is exhausted."
+                )
+            output_budget = MAX_RETRY_OUTPUT_TOKENS
+            logger.warning(
+                "provider=%s event=summary_truncated retry_output_tokens=%d",
+                provider_name, output_budget,
+            )
+            continue
+
+        response_text = "".join(
+            block.text for block in message.content if isinstance(block, TextBlock)
+        ).strip()
+        if not response_text:
+            raise SummarizationError(f"{provider_name} returned no summary text.")
         return _parse_response(response_text)
 
     raise AssertionError("Claude retry loop exhausted unexpectedly.")
