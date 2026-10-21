@@ -54,6 +54,7 @@ def make_claude_response(content: str) -> MagicMock:
     response.content = [TextBlock(type="text", text=content)]
     response.usage.input_tokens = 100
     response.usage.output_tokens = 50
+    response.stop_reason = "end_turn"
     return response
 
 
@@ -181,6 +182,114 @@ class TestChunkText:
 
 
 class TestSummarize:
+    @pytest.mark.parametrize("mode", ["cloud_public", "nvidia_internal"])
+    @pytest.mark.parametrize("partial", ['{"tldr": "cut off', "", VALID_JSON])
+    async def test_truncated_response_retries_with_larger_budget(
+        self, mocker: MagicMock, mode: str, partial: str
+    ) -> None:
+        truncated = make_claude_response(partial)
+        truncated.stop_reason = "max_tokens"
+        truncated.usage.output_tokens = 4096
+        client = AsyncMock()
+        client.messages.create.side_effect = [truncated, make_claude_response(VALID_JSON)]
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        usage = UsageStats()
+        persist = AsyncMock()
+
+        summary = await summarize(
+            make_result(), usage=usage, persist_usage=persist, processing_mode=mode
+        )
+
+        assert summary.tldr == "A great video about cycling training."
+        calls = client.messages.create.call_args_list
+        assert [c.kwargs["max_tokens"] for c in calls] == [4096, 8192]
+        assert calls[0].kwargs["messages"] == calls[1].kwargs["messages"]
+        assert usage.anthropic_requests == 2
+        assert usage.anthropic_output_tokens == 4146
+        assert usage.estimated_cost_usd == pytest.approx((200 * 3 + 4146 * 15) / 1_000_000)
+        assert persist.await_count == 4
+
+    async def test_truncation_at_ceiling_is_a_non_retryable_usage_limit(
+        self, mocker: MagicMock
+    ) -> None:
+        responses = [make_claude_response('{"tldr": "cut off') for _ in range(2)]
+        for response, tokens in zip(responses, [4096, 8192], strict=True):
+            response.stop_reason = "max_tokens"
+            response.usage.output_tokens = tokens
+        client = AsyncMock()
+        client.messages.create.side_effect = responses
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        usage = UsageStats()
+
+        with pytest.raises(UsageLimitError, match="truncated.*8192"):
+            await summarize(make_result(), usage=usage, processing_mode="cloud_public")
+
+        assert client.messages.create.call_count == 2
+        assert usage.anthropic_output_tokens == 12288
+
+    @pytest.mark.parametrize("limit", ["requests", "cost"])
+    async def test_truncation_retry_respects_remaining_job_limits(
+        self, mocker: MagicMock, limit: str
+    ) -> None:
+        response = make_claude_response('{"tldr": "cut off')
+        response.stop_reason = "max_tokens"
+        response.usage.output_tokens = 4096
+        client = AsyncMock()
+        client.messages.create.return_value = response
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        if limit == "requests":
+            mocker.patch.object(settings, "max_anthropic_requests_per_job", 1)
+
+        with pytest.raises(UsageLimitError, match="limit"):
+            await summarize(
+                make_result(), cost_budget_usd=0.10 if limit == "cost" else 2.0,
+                processing_mode="cloud_public",
+            )
+
+        assert client.messages.create.call_count == 1
+
+    async def test_truncation_retries_only_current_chunk(self, mocker: MagicMock) -> None:
+        truncated = make_claude_response('{"tldr": "cut off')
+        truncated.stop_reason = "max_tokens"
+        truncated.usage.output_tokens = 4096
+        complete = make_claude_response(VALID_JSON)
+        client = AsyncMock()
+        client.messages.create.side_effect = [complete, truncated, complete, complete, complete]
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch.object(settings, "summary_chunk_chars", 10)
+
+        await summarize(make_result(transcript="x" * 25), processing_mode="cloud_public")
+
+        calls = client.messages.create.call_args_list
+        assert [c.kwargs["max_tokens"] for c in calls] == [4096, 4096, 8192, 4096, 4096]
+        assert calls[1].kwargs["messages"] == calls[2].kwargs["messages"]
+
+    async def test_truncation_cannot_extend_exhausted_transient_retry_allowance(
+        self, mocker: MagicMock
+    ) -> None:
+        from anthropic import APIConnectionError
+
+        connection_error = APIConnectionError(
+            request=cast(Any, httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+        )
+        truncated = make_claude_response('{"tldr": "cut off')
+        truncated.stop_reason = "max_tokens"
+        truncated.usage.output_tokens = 4096
+        client = AsyncMock()
+        client.messages.create.side_effect = [connection_error, connection_error, truncated]
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.asyncio.sleep")
+        usage = UsageStats()
+
+        with pytest.raises(UsageLimitError, match="truncated.*4096"):
+            await summarize(make_result(), usage=usage, processing_mode="cloud_public")
+
+        assert client.messages.create.call_count == 3
+        assert usage.anthropic_requests == 3
+        assert usage.anthropic_output_tokens == 4096
+
     async def test_nvidia_internal_uses_only_internal_endpoint(
         self, mocker: MagicMock
     ) -> None:
