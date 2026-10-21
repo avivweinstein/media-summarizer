@@ -4,6 +4,7 @@ Pure-function tests — no network calls, no mocks needed.
 """
 
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,13 +13,45 @@ import pytest
 from config import settings
 from exceptions import MetadataError, UsageLimitError
 from models import TranscriptionOutput, TranscriptSegment
+from pipeline import _extract_playlist_videos_sync
 from sources.youtube import (
     YouTubeSource,
     _download_audio_sync,
     _extract_video_id,
+    _fetch_metadata_sync,
     _HostRestrictedYoutubeDL,
     _parse_upload_date,
 )
+
+
+@pytest.mark.parametrize("operation", ["metadata", "download", "playlist"])
+def test_youtube_paths_enable_node_without_cookies_or_remote_scripts(
+    mocker: MagicMock, tmp_path: Path, operation: str
+) -> None:
+    downloader = mocker.patch("sources.youtube.yt_dlp.YoutubeDL")
+    client = downloader.return_value.__enter__.return_value
+    client.extract_info.return_value = {"id": "video", "entries": [{"id": "video"}]}
+    client.download.return_value = 0
+    url = "https://www.youtube.com/watch?v=video"
+
+    if operation == "metadata":
+        assert _fetch_metadata_sync(url)["id"] == "video"
+    elif operation == "playlist":
+        assert _extract_playlist_videos_sync(url) == [url]
+    else:
+        destination = tmp_path / "audio.mp3"
+        destination.touch()
+        _download_audio_sync(url, destination, 1024)
+
+    options = downloader.call_args.args[0]
+    assert options["js_runtimes"] == {"node": {}}
+    assert not options.get("remote_components")
+    assert not options.get("cookiefile")
+    assert not options.get("cookiesfrombrowser")
+
+
+def test_youtube_challenge_scripts_are_installed() -> None:
+    assert version("yt-dlp-ejs")
 
 
 def test_host_restricted_extractor_blocks_request_before_network(mocker: MagicMock) -> None:

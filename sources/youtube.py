@@ -1,7 +1,7 @@
 """YouTube source — transcript via youtube-transcript-api, metadata via yt-dlp.
 
 If no native transcript is available, falls back to downloading audio via yt-dlp
-and transcribing with OpenAI Whisper.
+and transcribing with the configured Whisper backend.
 """
 
 import logging
@@ -131,6 +131,7 @@ def _fetch_metadata_sync(
         "no_warnings": True,
         "proxy": "",
         "skip_download": True,
+        "js_runtimes": {"node": {}},
         "socket_timeout": settings.source_fetch_timeout_seconds,
     }
     if youtube_api_key:
@@ -182,6 +183,7 @@ def _download_audio_sync(
         "no_warnings": True,
         "proxy": "",
         "format": "bestaudio/best",
+        "js_runtimes": {"node": {}},
         "max_filesize": max_bytes,
         "outtmpl": str(dest.with_suffix(".%(ext)s")),
         "progress_hooks": [enforce_size],
