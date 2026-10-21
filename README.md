@@ -26,6 +26,7 @@ newsletters, or local files and get structured summaries archived in a local Obs
 - **Python 3.11+**
 - **[`uv`](https://docs.astral.sh/uv/)** — Python package manager
 - **`ffmpeg`** — required for podcast audio compression and YouTube Whisper fallback
+- **Node.js 22+** — required for YouTube's JavaScript challenges; the app enables it explicitly
 - **`whisper.cpp` plus a local model** — required for audio and video transcription
 - **NVIDIA network access and an Inference Hub key** — required for summarization
 
@@ -35,13 +36,15 @@ newsletters, or local files and get structured summaries archived in a local Obs
 
 ```bash
 # macOS
-brew install ffmpeg
+brew install ffmpeg node
 
 # Ubuntu / Debian
 sudo apt install ffmpeg
+# Also install Node.js 22+ using your system's supported Node.js packages.
 
 # Verify
 ffmpeg -version
+node --version
 ```
 
 ### 2. Install uv
@@ -65,6 +68,10 @@ Edit `.env` and configure the NVIDIA Inference Hub key and local Whisper model.
 ```bash
 uv sync --extra dev --locked
 ```
+
+The lockfile includes `yt-dlp` and its matching `yt-dlp-ejs` challenge scripts.
+Node must be on the service's `PATH` (the macOS installer includes Homebrew's bin
+directories). No browser cookies or on-demand remote script downloads are enabled.
 
 ### 5. Configure NVIDIA-internal processing
 
@@ -517,6 +524,15 @@ accounting controls; they are not a statement of internal chargeback pricing.
 ---
 
 ## Troubleshooting
+
+**YouTube download fails with HTTP 403 or a JavaScript-runtime warning**
+Check `node --version` (22+ required) and install the locked environment with
+`uv sync --extra dev --locked`, then restart the service. YouTube extraction changes
+frequently; a maintainer can update the downloader and matching scripts with
+`uv lock --upgrade-package yt-dlp` followed by sync, tests, and a service restart.
+Some videos still require login or are blocked by YouTube; the tool does not use
+browser cookies. Deep health checks AI/storage dependencies, not whether a
+particular video can be downloaded.
 
 **"No transcript available" for a YouTube video**
 The video may not have captions. Media Summarizer falls back to local whisper.cpp

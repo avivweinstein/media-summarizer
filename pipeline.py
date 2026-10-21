@@ -111,6 +111,7 @@ def _extract_playlist_videos_sync(url: str) -> list[str]:
         "no_warnings": True,
         "extract_flat": True,
         "skip_download": True,
+        "js_runtimes": {"node": {}},
         "socket_timeout": settings.source_fetch_timeout_seconds,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
