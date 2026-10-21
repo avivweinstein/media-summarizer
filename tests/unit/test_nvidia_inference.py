@@ -9,6 +9,7 @@ from nvidia_inference import (
     NvidiaInferenceError,
     nvidia_http_client,
     nvidia_model_catalog,
+    nvidia_model_output_limit,
     validate_nvidia_configuration,
     validated_nvidia_base_url,
     verify_nvidia_model_access,
@@ -61,6 +62,33 @@ async def test_catalog_disables_proxy_and_redirects(mocker: MagicMock) -> None:
         f"{NVIDIA_INFERENCE_ORIGIN}/v1/models",
         headers={"x-api-key": "secret-value"},
     )
+
+
+@pytest.mark.parametrize("limit", [16000, 128000])
+async def test_output_limit_uses_configured_model(mocker: MagicMock, limit: int) -> None:
+    mocker.patch.object(settings, "nvidia_inference_model", "chosen")
+    mocker.patch("nvidia_inference._nvidia_model_metadata", return_value=[
+        {"id": "other", "max_output_tokens": 4096},
+        {"id": "chosen", "max_output_tokens": limit},
+    ])
+    assert await nvidia_model_output_limit() == limit
+
+
+@pytest.mark.parametrize("limit", [None, True, False, 0, -1, "128000", 128000.0])
+async def test_output_limit_rejects_invalid_metadata(mocker: MagicMock, limit: object) -> None:
+    mocker.patch.object(settings, "nvidia_inference_model", "chosen")
+    mocker.patch("nvidia_inference._nvidia_model_metadata", return_value=[
+        {"id": "chosen", "max_output_tokens": limit},
+    ])
+    with pytest.raises(ValueError, match="no valid output-token maximum"):
+        await nvidia_model_output_limit()
+
+
+async def test_output_limit_rejects_missing_model(mocker: MagicMock) -> None:
+    mocker.patch.object(settings, "nvidia_inference_model", "missing")
+    mocker.patch("nvidia_inference._nvidia_model_metadata", return_value=[])
+    with pytest.raises(ValueError, match="unavailable"):
+        await nvidia_model_output_limit()
 
 
 async def test_sdk_cannot_forward_anthropic_auth_token(

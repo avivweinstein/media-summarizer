@@ -16,7 +16,7 @@ from anthropic.types import TextBlock
 from config import settings
 from exceptions import SummarizationError, UsageLimitError
 from models import Summary, TranscriptResult, TranscriptSegment, UsageStats
-from summarizer import MODEL, _chunk_text, _parse_response, summarize
+from summarizer import MODEL, _call_claude, _chunk_text, _parse_response, summarize
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,6 +56,14 @@ def make_claude_response(content: str) -> MagicMock:
     response.usage.output_tokens = 50
     response.stop_reason = "end_turn"
     return response
+
+
+def make_streaming_client(response: MagicMock) -> MagicMock:
+    client = MagicMock()
+    stream = AsyncMock()
+    stream.get_final_message.return_value = response
+    client.messages.stream.return_value.__aenter__.return_value = stream
+    return client
 
 
 def make_api_status_error(
@@ -182,10 +190,9 @@ class TestChunkText:
 
 
 class TestSummarize:
-    @pytest.mark.parametrize("mode", ["cloud_public", "nvidia_internal"])
     @pytest.mark.parametrize("partial", ['{"tldr": "cut off', "", VALID_JSON])
     async def test_truncated_response_retries_with_larger_budget(
-        self, mocker: MagicMock, mode: str, partial: str
+        self, mocker: MagicMock, partial: str
     ) -> None:
         truncated = make_claude_response(partial)
         truncated.stop_reason = "max_tokens"
@@ -199,7 +206,7 @@ class TestSummarize:
         persist = AsyncMock()
 
         summary = await summarize(
-            make_result(), usage=usage, persist_usage=persist, processing_mode=mode
+            make_result(), usage=usage, persist_usage=persist, processing_mode="cloud_public"
         )
 
         assert summary.tldr == "A great video about cycling training."
@@ -293,8 +300,8 @@ class TestSummarize:
     async def test_nvidia_internal_uses_only_internal_endpoint(
         self, mocker: MagicMock
     ) -> None:
-        mock_client = AsyncMock()
-        mock_client.messages.create.return_value = make_claude_response(VALID_JSON)
+        mock_client = make_streaming_client(make_claude_response(VALID_JSON))
+        limit = mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
         factory = mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
         http_client = AsyncMock()
         http_factory = mocker.patch(
@@ -312,6 +319,10 @@ class TestSummarize:
 
         await summarize(make_result(), processing_mode="nvidia_internal")
 
+        limit.assert_awaited_once()
+        assert mock_client.messages.stream.call_args.kwargs["max_tokens"] == 128000
+        mock_client.messages.create.assert_not_called()
+
         factory.assert_called_once_with(
             api_key="nvidia-key",
             auth_token="",
@@ -321,7 +332,190 @@ class TestSummarize:
         )
         http_factory.assert_called_once_with(timeout=600)
         http_client.aclose.assert_awaited_once()
-        assert mock_client.messages.create.call_args.kwargs["model"] == "internal-model"
+        assert mock_client.messages.stream.call_args.kwargs["model"] == "internal-model"
+
+    @pytest.mark.parametrize("maximum", [16000, 128000])
+    async def test_nvidia_uses_catalog_maximum_for_each_chunk_and_accounts_actual_usage(
+        self, mocker: MagicMock, maximum: int
+    ) -> None:
+        client = make_streaming_client(make_claude_response(VALID_JSON))
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        limit = mocker.patch("summarizer.nvidia_model_output_limit", return_value=maximum)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        mocker.patch.object(settings, "summary_chunk_chars", 10)
+        usage = UsageStats()
+        persist = AsyncMock()
+
+        await summarize(make_result(transcript="x" * 25), usage=usage, persist_usage=persist)
+
+        limit.assert_awaited_once()
+        assert [c.kwargs["max_tokens"] for c in client.messages.stream.call_args_list] == [
+            maximum, maximum, maximum, maximum,
+        ]
+        assert usage.anthropic_requests == 4
+        assert usage.anthropic_output_tokens == 200
+        assert usage.estimated_cost_usd == pytest.approx(0.0042)
+        assert persist.await_count == 8
+
+    @pytest.mark.parametrize("partial", ['{"tldr": "cut off', "", VALID_JSON])
+    async def test_nvidia_model_ceiling_is_terminal_and_records_usage(
+        self, mocker: MagicMock, partial: str
+    ) -> None:
+        response = make_claude_response(partial)
+        response.stop_reason = "max_tokens"
+        response.usage.output_tokens = 128000
+        client = make_streaming_client(response)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        usage = UsageStats()
+
+        with pytest.raises(UsageLimitError, match="128000-token output maximum"):
+            await summarize(make_result(), usage=usage)
+
+        assert client.messages.stream.call_count == 1
+        assert usage.anthropic_output_tokens == 128000
+        assert usage.estimated_cost_usd == pytest.approx(1.9203)
+
+    async def test_nvidia_maximum_still_respects_remaining_cost_budget(
+        self, mocker: MagicMock
+    ) -> None:
+        client = make_streaming_client(make_claude_response(VALID_JSON))
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        usage = UsageStats(estimated_cost_usd=0.1)
+
+        with pytest.raises(UsageLimitError, match="cost"):
+            await summarize(make_result(), usage=usage, cost_budget_usd=2.0)
+
+        client.messages.stream.assert_not_called()
+        assert usage.anthropic_requests == 0
+
+    async def test_nvidia_stream_retry_keeps_model_maximum_and_request_accounting(
+        self, mocker: MagicMock
+    ) -> None:
+        from anthropic import APIConnectionError
+
+        client = make_streaming_client(make_claude_response(VALID_JSON))
+        stream = client.messages.stream.return_value.__aenter__.return_value
+        stream.get_final_message.side_effect = [
+            APIConnectionError(request=httpx.Request("POST", "https://inference-api.nvidia.com")),
+            make_claude_response(VALID_JSON),
+        ]
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch("summarizer.asyncio.sleep")
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        usage = UsageStats()
+
+        await summarize(make_result(), usage=usage, cost_budget_usd=4.0)
+
+        assert [c.kwargs["max_tokens"] for c in client.messages.stream.call_args_list] == [
+            128000, 128000,
+        ]
+        assert usage.anthropic_requests == 2
+        assert usage.estimated_cost_usd > 1.92
+
+    async def test_nvidia_missing_metadata_never_guesses_limit(self, mocker: MagicMock) -> None:
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        mocker.patch("summarizer.nvidia_model_output_limit", side_effect=ValueError("missing"))
+        factory = mocker.patch("summarizer.AsyncAnthropic")
+
+        with pytest.raises(SummarizationError, match="output-token maximum"):
+            await summarize(make_result())
+
+        factory.assert_not_called()
+
+    async def test_nvidia_incomplete_stream_never_publishes_parseable_partial_json(
+        self, mocker: MagicMock
+    ) -> None:
+        response = make_claude_response(VALID_JSON)
+        response.stop_reason = None
+        client = make_streaming_client(response)
+        mocker.patch("summarizer.AsyncAnthropic", return_value=client)
+        mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
+        mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
+        mocker.patch.object(settings, "nvidia_inference_api_key", "test-key")
+        usage = UsageStats()
+
+        with pytest.raises(SummarizationError, match="stream ended before completion"):
+            await summarize(make_result(), usage=usage)
+
+        assert usage.anthropic_requests == 1
+        assert usage.anthropic_output_tokens == 0
+        assert usage.estimated_cost_usd > 1.92
+
+    @pytest.mark.parametrize("failure", ["eof", "read", "timeout", "exhausted"])
+    async def test_real_sdk_stream_failures_preserve_reservation_and_retry_bounds(
+        self, mocker: MagicMock, failure: str
+    ) -> None:
+        from anthropic import AsyncAnthropic
+
+        events: list[dict[str, object]] = [
+            {"type": "message_start", "message": {
+                "id": "msg_test", "type": "message", "role": "assistant", "content": [],
+                "model": "internal-model", "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 100, "output_tokens": 1},
+            }},
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": VALID_JSON}},
+            {"type": "content_block_stop", "index": 0},
+        ]
+        payload = "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+        )
+        complete = payload + (
+            'event: message_delta\ndata: {"type":"message_delta",'
+            '"delta":{"stop_reason":"end_turn","stop_sequence":null},'
+            '"usage":{"output_tokens":50}}\n\n'
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+        mocker.patch("summarizer.asyncio.sleep")
+        calls = 0
+
+        class BrokenStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> Any:
+                yield payload.encode()
+                if failure == "timeout":
+                    raise httpx.ReadTimeout("stream timed out")
+                raise httpx.ReadError("stream disconnected")
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            assert json.loads(request.content)["max_tokens"] == 128000
+            headers = {"content-type": "text/event-stream"}
+            if failure == "eof":
+                return httpx.Response(200, headers=headers, text=payload)
+            if calls == 1 or failure == "exhausted":
+                return httpx.Response(200, headers=headers, stream=BrokenStream())
+            return httpx.Response(200, headers=headers, text=complete)
+
+        usage = UsageStats()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http_client:
+            client = AsyncAnthropic(api_key="test-key", http_client=http_client, max_retries=0)
+            call = _call_claude(
+                client, model="internal-model", provider_name="NVIDIA Inference Hub",
+                system="summarize", prompt="fixture", usage=usage, cost_budget_usd=6.0,
+                persist_usage=None, model_output_limit=128000,
+            )
+            if failure in {"eof", "exhausted"}:
+                with pytest.raises(SummarizationError, match="completion|connect"):
+                    await call
+            else:
+                assert (await call).tldr
+
+        assert calls == {"eof": 1, "read": 2, "timeout": 2, "exhausted": 3}[failure]
+        assert usage.anthropic_requests == calls
+        assert usage.anthropic_output_tokens == (50 if failure in {"read", "timeout"} else 0)
+        assert usage.estimated_cost_usd > 1.92
 
     async def test_nvidia_internal_missing_key_never_constructs_client(
         self, mocker: MagicMock
@@ -339,8 +533,8 @@ class TestSummarize:
     ) -> None:
         response = make_claude_response(VALID_JSON)
         response.content.insert(0, MagicMock(type="thinking"))
-        mock_client = AsyncMock()
-        mock_client.messages.create.return_value = response
+        mock_client = make_streaming_client(response)
+        mocker.patch("summarizer.nvidia_model_output_limit", return_value=128000)
         mocker.patch("summarizer.AsyncAnthropic", return_value=mock_client)
         mocker.patch("summarizer.nvidia_http_client", return_value=AsyncMock())
         mocker.patch.object(settings, "nvidia_inference_api_key", "nvidia-key")
